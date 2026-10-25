@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional
 import shutil
+import uuid
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +65,10 @@ class BasePatch(BaseModel):
     audience: Optional[str] = None
     age_band: Optional[str] = None
     notes: Optional[str] = None
+
+
+class MoveBody(BaseModel):
+    category: str = "default"
     active: Optional[bool] = None
 
 
@@ -167,16 +172,40 @@ def api_jobs(_: dict = Depends(current_user)):
 
 
 @app.get("/api/uploads")
-def api_list_uploads(_: dict = Depends(current_user)):
+def api_list_uploads(category: Optional[str] = None, _: dict = Depends(current_user)):
     items = []
-    for p in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
-            items.append({
-                "name": p.name,
-                "url": public_url(p),
-                "size": p.stat().st_size,
-                "mtime": int(p.stat().st_mtime),
-            })
+    if category:
+        cat_dir = UPLOADS / Path(category).name
+        if cat_dir.exists():
+            for p in sorted(cat_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+                if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                    items.append({
+                        "name": p.name,
+                        "url": public_url(p),
+                        "size": p.stat().st_size,
+                        "mtime": int(p.stat().st_mtime),
+                        "category": Path(category).name,
+                    })
+    else:
+        for p in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                items.append({
+                    "name": p.name,
+                    "url": public_url(p),
+                    "size": p.stat().st_size,
+                    "mtime": int(p.stat().st_mtime),
+                    "category": "default",
+                })
+            elif p.is_dir():
+                for f in sorted(p.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+                    if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                        items.append({
+                            "name": f.name,
+                            "url": public_url(f),
+                            "size": f.stat().st_size,
+                            "mtime": int(f.stat().st_mtime),
+                            "category": p.name,
+                        })
     return items
 
 
@@ -185,21 +214,41 @@ def api_delete_upload(filename: str, _: dict = Depends(current_user)):
     safe_name = Path(filename).name
     p = UPLOADS / safe_name
     if not p.exists():
+        for d in UPLOADS.iterdir():
+            if d.is_dir():
+                candidate = d / safe_name
+                if candidate.exists():
+                    p = candidate
+                    break
+    if not p.exists():
         raise HTTPException(status_code=404, detail="图片不存在")
-    trash_dest = TRASH / f"upload_{safe_name}"
+    trash_dest = TRASH / f"upload_{p.parent.name}_{safe_name}"
     if trash_dest.exists():
         trash_dest.unlink()
     p.replace(trash_dest)
     return {"ok": True, "filename": safe_name}
 
 
+class MoveBody(BaseModel):
+    category: str = "default"
+
+
 @app.post("/api/uploads/{filename}/move")
-def api_move_upload(filename: str, category: str = "default", _: dict = Depends(current_user)):
+def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_user)):
     safe_name = Path(filename).name
     p = UPLOADS / safe_name
     if not p.exists():
+        for d in UPLOADS.iterdir():
+            if d.is_dir():
+                candidate = d / safe_name
+                if candidate.exists():
+                    p = candidate
+                    break
+    if not p.exists():
         raise HTTPException(status_code=404, detail="图片不存在")
-    category = Path(category).name
+    category = Path(body.category).name
+    if p.parent.name == category:
+        return {"ok": True, "filename": safe_name, "category": category}
     cat_dir = UPLOADS / category
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
@@ -234,6 +283,30 @@ def api_get_upload(category: str, filename: str, _: dict = Depends(current_user)
         "size": p.stat().st_size,
         "mtime": int(p.stat().st_mtime),
         "category": safe_category,
+    }
+
+
+@app.post("/api/uploads")
+async def api_upload_to_library(
+    file: UploadFile = File(...),
+    category: str = Form(""),
+    _: dict = Depends(current_user),
+):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="只支持图片文件")
+    suffix = Path(file.filename or "upload.jpg").suffix.lower() or ".jpg"
+    safe_name = f"upload_{uuid.uuid4().hex[:8]}{suffix}"
+    cat = Path(category).name if category else "default"
+    cat_dir = UPLOADS / cat
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    dest = cat_dir / safe_name
+    content = await file.read()
+    dest.write_bytes(content)
+    return {
+        "name": safe_name,
+        "url": public_url(dest),
+        "size": dest.stat().st_size,
+        "category": cat,
     }
 
 

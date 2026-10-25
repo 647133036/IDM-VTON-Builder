@@ -331,9 +331,10 @@ function clothLibrary() {
 }
 
 function uploadLibrary() {
-  if (!state.uploads.length) return '<p class="hint">暂无已上传的图片。上传的图片会自动保存到此处，下次可直接选择复用。</p>'
   return `
     <div class="upload-toolbar">
+      <button class="btn ghost small" id="upload-lib-add">上传图片</button>
+      <input type="file" id="upload-lib-file" accept="image/*" multiple hidden />
       <select id="cat-filter" class="cat-filter">
         <option value="">全部分类</option>
         <option value="default">未分类</option>
@@ -343,10 +344,11 @@ function uploadLibrary() {
       <input type="text" id="cat-name" placeholder="分类名称" style="width:120px" hidden />
     </div>
     <div class="upload-list">
+      ${!state.uploads.length ? '<p class="hint">暂无已上传的图片。上传的图片会自动保存到此处，下次可直接选择复用。</p>' : ''}
       ${state.uploads.slice(0, 24).map((u) => `
         <div class="cloth-item upload-item ${state.selectedUploads.includes(u.name) ? 'selected' : ''}" data-upload="${u.name}">
           <img src="${u.url}" alt="${u.name}" loading="lazy" />
-          <span>${u.name.replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
+          <span>${u.name.replace(/^upload_[^_]+_/, '').replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
           <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="删除">x</button>
         </div>
       `).join('')}
@@ -407,7 +409,8 @@ function bindDashboard() {
   document.querySelectorAll('.nav button[data-view]').forEach((b) => {
     b.onclick = () => { state.view = b.dataset.view; render() }
   })
-  document.querySelector('#logout').onclick = logout
+  const logoutBtn = document.querySelector('#logout')
+  if (logoutBtn) logoutBtn.onclick = logout
   document.querySelectorAll('.base').forEach((el) => {
     el.onclick = (e) => {
       if (e.target.dataset.del) return
@@ -453,13 +456,20 @@ function bindDashboard() {
       addFiles(e.dataTransfer.files)
     }
     file.onchange = () => addFiles(file.files)
-    document.querySelector('#audience').onchange = (e) => { state.audience = e.target.value }
-    document.querySelector('#gtype').onchange = (e) => { state.garmentType = e.target.value }
-    document.querySelector('#fmt').onchange = (e) => { state.outputFormat = e.target.value }
-    document.querySelector('#bg').onchange = (e) => { state.background = e.target.value }
-    document.querySelector('#run').onclick = submitBatch
-    document.querySelector('#samples').onclick = loadSamples
-    document.querySelector('#clear').onclick = () => { state.files = []; state.selectedUploads = []; renderFileThumbs(); render() }
+    const audience = document.querySelector('#audience')
+    if (audience) audience.onchange = (e) => { state.audience = e.target.value }
+    const gtype = document.querySelector('#gtype')
+    if (gtype) gtype.onchange = (e) => { state.garmentType = e.target.value }
+    const fmt = document.querySelector('#fmt')
+    if (fmt) fmt.onchange = (e) => { state.outputFormat = e.target.value }
+    const bg = document.querySelector('#bg')
+    if (bg) bg.onchange = (e) => { state.background = e.target.value }
+    const run = document.querySelector('#run')
+    if (run) run.onclick = submitBatch
+    const samples = document.querySelector('#samples')
+    if (samples) samples.onclick = loadSamples
+    const clear = document.querySelector('#clear')
+    if (clear) clear.onclick = () => { state.files = []; state.selectedUploads = []; renderFileThumbs(); render() }
     const addSelected = document.querySelector('#add-selected')
     if (addSelected) {
       addSelected.onclick = async () => {
@@ -520,7 +530,7 @@ function bindDashboard() {
         refreshUploads()
         render()
       } else {
-        api(`/api/uploads/${cat}`).then(data => {
+        api(`/api/uploads?category=${encodeURIComponent(cat)}`).then(data => {
           state.uploads = data
           render()
         })
@@ -555,6 +565,30 @@ function bindDashboard() {
         catName.hidden = true
         render()
       }
+    }
+  }
+  const uploadAdd = document.querySelector('#upload-lib-add')
+  const uploadFile = document.querySelector('#upload-lib-file')
+  if (uploadAdd && uploadFile) {
+    uploadAdd.onclick = () => uploadFile.click()
+    uploadFile.onchange = async () => {
+      for (const f of uploadFile.files) {
+        try {
+          const form = new FormData()
+          form.append('file', f, f.name)
+          const res = await fetch('/api/uploads', {
+            method: 'POST',
+            headers: { Authorization: `Bearer ${state.token}` },
+            body: form
+          })
+          if (!res.ok) throw new Error('上传失败')
+        } catch (e) {
+          alert(`上传 ${f.name} 失败: ${e.message}`)
+        }
+      }
+      uploadFile.value = ''
+      await refreshUploads()
+      render()
     }
   }
   document.querySelectorAll('[data-del-upload]').forEach((btn) => {
