@@ -1,6 +1,14 @@
 import './style.css'
 
 const TOKEN_KEY = 'atelier_token'
+const AUDIENCE_LABEL = {
+  auto: '自动识别',
+  women: '女装',
+  men: '男装',
+  girls: '女童',
+  boys: '男童',
+  baby: '婴幼儿',
+}
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
   view: 'batch',
