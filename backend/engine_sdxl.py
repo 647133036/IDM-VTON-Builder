@@ -126,46 +126,37 @@ def compose_tryon_sdxl(
     pipe.to(device)
     pipe.enable_attention_slicing()
 
-    try:
-        from IPAdapter import IPAdapter
-        image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-            str(SDXL_DIR / "ip_adapter" / "image_encoder"), torch_dtype=dtype
-        )
-        feature_extractor = CLIPImageProcessor.from_pretrained(
-            str(SDXL_DIR / "ip_adapter" / "image_encoder")
-        )
-        ip_adapter = IPAdapter(
-            pipe,
-            image_encoder=image_encoder,
-            feature_extractor=feature_extractor,
-            adapter_model_state_dict=torch.load(
-                SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin"
-            ),
-        )
-        ip_adapter.set_weight(0.8)
-    except Exception:
-        pass
+    ip_adapter_path = str(SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin")
+    if (SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin").exists():
+        try:
+            pipe.load_image_embedding(ip_adapter_path)
+        except Exception:
+            pass
 
     control_pose = _get_openpose_control(human_img)
     control_canny = _get_canny_control(cloth_img)
 
     generator = torch.Generator(device=device).manual_seed(42)
 
+    pipe_kwargs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "control_image": [control_pose, control_canny],
+        "controlnet_conditioning_scale": [0.8, 0.6],
+        "width": target_w,
+        "height": target_h,
+        "num_inference_steps": 30,
+        "guidance_scale": 7.5,
+        "generator": generator,
+        "output_type": "pil",
+    }
+
+    if (SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin").exists():
+        pipe_kwargs["image"] = cloth_img
+
     with torch.no_grad():
         with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
-            output = pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=human_img,
-                control_image=[control_pose, control_canny],
-                controlnet_conditioning_scale=[0.8, 0.6],
-                width=target_w,
-                height=target_h,
-                num_inference_steps=30,
-                guidance_scale=7.5,
-                generator=generator,
-                output_type="pil",
-            )
+            output = pipe(**pipe_kwargs)
 
     result = output.images[0]
 
