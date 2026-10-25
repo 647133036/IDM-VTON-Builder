@@ -356,28 +356,58 @@ def compose_tryon(
     long_side: int = 2048,
     background: str = "white",
 ) -> Image.Image:
-    avail, reason = _idm_vton_available()
-    if avail:
+    license_allowed, _ = _license_allows_idm()
+    if license_allowed:
+        avail, _ = _idm_vton_available()
+        if avail:
+            try:
+                return _idm_vton_engine(base_path, garment_path, audience, garment_type, long_side, background)
+            except Exception:
+                pass
+
+    if _LICENSE_MODE == "commercial":
         try:
-            return _idm_vton_engine(base_path, garment_path, audience, garment_type, long_side, background)
+            from engine_sdxl import sdxl_available, compose_tryon_sdxl
+            sdxl_avail, _ = sdxl_available()
+            if sdxl_avail:
+                return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background)
         except Exception:
             pass
+
     return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background)
 
 
 def engine_status() -> dict:
     avail, reason = _idm_vton_available()
     license_allowed, license_reason = _license_allows_idm()
+
+    sdxl_avail = False
+    sdxl_reason = ""
+    try:
+        from engine_sdxl import sdxl_available
+        sdxl_avail, sdxl_reason = sdxl_available()
+    except Exception as e:
+        sdxl_reason = str(e)
+
+    engine = "composite-fallback"
+    if license_allowed and avail:
+        engine = "idm-vton"
+    elif _LICENSE_MODE == "commercial" and sdxl_avail:
+        engine = "sdxl-commercial"
+
     return {
         "idm_vton_available": avail,
-        "reason": reason if not avail else "",
-        "engine": "idm-vton" if avail else "idm-vton-composite-fallback",
+        "idm_vton_reason": reason if not avail else "",
+        "sdxl_available": sdxl_avail,
+        "sdxl_reason": sdxl_reason if not sdxl_avail else "",
+        "engine": engine,
         "license_mode": _LICENSE_MODE or "unset",
         "license_allows_idm": license_allowed,
         "license_reason": license_reason if not license_allowed else "",
         "commercial_compliant": _LICENSE_MODE == "commercial",
         "weights_dir": str(WEIGHTS_DIR),
         "idm_vton_dir": str(_IDM_DIR),
+        "sdxl_dir": str(_REPO_ROOT / "models" / "sdxl"),
     }
 
 
