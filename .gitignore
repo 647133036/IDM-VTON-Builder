@@ -1,0 +1,12 @@
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+*.log
+
+backend/data/uploads/
+backend/data/results/
+backend/data/jobs/
+backend/data/state.json
+backend/data/state.tmp
