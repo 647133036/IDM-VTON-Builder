@@ -243,19 +243,10 @@ def license_status():
         "idm_vton_available": status["idm_vton_available"],
         "idm_vton_license": "CC BY-NC-SA 4.0",
         "idm_vton_commercial_use": "禁止",
+        "sdxl_available": status["sdxl_available"],
         "current_engine": status["engine"],
-        "compliance_advice": _compliance_advice(status),
+        "compliance_advice": status["compliance_advice"],
     }
-
-
-def _compliance_advice(status: dict) -> str:
-    if status["license_mode"] == "commercial":
-        return "商业模式：IDM-VTON 已禁用，请使用商用模型或 API。"
-    if status["license_mode"] == "research":
-        if status["idm_vton_available"]:
-            return "研究模式：IDM-VTON 可用，仅限测试/学习，不得用于生产。"
-        return "研究模式：IDM-VTON 不可用（缺少 GPU 或权重），当前使用合成引擎。"
-    return "未设置 LICENSE_MODE：建议设置 research（测试）或 commercial（生产）。"
 
 
 @app.get("/api/download/{job_id}")

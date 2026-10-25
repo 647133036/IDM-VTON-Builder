@@ -217,6 +217,20 @@ def _composite_engine(
 _engine_state: dict = {"pipe": None, "available": None, "reason": ""}
 
 
+def _get_compliance_advice(engine: str, license_mode: str, sdxl_avail: bool) -> str:
+    if license_mode == "commercial" and engine == "sdxl-commercial":
+        return "商用模式：使用 SDXL 商用引擎，合规。"
+    if license_mode == "commercial" and engine == "no-compliant-engine":
+        return "商用模式：无可用商用引擎，请下载 SDXL 权重或切换 LICENSE_MODE=research。"
+    if license_mode == "research" and engine == "idm-vton":
+        return "研究模式：使用 IDM-VTON，仅限非商业用途。"
+    if license_mode == "research" and engine == "composite-fallback":
+        return "研究模式：IDM-VTON 不可用，使用合成引擎（效果有限）。"
+    if license_mode == "":
+        return "未设置 LICENSE_MODE，使用合成引擎。请设置 research 或 commercial。"
+    return f"当前引擎: {engine}，请确认合规性。"
+
+
 def _load_idm_vton_pipeline():
     if _engine_state["available"] is False:
         return None
@@ -368,11 +382,12 @@ def compose_tryon(
     if _LICENSE_MODE == "commercial":
         try:
             from engine_sdxl import sdxl_available, compose_tryon_sdxl
-            sdxl_avail, _ = sdxl_available()
+            sdxl_avail, sdxl_reason = sdxl_available()
             if sdxl_avail:
                 return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background)
-        except Exception:
-            pass
+            raise RuntimeError(f"commercial 模式无可用商用引擎: {sdxl_reason}")
+        except ImportError:
+            raise RuntimeError("commercial 模式需要 SDXL 引擎，请安装 diffusers 等依赖")
 
     return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background)
 
@@ -390,10 +405,17 @@ def engine_status() -> dict:
         sdxl_reason = str(e)
 
     engine = "composite-fallback"
+    commercial_compliant = False
+
     if license_allowed and avail:
         engine = "idm-vton"
+        commercial_compliant = False
     elif _LICENSE_MODE == "commercial" and sdxl_avail:
         engine = "sdxl-commercial"
+        commercial_compliant = True
+    elif _LICENSE_MODE == "commercial" and not sdxl_avail:
+        engine = "no-compliant-engine"
+        commercial_compliant = False
 
     return {
         "idm_vton_available": avail,
@@ -404,7 +426,8 @@ def engine_status() -> dict:
         "license_mode": _LICENSE_MODE or "unset",
         "license_allows_idm": license_allowed,
         "license_reason": license_reason if not license_allowed else "",
-        "commercial_compliant": _LICENSE_MODE == "commercial",
+        "commercial_compliant": commercial_compliant,
+        "compliance_advice": _get_compliance_advice(engine, _LICENSE_MODE, sdxl_avail),
         "weights_dir": str(WEIGHTS_DIR),
         "idm_vton_dir": str(_IDM_DIR),
         "sdxl_dir": str(_REPO_ROOT / "models" / "sdxl"),
