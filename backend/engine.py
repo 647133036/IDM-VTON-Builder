@@ -404,6 +404,13 @@ def engine_status() -> dict:
     except Exception as e:
         sdxl_reason = str(e)
 
+    gpu_available = False
+    try:
+        import torch
+        gpu_available = bool(torch.cuda.is_available())
+    except Exception:
+        gpu_available = False
+
     engine = "composite-fallback"
     commercial_compliant = False
 
@@ -422,6 +429,7 @@ def engine_status() -> dict:
         "idm_vton_reason": reason if not avail else "",
         "sdxl_available": sdxl_avail,
         "sdxl_reason": sdxl_reason if not sdxl_avail else "",
+        "gpu_available": gpu_available,
         "engine": engine,
         "license_mode": _LICENSE_MODE or "unset",
         "license_allows_idm": license_allowed,

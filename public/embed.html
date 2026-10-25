@@ -10,6 +10,11 @@
     </style>
   </head>
   <body>
-    <iframe src="/" title="Atelier Try-On"></iframe>
+    <script>
+      var params = new URLSearchParams(location.search)
+      var target = '/'
+      if (params.get('store')) target = '/?store=' + encodeURIComponent(params.get('store'))
+      document.write('<iframe src="' + target + '" title="Atelier Try-On"></iframe>')
+    </script>
   </body>
 </html>

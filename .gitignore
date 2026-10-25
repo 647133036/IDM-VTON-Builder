@@ -11,3 +11,8 @@ backend/data/jobs/
 backend/data/trash/
 backend/data/state.json
 backend/data/state.tmp
+backend/data/state.lock
+
+dist/
+.monkeycode/
+.monkeycode-tmp-files/

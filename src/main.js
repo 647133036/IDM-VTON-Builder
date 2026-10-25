@@ -1,13 +1,19 @@
 import './style.css'
+import { t, getLang, setLang, fmtAudience, fmtAge } from './i18n'
 
 const TOKEN_KEY = 'atelier_token'
 const AUDIENCE_LABEL = {
-  auto: '自动识别',
-  women: '女装',
-  men: '男装',
-  girls: '女童',
-  boys: '男童',
-  baby: '婴幼儿',
+  auto: 'auto',
+  women: 'women',
+  men: 'men',
+  girls: 'girls',
+  boys: 'boys',
+  baby: 'baby',
+}
+const AGE_LABEL = { adult: 'adult', kids: 'kids', baby: 'baby' }
+function ethnicityLabel(value) {
+  const hit = (state.ethnicities || []).find((e) => e.value === value)
+  return hit ? hit.label : (value || '')
 }
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
@@ -17,7 +23,13 @@ const state = {
   jobs: [],
   stats: {},
   settings: {},
+  stores: [],
+  ethnicities: [],
   selectedBase: '',
+  selectedBases: [],
+  baseBatchOpen: false,
+  ethnicity: '',
+  storeCode: '',
   files: [],
   audience: 'auto',
   garmentType: 'auto',
@@ -25,6 +37,7 @@ const state = {
   background: 'white',
   error: '',
   previewJob: '',
+  pushJob: '',
   license: null,
   uploads: [],
   uploadCategories: {},
@@ -37,10 +50,10 @@ async function api(path, options = {}) {
   const res = await fetch(path, { ...options, headers })
   if (res.status === 401) {
     logout()
-    throw new Error('需要登录')
+    throw new Error(t('login.need'))
   }
   if (!res.ok) {
-    let detail = '请求失败'
+    let detail = t('login.failed')
     try {
       const data = await res.json()
       detail = data.detail || detail
@@ -78,10 +91,11 @@ function loginView() {
     <div class="login">
       <div class="login-card">
         <h1>Atelier</h1>
-        <p>店铺后台 · 固定底图换衣工作台。账号 admin / admin123，或 staff / staff123。</p>
-        <label>账号<input id="u" value="admin" /></label>
-        <label>密码<input id="p" type="password" value="admin123" /></label>
-        <button class="btn gold" id="login">进入后台</button>
+        <p>${t('login.subtitle')}</p>
+        <label>${t('login.acc')}<input id="u" value="admin" /></label>
+        <label>${t('login.pwd')}<input id="p" type="password" value="admin123" /></label>
+        <button class="btn gold" id="login">${t('login.btn')}</button>
+        <button class="btn ghost" id="login-lang" style="width:100%;margin-top:10px">${getLang() === 'zh' ? 'Switch to English' : '切换到中文'}</button>
         <p class="err" id="login-err"></p>
       </div>
     </div>
@@ -94,46 +108,59 @@ function dashboardView() {
       <header class="top">
         <div class="brand">
           <h1>Atelier Studio</h1>
-          <span>${state.user?.name || 'Store Admin'} · 固定底图 + 换衣</span>
+          <span>${state.user?.name || 'Store Admin'} · ${t('nav.storePrefix')}${state.storeCode ? ` · ${t('nav.embedStore')} ${escapeHtml(state.storeCode)}` : ''}</span>
         </div>
         <nav class="nav">
-          <button data-view="batch" class="${state.view === 'batch' ? 'on' : ''}">批量换衣</button>
-          <button data-view="bases" class="${state.view === 'bases' ? 'on' : ''}">模特底座</button>
-          <button data-view="queue" class="${state.view === 'queue' ? 'on' : ''}">任务队列</button>
-          <button data-view="embed" class="${state.view === 'embed' ? 'on' : ''}">店铺嵌入</button>
-          <button id="logout" class="${''}">退出</button>
+          <button data-view="batch" class="${state.view === 'batch' ? 'on' : ''}">${t('nav.batch')}</button>
+          <button data-view="bases" class="${state.view === 'bases' ? 'on' : ''}">${t('nav.bases')}</button>
+          <button data-view="queue" class="${state.view === 'queue' ? 'on' : ''}">${t('nav.queue')}</button>
+          <button data-view="embed" class="${state.view === 'embed' ? 'on' : ''}">${t('nav.embed')}</button>
+          <button id="lang-switch" class="${''}">${getLang() === 'zh' ? 'EN' : '中'}</button>
+          <button id="logout" class="${''}">${t('nav.logout')}</button>
         </nav>
       </header>
       ${licenseBanner()}
       <section class="kpis">
-        ${kpi('队列', state.stats.queued)}
-        ${kpi('生成中', state.stats.running)}
-        ${kpi('已完成', state.stats.done)}
-        ${kpi('失败', state.stats.failed)}
-        ${kpi('底座', state.stats.bases)}
+        ${kpi(t('kpi.queued'), state.stats.queued)}
+        ${kpi(t('kpi.running'), state.stats.running)}
+        ${kpi(t('kpi.done'), state.stats.done)}
+        ${kpi(t('kpi.failed'), state.stats.failed)}
+        ${kpi(t('kpi.bases'), state.stats.bases)}
       </section>
       ${state.view === 'batch' ? batchView() : ''}
       ${state.view === 'bases' ? basesView() : ''}
       ${state.view === 'queue' ? queueView() : ''}
       ${state.view === 'embed' ? embedView() : ''}
       ${state.previewJob ? previewModal() : ''}
+      ${state.pushJob ? pushModal() : ''}
     </div>
   `
+}
+
+function activeEngineLabel(l) {
+  if (!l.gpu_available) return t('engine.noGpu')
+  if (l.sdxl_available) return t('engine.sdxlOk')
+  return t('engine.sdxlNo')
 }
 
 function licenseBanner() {
   if (!state.license) return ''
   const l = state.license
+  const engine = activeEngineLabel(l)
+  const link = '<a href="/docs/LICENSE_COMPLIANCE.md" target="_blank">'
+  const linkEnd = '</a>'
   if (l.license_mode === 'commercial') {
-    return `<div class="banner warn"><strong>商业模式</strong>：IDM-VTON 已禁用（CC BY-NC-SA 禁止商用），当前使用 ${l.current_engine}。请使用商用模型或 API。</div>`
+    return `<div class="banner warn"><strong>${t('banner.commercial')}</strong>：${t('banner.commercialText', { engine, link, linkEnd })}</div>`
   }
   if (l.license_mode === 'research') {
+    const idmNote = t('banner.idmNote')
+    const sdxlNote = t('banner.sdxlNote')
     if (l.idm_vton_available) {
-      return `<div class="banner info"><strong>研究模式</strong>：IDM-VTON 可用，仅限测试/学习，不得用于生产。详见 <a href="/docs/LICENSE_COMPLIANCE.md" target="_blank">合规说明</a>。</div>`
+      return `<div class="banner warn"><strong>${t('banner.research')}</strong>：${idmNote}；${sdxlNote}。${t('banner.researchIdmOn', { engine })}</div>`
     }
-    return `<div class="banner info"><strong>研究模式</strong>：IDM-VTON 不可用（缺少 GPU 或权重），当前使用 ${l.current_engine}。</div>`
+    return `<div class="banner warn"><strong>${t('banner.research')}</strong>：${idmNote}；${sdxlNote}。${t('banner.researchIdmOff', { engine })}</div>`
   }
-  return `<div class="banner warn"><strong>未设置 LICENSE_MODE</strong>：建议设置 research（测试）或 commercial（生产）。详见 <a href="/docs/LICENSE_COMPLIANCE.md" target="_blank">合规说明</a>。</div>`
+  return `<div class="banner warn"><strong>${t('banner.unset')}</strong>：${t('banner.unsetText', { link, linkEnd })}</div>`
 }
 
 function previewModal() {
@@ -145,24 +172,55 @@ function previewModal() {
       <div class="modal-inner">
         <div class="modal-head">
           <div>
-            <h3>成品大图预览</h3>
-            <small>${escapeHtml(job.title || job.source_name)} · ${AUDIENCE_LABEL[job.audience] || job.audience} · ${escapeHtml(job.garment_type)}</small>
+            <h3>${t('pv.title')}</h3>
+            <small>${escapeHtml(job.title || job.source_name)} · ${fmtAudience(job.audience) || job.audience} · ${escapeHtml(job.garment_type)}</small>
           </div>
-          <button class="btn ghost small" id="close-preview">关闭</button>
+          <button class="btn ghost small" id="close-preview">${t('pv.close')}</button>
         </div>
         <div class="modal-body">
           <div class="preview-col">
-            <span class="preview-label">原服装图</span>
-            <img class="preview-img" src="${job.source_url}" alt="原服装" />
+            <span class="preview-label">${t('pv.source')}</span>
+            <img class="preview-img" src="${job.source_url}" alt="${t('pv.source')}" />
           </div>
           <div class="preview-col main">
-            <span class="preview-label">成品 · ${base ? escapeHtml(base.name) : '底座'}</span>
-            <img class="preview-img big" src="${job.result_url}" alt="成品" />
+            <span class="preview-label">${t('pv.result')} · ${base ? escapeHtml(base.name) : t('pv.base')}</span>
+            <img class="preview-img big" src="${job.result_url}" alt="${t('pv.result')}" />
           </div>
         </div>
         <div class="modal-foot">
-          <a class="btn gold" href="/api/download/${job.id}" download>下载 ${job.result_url.split('.').pop().toUpperCase()}</a>
-          <button class="btn ghost" id="close-preview-2">关闭</button>
+          <a class="btn gold" href="/api/download/${job.id}" download>${t('pv.download')} ${job.result_url.split('.').pop().toUpperCase()}</a>
+          <button class="btn ghost" id="close-preview-2">${t('pv.close')}</button>
+        </div>
+      </div>
+    </div>
+  `
+}
+
+function pushModal() {
+  const job = state.jobs.find((j) => j.id === state.pushJob)
+  if (!job) return ''
+  const stores = state.stores || []
+  const doneStoreIds = job.pushed_stores || []
+  return `
+    <div class="modal" id="push-modal">
+      <div class="modal-inner">
+        <div class="modal-head">
+          <div>
+            <h3>${t('push.title')}</h3>
+            <small>${escapeHtml(job.title || job.source_name)}</small>
+          </div>
+          <button class="btn ghost small" id="close-push">${t('push.close')}</button>
+        </div>
+        <div class="modal-body">
+          ${stores.length ? stores.map((s) => {
+            const checked = doneStoreIds.includes(s.id) ? 'checked' : ''
+            return `<label class="store-opt"><input type="checkbox" data-store="${s.id}" ${checked} /> <b>${escapeHtml(s.name)}</b> <span class="hint">${escapeHtml(s.platform || 'other')}${s.product_id ? ' · #' + escapeHtml(s.product_id) : ''}</span></label>`
+          }).join('') : `<p class="hint">${t('push.nostore')}</p>`}
+          <label class="store-opt"><span>${t('push.productId')}</span><input id="push-product-id" placeholder="${t('push.productIdPh')}" /></label>
+        </div>
+        <div class="modal-foot">
+          <button class="btn gold" id="confirm-push" ${stores.length ? '' : 'disabled'}>${t('push.confirm')}</button>
+          <button class="btn ghost" id="close-push-2">${t('push.close')}</button>
         </div>
       </div>
     </div>
@@ -177,62 +235,70 @@ function batchView() {
   return `
     <div class="grid">
       <aside class="panel">
-        <h3>1. 选择固定底图</h3>
+        <h3>${t('step.base')}</h3>
+        <div class="row">
+          <label>${t('eth.filter')}
+            <select id="eth-filter">
+              <option value="">${t('eth.all')}</option>
+              ${(state.ethnicities || []).map((e) => `<option value="${e.value}" ${state.ethnicity === e.value ? 'selected' : ''}>${escapeHtml(e.label)}</option>`).join('')}
+            </select>
+          </label>
+        </div>
         <div class="bases" id="base-list">${baseCards()}</div>
-        <h3 style="margin-top:16px">2. 品类与输出</h3>
+        <h3 style="margin-top:16px">${t('step.output')}</h3>
         <div class="row">
-          <label>受众
+          <label>${t('form.audience')}
             <select id="audience">
-              ${Object.entries(AUDIENCE_LABEL).map(([k, v]) => `<option value="${k}" ${state.audience === k ? 'selected' : ''}>${v}</option>`).join('')}
+              ${Object.keys(AUDIENCE_LABEL).map((k) => `<option value="${k}" ${state.audience === k ? 'selected' : ''}>${fmtAudience(k)}</option>`).join('')}
             </select>
           </label>
-          <label>服装
+          <label>${t('form.garment')}
             <select id="gtype">
-              <option value="auto">自动</option>
-              <option value="upper">上衣</option>
-              <option value="dress">裙装</option>
-              <option value="lower">下装</option>
-              <option value="onesie">连体</option>
+              <option value="auto">${t('opt.auto')}</option>
+              <option value="upper">${t('opt.upper')}</option>
+              <option value="dress">${t('opt.dress')}</option>
+              <option value="lower">${t('opt.lower')}</option>
+              <option value="onesie">${t('opt.onesie')}</option>
             </select>
           </label>
         </div>
         <div class="row">
-          <label>格式
+          <label>${t('form.fmt')}
             <select id="fmt">
-              <option value="jpg">JPEG 白底</option>
-              <option value="png">PNG</option>
+              <option value="jpg">${t('opt.jpg')}</option>
+              <option value="png">${t('opt.png')}</option>
             </select>
           </label>
-          <label>背景
+          <label>${t('form.bg')}
             <select id="bg">
-              <option value="white">白底</option>
-              <option value="transparent">透明</option>
+              <option value="white">${t('opt.white')}</option>
+              <option value="transparent">${t('opt.transparent')}</option>
             </select>
           </label>
         </div>
-        <p class="hint">每件只出一张正面成品，长边 2048px。女装 / 男装 / 女童 / 男童 / 婴幼儿底座可随时更换。</p>
+        <p class="hint">${t('hint.output')}</p>
       </aside>
       <section class="panel">
-        <h3>3. 拖入平铺图或幽灵模特图</h3>
-        <div class="drop" id="drop">把几十到上百张服装图拖到这里，或点击选择文件<br><small>支持 JPG / PNG / WEBP，可一次多选</small></div>
+        <h3>${t('step.drop')}</h3>
+        <div class="drop" id="drop">${t('drop.hint')}<br><small>${t('drop.formats')}</small></div>
         <input id="file" type="file" accept="image/*" multiple hidden />
         <div class="thumbs" id="file-thumbs"></div>
         <div class="row" style="margin-top:12px">
-          <button class="btn gold" id="run">一键生成 ${state.files.length} 件</button>
-          <button class="btn ghost" id="samples">载入示例平铺图</button>
-          <button class="btn ghost" id="clear">清空</button>
+          <button class="btn gold" id="run">${t('btn.generate', { n: state.files.length })}</button>
+          <button class="btn ghost" id="samples">${t('btn.samples')}</button>
+          <button class="btn ghost" id="clear">${t('btn.clear')}</button>
         </div>
         ${state.selectedUploads.length ? `
         <div class="row" style="margin-top:12px;padding:10px;background:rgba(212,180,131,.1);border-radius:10px">
-          <small>已选择 ${state.selectedUploads.length} 张图片</small>
-          <button class="btn gold small" id="add-selected">加入生成队列</button>
+          <small>${t('sel.count', { n: state.selectedUploads.length })}</small>
+          <button class="btn gold small" id="add-selected">${t('btn.addSel')}</button>
         </div>` : ''}
         <p class="err" id="batch-err">${state.error}</p>
-        <h3 style="margin-top:18px">已上传图片库 · 点击选择</h3>
+        <h3 style="margin-top:18px">${t('lib.upload')}</h3>
         <div class="upload-lib" id="upload-lib">${uploadLibrary()}</div>
-        <h3 style="margin-top:18px">示例服装库 · 点击加入</h3>
+        <h3 style="margin-top:18px">${t('lib.cloth')}</h3>
         <div class="cloth-lib" id="cloth-lib">${clothLibrary()}</div>
-        <h3 style="margin-top:18px">最近任务</h3>
+        <h3 style="margin-top:18px">${t('lib.recent')}</h3>
         <div class="queue">${jobCards(state.jobs.slice(0, 8))}</div>
       </section>
     </div>
@@ -243,39 +309,103 @@ function basesView() {
   return `
     <div class="grid">
       <section class="panel">
-        <h3>当前模特底座</h3>
-        <p class="hint">底座是固定前视人台。换衣时只替换服装区域，脸、手、姿态和背景保持不变。可上传自家模特替换默认底座。任务选「自动识别」时，受众优先取所选手底的受众标签。</p>
+        <h3>${t('base.title')}</h3>
+        <p class="hint">${t('base.hint')}</p>
+        <div class="row" style="margin-bottom:8px">
+          <button class="btn ghost small" id="base-batch-sel">${t('base.batchBtn')}</button>
+          <span id="base-batch-count" style="font-size:12px;opacity:.7"></span>
+        </div>
+        <div id="base-batch-box" class="eth-manage" style="display:${state.baseBatchOpen ? 'block' : 'none'}">
+          <div class="row">
+            <span class="hint" id="base-batch-tip">${t('base.batchTip')}</span>
+          </div>
+          <div class="row">
+            <label>${t('form.audience')}
+              <select id="bbaud">
+                <option value="">${t('base.keep')}</option>
+                <option value="women">${t('aud.women')}</option>
+                <option value="men">${t('aud.men')}</option>
+                <option value="girls">${t('aud.girls')}</option>
+                <option value="boys">${t('aud.boys')}</option>
+                <option value="baby">${t('aud.baby')}</option>
+              </select>
+            </label>
+            <label>${t('form.ageband')}
+              <select id="bbage">
+                <option value="">${t('base.keep')}</option>
+                <option value="adult">${t('age.adult')}</option>
+                <option value="kids">${t('age.kids')}</option>
+                <option value="baby">${t('age.baby')}</option>
+              </select>
+            </label>
+            <label>${t('form.ethnicity')}
+              <select id="bbeth">
+                <option value="">${t('base.keep')}</option>
+                ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(e.label)}</option>`).join('')}
+              </select>
+            </label>
+          </div>
+          <button class="btn gold small" id="base-batch-apply">${t('base.apply')}</button>
+        </div>
         <div class="bases">${state.bases.map((b) => `
-          <div class="base ${state.selectedBase === b.id ? 'sel' : ''}" data-id="${b.id}">
+          <div class="base ${state.selectedBase === b.id ? 'sel' : ''} ${state.selectedBases.includes(b.id) ? 'batch-sel' : ''}" data-id="${b.id}">
             <img src="${b.url}" alt="${escapeHtml(b.name)}" />
             <em>${escapeHtml(b.name)}</em>
-            <button class="btn ghost small" data-del="${b.id}" title="下架此底座">下架</button>
+            <small>${fmtAudience(b.audience) || b.audience || '—'} · ${fmtAge(b.age_band) || b.age_band || '—'} · ${escapeHtml(state.ethnicities.find(x => x.value === b.ethnicity)?.label || b.ethnicity || '—')}</small>
+            <div class="row" style="flex:none">
+              <label title="${t('base.batchTitle')}"><input type="checkbox" data-bsel="${b.id}" ${state.selectedBases.includes(b.id) ? 'checked' : ''} /> ${t('base.batch')}</label>
+              <button class="btn ghost small" data-del="${b.id}" title="${t('base.retireTitle')}">${t('base.retire')}</button>
+            </div>
           </div>`).join('')}</div>
       </section>
       <section class="panel">
-        <h3>上传新底座</h3>
-        <label>名称<input id="bname" placeholder="例如 女装·亚洲模特 B" /></label>
+        <h3>${t('base.upload')}</h3>
+        <label>${t('form.name')}<input id="bname" placeholder="${t('base.namePh')}" /></label>
         <div class="row">
-          <label>受众
+          <label>${t('form.audience')}
             <select id="baud">
-              <option value="women">女装</option>
-              <option value="men">男装</option>
-              <option value="girls">女童</option>
-              <option value="boys">男童</option>
-              <option value="baby">婴幼儿</option>
+              <option value="women">${t('aud.women')}</option>
+              <option value="men">${t('aud.men')}</option>
+              <option value="girls">${t('aud.girls')}</option>
+              <option value="boys">${t('aud.boys')}</option>
+              <option value="baby">${t('aud.baby')}</option>
             </select>
           </label>
-          <label>年龄带
+          <label>${t('form.ageband')}
             <select id="bage">
-              <option value="adult">成人</option>
-              <option value="kids">儿童</option>
-              <option value="baby">婴幼儿</option>
+              <option value="adult">${t('age.adult')}</option>
+              <option value="kids">${t('age.kids')}</option>
+              <option value="baby">${t('age.baby')}</option>
+            </select>
+          </label>
+          <label>${t('form.ethnicity')}
+            <select id="beth">
+              ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(e.label)}</option>`).join('')}
             </select>
           </label>
         </div>
-        <label>备注<input id="bnotes" placeholder="站姿、适合品类" /></label>
-        <label>底图文件<input id="bfile" type="file" accept="image/*" /></label>
-        <button class="btn gold" id="add-base">保存底座</button>
+        <button class="btn ghost small" id="eth-manage" type="button">${t('base.ethManage')}</button>
+        <div id="eth-manage-box" class="eth-manage" style="display:none">
+          <div class="row">
+            <input id="new-eth-value" placeholder="${t('eth.newValue')}" />
+            <input id="new-eth-label" placeholder="${t('eth.newLabel')}" />
+            <button class="btn gold small" id="add-eth">${t('eth.add')}</button>
+          </div>
+          <div class="eth-list">
+            ${(state.ethnicities || []).map((e) => `
+              <div class="eth-item">
+                <span>${escapeHtml(e.label)}</span>
+                <code>${escapeHtml(e.value)}</code>
+                <div class="row" style="flex:none">
+                  <button class="btn ghost small eth-rename" data-value="${e.value}" data-label="${escapeHtml(e.label)}">${t('eth.rename')}</button>
+                  <button class="btn ghost small eth-del" data-value="${e.value}">${t('eth.del')}</button>
+                </div>
+              </div>`).join('')}
+          </div>
+        </div>
+        <label>${t('form.notes')}<input id="bnotes" placeholder="${t('base.notesPh')}" /></label>
+        <label>${t('form.file')}<input id="bfile" type="file" accept="image/*" /></label>
+        <button class="btn gold" id="add-base">${t('base.save')}</button>
         <p class="err" id="base-err"></p>
       </section>
     </div>
@@ -286,9 +416,9 @@ function queueView() {
   const done = state.jobs.filter((j) => j.status === 'done')
   return `
     <section class="panel">
-      <h3>生成队列</h3>
+      <h3>${t('queue.title')}</h3>
       <div class="row" style="margin-bottom:12px">
-        <button class="btn ghost small" id="dl-all">打包下载已完成 ${done.length} 张</button>
+        <button class="btn ghost small" id="dl-all">${t('queue.dlAll', { n: done.length })}</button>
       </div>
       <div class="queue">${jobCards(state.jobs)}</div>
     </section>
@@ -296,33 +426,69 @@ function queueView() {
 }
 
 function embedView() {
-  const snippet = `<iframe src="${location.origin}/embed.html" style="width:100%;min-height:720px;border:0;border-radius:16px"></iframe>`
+  const stores = state.stores || []
+  const listHtml = stores.length ? stores.map((s) => {
+    const snippet = `<iframe src="${location.origin}/embed.html?store=${s.id}" style="width:100%;min-height:720px;border:0;border-radius:16px"></iframe>`
+    return `
+      <div class="store-card">
+        <div class="store-head">
+          <b>${escapeHtml(s.name)}</b>
+          <span class="tag">${escapeHtml(s.platform || 'other')}</span>
+          <span class="hint">${t('embed.product')}${s.product_id ? '#' + escapeHtml(s.product_id) : t('embed.bySku')}</span>
+          <button class="btn ghost small" data-del-store="${s.id}">${t('embed.delStore')}</button>
+        </div>
+        <p class="hint">${t('embed.storeCode')}</p>
+        <div class="code">${escapeHtml(snippet)}</div>
+        <p class="hint">${t('embed.base', { url: escapeHtml('/embed.html?store=' + s.id) })}</p>
+      </div>
+    `
+  }).join('') : `<p class="hint">${t('embed.empty')}</p>`
   return `
     <div class="grid">
       <section class="panel">
-        <h3>嵌进店铺后台</h3>
-        <p class="hint">前端是独立 SPA，用 iframe 或把 /embed.html 挂到现有 admin 路由即可。后端 FastAPI 部署在你的云账号，数据与算力不出域。</p>
-        <div class="code">${escapeHtml(snippet)}</div>
-        <p class="hint">生产环境把 JWT 密钥、管理员密码和 GPU 推理服务配到环境变量。当前演示引擎是服务端合成流水线，接口与 IDM-VTON 任务队列对齐，可替换为 GPU worker。</p>
+        <h3>${t('embed.title')}</h3>
+        <p class="hint">${t('embed.hint')}</p>
+        ${listHtml}
+        <h3 style="margin-top:18px">${t('embed.add')}</h3>
+        <label>${t('embed.sname')}<input id="sname" placeholder="${t('embed.snamePh')}" /></label>
+        <label>${t('embed.platform')}
+            <select id="splatform">
+              <option value="shopify">Shopify</option>
+              <option value="wordpress">WordPress / WooCommerce</option>
+              <option value="tiktok">TikTok Shop</option>
+              <option value="taobao">${t('embed.taobao')}</option>
+              <option value="other">${t('embed.other')}</option>
+            </select>
+          </label>
+        <label>${t('embed.shopUrl')}<input id="sshop" placeholder="${t('embed.shopUrlPh', { shop: '{shop}' })}" /></label>
+        <label>${t('embed.api')}<input id="sapi" placeholder="${t('embed.apiPh')}" /></label>
+        <label>${t('embed.productId')}<input id="sprod" placeholder="${t('embed.productIdPh')}" /></label>
+        <button class="btn gold" id="add-store">${t('embed.add')}</button>
+        <p class="err" id="store-err"></p>
       </section>
       <section class="panel">
-        <h3>API</h3>
+        <h3>${t('embed.pushTitle')}</h3>
+        <p class="hint">${t('embed.pushHint')}</p>
         <div class="code">POST /api/auth/login
 GET  /api/bases
 POST /api/jobs/batch
 GET  /api/jobs
-POST /api/jobs/{id}/push
-GET  /api/download/{id}</div>
+POST /api/jobs/{id}/push   body: {"store_ids":["x"],"product_id":"123"}
+GET  /api/download/{id}
+GET/POST/PATCH/DELETE /api/stores</div>
+        <p class="hint">${t('embed.pushAdapter')}</p>
+        <p class="hint">${t('embed.prodNote')}</p>
       </section>
     </div>
   `
 }
 
 function baseCards() {
-  return state.bases.map((b) => `
+  const list = state.ethnicity ? state.bases.filter((b) => b.ethnicity === state.ethnicity) : state.bases
+  return list.map((b) => `
     <div class="base ${state.selectedBase === b.id ? 'sel' : ''}" data-id="${b.id}">
       <img src="${b.url}" alt="${escapeHtml(b.name)}" />
-      <em>${AUDIENCE_LABEL[b.audience] || escapeHtml(b.name)}</em>
+      <em>${ethnicityLabel(b.ethnicity) ? ethnicityLabel(b.ethnicity) + ' · ' : ''}${fmtAudience(b.audience) || escapeHtml(b.name)}</em>
     </div>
   `).join('')
 }
@@ -339,25 +505,48 @@ function clothLibrary() {
 }
 
 function uploadLibrary() {
+  const cats = state.uploadCategories ? Object.keys(state.uploadCategories).filter(c => c !== 'default') : []
   return `
     <div class="upload-toolbar">
-      <button class="btn ghost small" id="upload-lib-add">上传图片</button>
+      <button class="btn ghost small" id="upload-lib-add">${t('upl.add')}</button>
       <input type="file" id="upload-lib-file" accept="image/*" multiple hidden />
       <select id="cat-filter" class="cat-filter">
-        <option value="">全部分类</option>
-        <option value="default">未分类</option>
-        ${state.uploadCategories ? Object.keys(state.uploadCategories).filter(c => c !== 'default').map(c => `<option value="${c}">${c}</option>`).join('') : ''}
+        <option value="">${t('upl.all')}</option>
+        <option value="default">${t('upl.unsorted')}</option>
+        ${cats.map(c => `<option value="${c}">${c}</option>`).join('')}
       </select>
-      <button class="btn ghost small" id="cat-move">移动到分类</button>
-      <input type="text" id="cat-name" placeholder="分类名称" style="width:120px" hidden />
+      <button class="btn ghost small" id="cat-move">${t('upl.move')}</button>
+      <select id="cat-move-select" style="display:none">
+        <option value="">${t('upl.choose')}</option>
+        ${cats.map(c => `<option value="${c}">${c}</option>`).join('')}
+        <option value="__new__">${t('upl.new')}</option>
+      </select>
+      <input type="text" id="cat-name" placeholder="${t('upl.newName')}" style="width:120px;display:none" />
+      <button class="btn ghost small" id="cat-manage">${t('upl.manage')}</button>
+    </div>
+    <div id="cat-manage-box" class="cat-manage" style="display:none">
+      <div class="row">
+        <input id="new-cat-name" placeholder="${t('upl.newName')}" />
+        <button class="btn gold small" id="add-cat">${t('upl.create')}</button>
+      </div>
+      <div class="cat-list">
+        ${cats.length ? cats.map(c => `
+          <div class="cat-item">
+            <code>${escapeHtml(c)}</code> <span class="hint">${t('upl.count', { n: state.uploadCategories[c] || 0 })}</span>
+            <div class="row" style="flex:none">
+              <button class="btn ghost small cat-rename" data-cat="${escapeHtml(c)}">${t('eth.rename')}</button>
+              <button class="btn ghost small cat-del" data-cat="${escapeHtml(c)}">${t('eth.del')}</button>
+            </div>
+          </div>`).join('') : `<p class="hint">${t('upl.empty')}</p>`}
+      </div>
     </div>
     <div class="upload-list">
-      ${!state.uploads.length ? '<p class="hint">暂无已上传的图片。上传的图片会自动保存到此处，下次可直接选择复用。</p>' : ''}
+      ${!state.uploads.length ? `<p class="hint">${t('upl.noUpload')}</p>` : ''}
       ${state.uploads.slice(0, 24).map((u) => `
         <div class="cloth-item upload-item ${state.selectedUploads.includes(u.name) ? 'selected' : ''}" data-upload="${u.name}">
           <img src="${u.url}" alt="${u.name}" loading="lazy" />
           <span>${u.name.replace(/^upload_[^_]+_/, '').replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
-          <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="删除">x</button>
+          <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="${t('upl.del')}">x</button>
         </div>
       `).join('')}
     </div>
@@ -365,21 +554,21 @@ function uploadLibrary() {
 }
 
 function jobCards(jobs) {
-  if (!jobs.length) return '<p class="hint">暂无任务</p>'
+  if (!jobs.length) return `<p class="hint">${t('queue.empty')}</p>`
   return jobs.map((j) => `
     <article class="job" data-id="${j.id}">
       <img class="${j.status === 'done' ? 'zoomable' : ''}" src="${j.preview_url || j.source_url}" alt="" data-preview="${j.status === 'done' ? j.id : ''}" />
       <div class="meta">
         <b>${escapeHtml(j.title || j.source_name)}</b>
-        <small>${AUDIENCE_LABEL[j.audience] || j.audience} · ${escapeHtml(j.message)}</small>
+        <small>${fmtAudience(j.audience) || j.audience} · ${escapeHtml(j.message)}</small>
         <div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       </div>
       <div>
         <div class="status ${j.status}">${j.status}</div>
         <div class="actions">
-          ${j.status === 'done' ? `<button class="btn ghost small" data-preview="${j.id}">大图预览</button>
-          <a class="btn ghost small" href="/api/download/${j.id}" data-dl="${j.id}">下载</a>
-          <button class="btn ghost small" data-push="${j.id}">推送到商品页</button>` : ''}
+          ${j.status === 'done' ? `<button class="btn ghost small" data-preview="${j.id}">${t('job.preview')}</button>
+          <a class="btn ghost small" href="/api/download/${j.id}" data-dl="${j.id}">${t('job.download')}</a>
+          <button class="btn ghost small" data-push="${j.id}">${j.pushed_stores?.length ? t('job.pushedCount', { n: j.pushed_stores.length }) : t('job.push')}</button>` : ''}
         </div>
       </div>
     </article>
@@ -391,6 +580,8 @@ function escapeHtml(s) {
 }
 
 function bindLogin() {
+  const langBtn = document.querySelector('#login-lang')
+  if (langBtn) langBtn.onclick = () => { setLang(getLang() === 'zh' ? 'en' : 'zh'); render() }
   document.querySelector('#login').onclick = async () => {
     const err = document.querySelector('#login-err')
     err.textContent = ''
@@ -414,24 +605,138 @@ function bindLogin() {
 }
 
 function bindDashboard() {
+  const langSwitch = document.querySelector('#lang-switch')
+  if (langSwitch) langSwitch.onclick = () => { setLang(getLang() === 'zh' ? 'en' : 'zh'); render() }
   document.querySelectorAll('.nav button[data-view]').forEach((b) => {
     b.onclick = () => { state.view = b.dataset.view; render() }
   })
   const logoutBtn = document.querySelector('#logout')
   if (logoutBtn) logoutBtn.onclick = logout
+  const ethFilter = document.querySelector('#eth-filter')
+  if (ethFilter) {
+    ethFilter.onchange = (e) => { state.ethnicity = e.target.value; render() }
+  }
+  const ethManage = document.querySelector('#eth-manage')
+  const ethBox = document.querySelector('#eth-manage-box')
+  if (ethManage && ethBox) {
+    ethManage.onclick = () => { ethBox.style.display = ethBox.style.display === 'none' ? 'block' : 'none' }
+  }
+  const addEth = document.querySelector('#add-eth')
+  if (addEth) {
+    addEth.onclick = async () => {
+      const value = document.querySelector('#new-eth-value').value.trim()
+      const label = document.querySelector('#new-eth-label').value.trim()
+      if (!value || !label) { alert(t('eth.needBoth')); return }
+      try {
+        await api('/api/ethnicities', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value, label })
+        })
+        document.querySelector('#new-eth-value').value = ''
+        document.querySelector('#new-eth-label').value = ''
+        await refreshJobs()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  }
+  document.querySelectorAll('.eth-rename').forEach((btn) => {
+    btn.onclick = async () => {
+      const value = btn.dataset.value
+      const label = prompt(t('eth.renamePh'), btn.dataset.label)
+      if (!label || label === btn.dataset.label) return
+      try {
+        await api(`/api/ethnicities/${encodeURIComponent(value)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ label })
+        })
+        await refreshJobs()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  })
+  document.querySelectorAll('.eth-del').forEach((btn) => {
+    btn.onclick = async () => {
+      const value = btn.dataset.value
+      if (!confirm(t('eth.delConfirm', { v: btn.dataset.value }))) return
+      try {
+        await api(`/api/ethnicities/${encodeURIComponent(value)}`, { method: 'DELETE' })
+        await refreshJobs()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  })
   document.querySelectorAll('.base').forEach((el) => {
     el.onclick = (e) => {
       if (e.target.dataset.del) return
+      if (e.target.dataset.bsel) return
       const base = state.bases.find((b) => b.id === el.dataset.id)
       if (base && base.audience) state.audience = base.audience
       state.selectedBase = el.dataset.id
       render()
     }
   })
+  document.querySelectorAll('[data-bsel]').forEach((cb) => {
+    cb.onclick = (e) => e.stopPropagation()
+    cb.onchange = () => {
+      const id = cb.dataset.bsel
+      if (cb.checked) {
+        if (!state.selectedBases.includes(id)) state.selectedBases.push(id)
+      } else {
+        state.selectedBases = state.selectedBases.filter((x) => x !== id)
+      }
+      render()
+    }
+  })
+  const baseBatchSel = document.querySelector('#base-batch-sel')
+  const baseBatchBox = document.querySelector('#base-batch-box')
+  if (baseBatchSel && baseBatchBox) {
+    const countEl = document.querySelector('#base-batch-count')
+    if (countEl) countEl.textContent = state.selectedBases.length ? t('base.selCount', { n: state.selectedBases.length }) : ''
+    baseBatchSel.onclick = () => {
+      state.baseBatchOpen = !state.baseBatchOpen
+      render()
+    }
+    const baseBatchApply = document.querySelector('#base-batch-apply')
+    baseBatchApply.onclick = async () => {
+      if (!state.selectedBases.length) { alert(t('base.needSel')); return }
+      const patch = {}
+      const baud = document.querySelector('#bbaud').value
+      const bage = document.querySelector('#bbage').value
+      const bbeth = document.querySelector('#bbeth').value
+      if (baud) patch.audience = baud
+      if (bage) patch.age_band = bage
+      if (bbeth) patch.ethnicity = bbeth
+      if (!Object.keys(patch).length) { alert(t('base.needCat')); return }
+      try {
+        const res = await api('/api/bases/batch/patch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ids: state.selectedBases, patch })
+        })
+        if (!res.ok) throw new Error(res.detail || t('base.batchFail'))
+        state.selectedBases = []
+        document.querySelector('#bbaud').value = ''
+        document.querySelector('#bbage').value = ''
+        document.querySelector('#bbeth').value = ''
+        await refreshJobs()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  }
   document.querySelectorAll('[data-del]').forEach((btn) => {
     btn.onclick = async (e) => {
       e.stopPropagation()
-      if (!confirm('确认下架此底座？已生成的任务不受影响。')) return
+      if (!confirm(t('base.retireConfirm'))) return
       try {
         await api(`/api/bases/${btn.dataset.del}`, { method: 'DELETE' })
         if (state.selectedBase === btn.dataset.del) state.selectedBase = ''
@@ -483,17 +788,19 @@ function bindDashboard() {
       addSelected.onclick = async () => {
         for (const name of state.selectedUploads) {
           try {
-            const res = await fetch(`/files/uploads/${name}`)
+            const upload = state.uploads.find(u => u.name === name)
+            const url = upload ? upload.url : `/files/uploads/${name}`
+            const res = await fetch(url)
             const blob = await res.blob()
             state.files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
           } catch (e) {
-            console.error('加载图片失败', name, e)
+            console.error(t('job.loadedErr'), name, e)
           }
         }
         state.selectedUploads = []
         renderFileThumbs()
         const run = document.querySelector('#run')
-        if (run) run.textContent = `一键生成 ${state.files.length} 件`
+        if (run) run.textContent = t('btn.generate', { n: state.files.length })
         render()
       }
     }
@@ -512,9 +819,9 @@ function bindDashboard() {
         state.files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
         renderFileThumbs()
         const run = document.querySelector('#run')
-        if (run) run.textContent = `一键生成 ${state.files.length} 件`
+        if (run) run.textContent = t('btn.generate', { n: state.files.length })
       } catch (e) {
-        console.error('加载示例服装失败', e)
+        console.error(t('job.loadSampleErr'), e)
       }
     }
   })
@@ -545,16 +852,88 @@ function bindDashboard() {
       }
     }
   }
+  const catManage = document.querySelector('#cat-manage')
+  const catBox = document.querySelector('#cat-manage-box')
+  if (catManage && catBox) {
+    catManage.onclick = () => { catBox.style.display = catBox.style.display === 'none' ? 'block' : 'none' }
+  }
+  const addCat = document.querySelector('#add-cat')
+  if (addCat) {
+    addCat.onclick = async () => {
+      const name = document.querySelector('#new-cat-name').value.trim()
+      if (!name) { alert(t('upl.nameRequired')); return }
+      try {
+        await api('/api/uploads/categories', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        })
+        document.querySelector('#new-cat-name').value = ''
+        await refreshUploads()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  }
+  document.querySelectorAll('.cat-rename').forEach((btn) => {
+    btn.onclick = async () => {
+      const cat = btn.dataset.cat
+      const name = prompt(t('upl.newName'), cat)
+      if (!name || name === cat) return
+      try {
+        await api(`/api/uploads/categories/${encodeURIComponent(cat)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        })
+        await refreshUploads()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  })
+  document.querySelectorAll('.cat-del').forEach((btn) => {
+    btn.onclick = async () => {
+      const cat = btn.dataset.cat
+      if (!confirm(t('upl.delCatConfirm', { c: cat }))) return
+      try {
+        await api(`/api/uploads/categories/${encodeURIComponent(cat)}`, { method: 'DELETE' })
+        await refreshUploads()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  })
   const catMove = document.querySelector('#cat-move')
+  const catMoveSelect = document.querySelector('#cat-move-select')
   const catName = document.querySelector('#cat-name')
   if (catMove) {
     catMove.onclick = () => {
-      catName.hidden = !catName.hidden
-      catName.focus()
+      if (state.selectedUploads.length === 0) {
+        alert(t('upl.moveHint'))
+        return
+      }
+      const show = catMoveSelect.style.display !== 'inline-block'
+      catMoveSelect.style.display = show ? 'inline-block' : 'none'
+      catName.style.display = 'none'
+      catMoveSelect.value = ''
     }
-    catName.onkeydown = async (e) => {
-      if (e.key === 'Enter' && catName.value && state.selectedUploads.length) {
-        const category = catName.value.trim()
+    catMoveSelect.onchange = () => {
+      const val = catMoveSelect.value
+      if (!val) return
+      if (val === '__new__') {
+        catName.style.display = 'inline-block'
+        catName.focus()
+        return
+      }
+      applyCategory(val)
+    }
+    const applyCategory = async (category) => {
+      if (!category || state.selectedUploads.length === 0) return
+      try {
         for (const name of state.selectedUploads) {
           await api(`/api/uploads/${name}/move`, {
             method: 'POST',
@@ -564,13 +943,35 @@ function bindDashboard() {
         }
         state.selectedUploads = []
         catName.value = ''
-        catName.hidden = true
+        catName.style.display = 'none'
+        catMoveSelect.style.display = 'none'
+        catMoveSelect.value = ''
         await refreshUploads()
         render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+    catName.onkeydown = async (e) => {
+      if (e.key === 'Enter' && catName.value && state.selectedUploads.length) {
+        const category = catName.value.trim()
+        try {
+          const existing = await api('/api/uploads/categories')
+          if (!existing.includes(category)) {
+            await api('/api/uploads/categories', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: category })
+            })
+          }
+          await applyCategory(category)
+        } catch (err) {
+          alert(err.message)
+        }
       }
       if (e.key === 'Escape') {
         catName.value = ''
-        catName.hidden = true
+        catName.style.display = 'none'
         render()
       }
     }
@@ -589,9 +990,9 @@ function bindDashboard() {
             headers: { Authorization: `Bearer ${state.token}` },
             body: form
           })
-          if (!res.ok) throw new Error('上传失败')
+          if (!res.ok) throw new Error(t('upl.uploadFail'))
         } catch (e) {
-          alert(`上传 ${f.name} 失败: ${e.message}`)
+          alert(t('upl.uploadFileFail', { n: f.name, msg: e.message }))
         }
       }
       uploadFile.value = ''
@@ -602,7 +1003,7 @@ function bindDashboard() {
   document.querySelectorAll('[data-del-upload]').forEach((btn) => {
     btn.onclick = async (e) => {
       e.stopPropagation()
-      if (!confirm('确认删除此图片？')) return
+      if (!confirm(t('upl.delConfirm'))) return
       try {
         await api(`/api/uploads/${btn.dataset.delUpload}`, { method: 'DELETE' })
         await refreshUploads()
@@ -613,16 +1014,36 @@ function bindDashboard() {
     }
   })
   document.querySelectorAll('[data-push]').forEach((btn) => {
-    btn.onclick = async () => {
-      await api(`/api/jobs/${btn.dataset.push}/push`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sku: '', product_url: '/products/staging' })
-      })
-      await refreshJobs()
-      render()
-    }
+    btn.onclick = () => { state.pushJob = btn.dataset.push; render() }
   })
+  const closePU = document.querySelector('#close-push')
+  const closePU2 = document.querySelector('#close-push-2')
+  if (closePU) closePU.onclick = () => { state.pushJob = ''; render() }
+  if (closePU2) closePU2.onclick = () => { state.pushJob = ''; render() }
+  const pushModal = document.querySelector('#push-modal')
+  if (pushModal) pushModal.onclick = (e) => { if (e.target === pushModal) { state.pushJob = ''; render() } }
+  const confirmPush = document.querySelector('#confirm-push')
+  if (confirmPush) {
+    confirmPush.onclick = async () => {
+      const ids = Array.from(document.querySelectorAll('#push-modal [data-store]:checked')).map((el) => el.dataset.store)
+      const productIdEl = document.querySelector('#push-product-id')
+      const productId = productIdEl ? productIdEl.value.trim() : ''
+      try {
+        await api(`/api/jobs/${state.pushJob}/push`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ sku: '', product_url: '', product_id: productId, store_ids: ids })
+        })
+        const job = state.jobs.find((j) => j.id === state.pushJob)
+        if (job) { job.message = t('push.updated'); job.pushed_stores = ids }
+        state.pushJob = ''
+        await refreshJobs()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  }
   document.querySelectorAll('[data-dl]').forEach((a) => {
     a.onclick = async (e) => {
       e.preventDefault()
@@ -637,6 +1058,49 @@ function bindDashboard() {
   })
   const dlAll = document.querySelector('#dl-all')
   if (dlAll) dlAll.onclick = downloadAll
+  document.querySelectorAll('[data-del-store]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation()
+      if (!confirm(t('embed.delConfirm'))) return
+      try {
+        await api(`/api/stores/${btn.dataset.delStore}`, { method: 'DELETE' })
+        await refreshStores()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
+  })
+  const addStore = document.querySelector('#add-store')
+  if (addStore) {
+    addStore.onclick = async () => {
+      const err = document.querySelector('#store-err')
+      err.textContent = ''
+      const name = document.querySelector('#sname').value.trim()
+      if (!name) { err.textContent = t('embed.nameRequired'); return }
+      try {
+        await api('/api/stores', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            name,
+            platform: document.querySelector('#splatform').value,
+            shop_url: document.querySelector('#sshop').value.trim(),
+            webhook_url: '',
+            api_key: document.querySelector('#sapi').value.trim(),
+            product_id: document.querySelector('#sprod').value.trim()
+          })
+        })
+        document.querySelector('#sname').value = ''
+        document.querySelector('#sapi').value = ''
+        document.querySelector('#sprod').value = ''
+        await refreshStores()
+        render()
+      } catch (e) {
+        err.textContent = e.message
+      }
+    }
+  }
 }
 
 function addFiles(list) {
@@ -649,7 +1113,7 @@ function renderFileThumbs() {
   const run = document.querySelector('#run')
   if (!box) return
   box.innerHTML = state.files.slice(0, 24).map((f) => `<img src="${URL.createObjectURL(f)}" alt="${f.name}">`).join('')
-  if (run) run.textContent = `一键生成 ${state.files.length} 件`
+  if (run) run.textContent = t('btn.generate', { n: state.files.length })
 }
 
 async function loadSamples() {
@@ -667,11 +1131,11 @@ async function submitBatch() {
   const err = document.querySelector('#batch-err')
   err.textContent = ''
   if (!state.selectedBase) {
-    err.textContent = '请先选择模特底座'
+    err.textContent = t('err.selectedBase')
     return
   }
   if (!state.files.length) {
-    err.textContent = '请拖入服装图'
+    err.textContent = t('err.dropFile')
     return
   }
   const form = new FormData()
@@ -697,13 +1161,14 @@ async function saveBase() {
   err.textContent = ''
   const file = document.querySelector('#bfile').files[0]
   if (!file) {
-    err.textContent = '请选择底图'
+    err.textContent = t('err.baseFile')
     return
   }
   const form = new FormData()
   form.append('name', document.querySelector('#bname').value || file.name)
   form.append('audience', document.querySelector('#baud').value)
   form.append('age_band', document.querySelector('#bage').value)
+  form.append('ethnicity', document.querySelector('#beth').value)
   form.append('notes', document.querySelector('#bnotes').value)
   form.append('file', file)
   try {
@@ -729,18 +1194,20 @@ async function downloadAll() {
 }
 
 async function refreshJobs() {
-  const [bases, jobs, stats, settings, me] = await Promise.all([
+  const [bases, jobs, stats, settings, me, ethnicities] = await Promise.all([
     api('/api/bases'),
     api('/api/jobs'),
     api('/api/stats'),
     api('/api/settings'),
-    api('/api/me')
+    api('/api/me'),
+    api('/api/ethnicities').catch(() => [])
   ])
   state.bases = bases
   state.jobs = jobs
   state.stats = stats
   state.settings = settings
   state.user = me
+  state.ethnicities = ethnicities
   if (!state.selectedBase && bases[0]) state.selectedBase = bases[0].id
 }
 
@@ -755,12 +1222,21 @@ async function refreshUploads() {
   } catch {}
 }
 
+async function refreshStores() {
+  try {
+    state.stores = await api('/api/stores')
+  } catch {}
+}
+
 async function boot() {
   await refreshJobs()
   await refreshUploads()
+  await refreshStores()
   try {
     state.license = await api('/api/license')
   } catch {}
+  const params = new URLSearchParams(location.search)
+  state.storeCode = params.get('store') || ''
   render()
   setInterval(async () => {
     if (!state.token) return

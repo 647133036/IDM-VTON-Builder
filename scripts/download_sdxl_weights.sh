@@ -25,16 +25,19 @@ huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
     --local-dir "${MODEL_DIR}/sdxl_base"
 
 echo ""
-echo "==> 下载 ControlNet Canny..."
-huggingface-cli download lllyasviel/control_v11p_sd15_canny \
-    --include "*.safetensors" \
-    --local-dir "${MODEL_DIR}/controlnet"
+echo "==> 下载 ControlNet Canny (SDXL)..."
+huggingface-cli download xinsir/controlnet-canny-sdxl-1.0 \
+    --local-dir "${MODEL_DIR}/controlnet_canny"
 
 echo ""
-echo "==> 下载 ControlNet OpenPose..."
-huggingface-cli download lllyasviel/control_v11p_sd15_openpose \
-    --include "*.safetensors" \
-    --local-dir "${MODEL_DIR}/controlnet"
+echo "==> 下载 ControlNet OpenPose (SDXL)..."
+huggingface-cli download xinsir/controlnet-openpose-sdxl-1.0 \
+    --local-dir "${MODEL_DIR}/controlnet_openpose"
+
+echo ""
+echo "==> 下载 OpenPose/Canny 预处理器权重 (Annotators)..."
+huggingface-cli download lllyasviel/Annotators \
+    --local-dir "${MODEL_DIR}/annotators"
 
 echo ""
 echo "==> 下载 IP-Adapter image_encoder..."

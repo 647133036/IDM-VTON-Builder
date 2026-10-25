@@ -3,10 +3,9 @@ from typing import Optional
 import shutil
 import uuid
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from auth import USERS, current_user, issue_token
@@ -18,11 +17,20 @@ from store import (
     TRASH,
     UPLOADS,
     add_base,
+    add_ethnicity,
+    add_store,
     create_job,
-    get_job,
     delete_base,
+    delete_ethnicity,
+    delete_store,
+    embed_url,
+    find_in_dir,
+    get_job,
+    get_store,
     list_bases,
+    list_ethnicities,
     list_jobs,
+    list_stores,
     patch_job,
     public_url,
     seed_bases_if_empty,
@@ -30,8 +38,11 @@ from store import (
     stats,
     uid,
     update_base,
+    update_ethnicity,
     update_settings,
+    update_store,
 )
+from push import push_store
 from worker import start_worker
 
 app = FastAPI(title="Atelier Try-On", version="0.1.0")
@@ -45,7 +56,24 @@ app.add_middleware(
 
 seed_bases_if_empty()
 start_worker()
-app.mount("/files", StaticFiles(directory=str(DATA)), name="files")
+
+
+@app.get("/files/{path:path}")
+def serve_file(path: str):
+    rel = Path(path)
+    target = (DATA / rel).resolve()
+    if DATA.resolve() not in target.parents and target != DATA.resolve():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if target.is_file():
+        return FileResponse(target)
+    uploads_candidate = DATA / "uploads" / rel.name
+    if str(rel).startswith("uploads"):
+        found = find_in_dir(UPLOADS, rel.name)
+        if found:
+            return FileResponse(found)
+    if uploads_candidate.is_file():
+        return FileResponse(uploads_candidate)
+    raise HTTPException(status_code=404, detail="文件不存在")
 
 
 class LoginBody(BaseModel):
@@ -65,7 +93,45 @@ class BasePatch(BaseModel):
     name: Optional[str] = None
     audience: Optional[str] = None
     age_band: Optional[str] = None
+    ethnicity: Optional[str] = None
+    pose: Optional[str] = None
     notes: Optional[str] = None
+
+
+class BaseBatchPatch(BaseModel):
+    ids: list[str]
+    patch: dict[str, Optional[str]] = {}
+
+
+class EthnicityBody(BaseModel):
+    value: str
+    label: str
+
+
+class EthnicityPatch(BaseModel):
+    label: Optional[str] = None
+
+
+class CategoryBody(BaseModel):
+    name: str
+
+
+class StoreBody(BaseModel):
+    name: str
+    platform: Optional[str] = "other"
+    shop_url: Optional[str] = ""
+    webhook_url: Optional[str] = ""
+    api_key: Optional[str] = ""
+    product_id: Optional[str] = ""
+
+
+class StorePatch(BaseModel):
+    name: Optional[str] = None
+    platform: Optional[str] = None
+    shop_url: Optional[str] = None
+    webhook_url: Optional[str] = None
+    api_key: Optional[str] = None
+    product_id: Optional[str] = None
 
 
 class MoveBody(BaseModel):
@@ -76,6 +142,8 @@ class MoveBody(BaseModel):
 class PushBody(BaseModel):
     sku: Optional[str] = ""
     product_url: Optional[str] = ""
+    product_id: Optional[str] = ""
+    store_ids: Optional[list[str]] = []
 
 
 @app.post("/api/auth/login")
@@ -124,10 +192,13 @@ async def api_add_base(
     name: str = Form(...),
     audience: str = Form("women"),
     age_band: str = Form("adult"),
+    ethnicity: str = Form("east"),
     notes: str = Form(""),
     file: UploadFile = File(...),
     _: dict = Depends(current_user),
 ):
+    if ethnicity not in {e["value"] for e in list_ethnicities()}:
+        raise HTTPException(status_code=400, detail=f"未知人种标签: {ethnicity}")
     ext = Path(file.filename or "base.png").suffix.lower() or ".png"
     base_id = uid("base")
     filename = f"{base_id}{ext}"
@@ -138,6 +209,7 @@ async def api_add_base(
         "name": name,
         "audience": audience,
         "age_band": age_band,
+        "ethnicity": ethnicity,
         "pose": "front",
         "file": filename,
         "notes": notes,
@@ -158,6 +230,24 @@ def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(current_user
         raise HTTPException(status_code=404, detail="底座不存在") from exc
 
 
+@app.post("/api/bases/batch/patch")
+def api_patch_bases_batch(body: BaseBatchPatch, _: dict = Depends(current_user)):
+    patch = {k: v for k, v in body.patch.items() if v is not None}
+    if not patch:
+        raise HTTPException(status_code=400, detail="无可更新的属性")
+    allowed = {"name", "audience", "age_band", "ethnicity", "pose", "notes"}
+    patch = {k: v for k, v in patch.items() if k in allowed}
+    if "ethnicity" in patch and patch["ethnicity"] not in {e["value"] for e in list_ethnicities()}:
+        raise HTTPException(status_code=400, detail=f"未知人种标签: {patch['ethnicity']}")
+    updated = []
+    for base_id in body.ids:
+        try:
+            updated.append(update_base(base_id, dict(patch)))
+        except KeyError:
+            continue
+    return {"ok": True, "count": len(updated), "bases": updated}
+
+
 @app.delete("/api/bases/{base_id}")
 def api_delete_base(base_id: str, _: dict = Depends(current_user)):
     try:
@@ -165,6 +255,107 @@ def api_delete_base(base_id: str, _: dict = Depends(current_user)):
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="底座不存在") from exc
     return {"ok": True, "id": base_id}
+
+
+@app.get("/api/ethnicities")
+def api_ethnicities(_: dict = Depends(current_user)):
+    return list_ethnicities()
+
+
+@app.post("/api/ethnicities")
+def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(current_user)):
+    value = body.value.strip()
+    label = body.label.strip()
+    if not value or not label:
+        raise HTTPException(status_code=400, detail="人种 value 与 label 不能为空")
+    try:
+        return add_ethnicity({"value": value, "label": label})
+    except KeyError:
+        raise HTTPException(status_code=400, detail="人种标签已存在")
+
+
+@app.patch("/api/ethnicities/{value}")
+def api_patch_ethnicity(value: str, body: EthnicityPatch, _: dict = Depends(current_user)):
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        return update_ethnicity(value, patch)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="人种标签不存在") from exc
+
+
+@app.delete("/api/ethnicities/{value}")
+def api_delete_ethnicity(value: str, _: dict = Depends(current_user)):
+    try:
+        delete_ethnicity(value)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="人种标签不存在") from exc
+    return {"ok": True, "value": value}
+
+
+def _origin(request: Request) -> str:
+    forwarded_host = request.headers.get("x-forwarded-host")
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    forwarded_port = request.headers.get("x-forwarded-port")
+    if forwarded_host:
+        proto = forwarded_proto or "http"
+        host = forwarded_host
+        if forwarded_port and forwarded_port not in ("80", "443"):
+            host = f"{host}:{forwarded_port}"
+        return f"{proto}://{host}"
+    base = str(request.base_url).rstrip("/")
+    if base.endswith("/api"):
+        base = base[:-4]
+    return base
+
+
+@app.get("/api/stores")
+def api_stores(request: Request, _: dict = Depends(current_user)):
+    origin = _origin(request)
+    items = []
+    for s in list_stores():
+        item = dict(s)
+        item["embed_url"] = embed_url(origin, s["id"])
+        items.append(item)
+    return items
+
+
+@app.post("/api/stores")
+def api_add_store(body: StoreBody, request: Request, _: dict = Depends(current_user)):
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="店铺名称不能为空")
+    meta = {
+        "id": uid("store"),
+        "name": name,
+        "platform": body.platform or "other",
+        "shop_url": body.shop_url or "",
+        "webhook_url": body.webhook_url or "",
+        "api_key": body.api_key or "",
+        "product_id": body.product_id or "",
+        "created_at": int(__import__("time").time()),
+        "active": True,
+    }
+    created = add_store(meta)
+    created["embed_url"] = embed_url(_origin(request), created["id"])
+    return created
+
+
+@app.patch("/api/stores/{store_id}")
+def api_patch_store(store_id: str, body: StorePatch, _: dict = Depends(current_user)):
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    try:
+        return update_store(store_id, patch)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="店铺不存在") from exc
+
+
+@app.delete("/api/stores/{store_id}")
+def api_delete_store(store_id: str, _: dict = Depends(current_user)):
+    try:
+        delete_store(store_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="店铺不存在") from exc
+    return {"ok": True, "id": store_id}
 
 
 @app.get("/api/jobs")
@@ -257,6 +448,54 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
         dest.unlink()
     p.replace(dest)
     return {"ok": True, "filename": safe_name, "category": category}
+
+
+@app.post("/api/uploads/categories")
+def api_add_upload_category(body: CategoryBody, _: dict = Depends(current_user)):
+    name = Path(body.name).name.strip()
+    if not name or name in ("default", "."):
+        raise HTTPException(status_code=400, detail="分类名称无效")
+    cat_dir = UPLOADS / name
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    return {"ok": True, "category": name}
+
+
+@app.patch("/api/uploads/categories/{category}")
+def api_rename_upload_category(category: str, body: CategoryBody, _: dict = Depends(current_user)):
+    src_dir = UPLOADS / Path(category).name
+    new_name = Path(body.name).name.strip()
+    if not src_dir.is_dir():
+        raise HTTPException(status_code=404, detail="分类不存在")
+    if not new_name or new_name in ("default", "."):
+        raise HTTPException(status_code=400, detail="分类名称无效")
+    if new_name == src_dir.name:
+        return {"ok": True, "category": new_name}
+    if (UPLOADS / new_name).exists():
+        raise HTTPException(status_code=400, detail=f"分类已存在: {new_name}")
+    src_dir.rename(UPLOADS / new_name)
+    return {"ok": True, "category": new_name}
+
+
+@app.delete("/api/uploads/categories/{category}")
+def api_delete_upload_category(category: str, _: dict = Depends(current_user)):
+    cat_dir = UPLOADS / Path(category).name
+    if not cat_dir.is_dir():
+        raise HTTPException(status_code=404, detail="分类不存在")
+    moved = 0
+    for p in cat_dir.iterdir():
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            dest = UPLOADS / p.name
+            i = 1
+            while dest.exists():
+                dest = UPLOADS / f"{p.stem}_{i}{p.suffix}"
+                i += 1
+            p.replace(dest)
+            moved += 1
+    try:
+        cat_dir.rmdir()
+    except OSError:
+        cat_dir.rename(TRASH / f"category_{cat_dir.name}")
+    return {"ok": True, "category": category, "moved_to_default": moved}
 
 
 @app.get("/api/uploads/categories")
@@ -365,12 +604,46 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(current_user)):
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     if job["status"] != "done":
         raise HTTPException(status_code=400, detail="仅已完成的成品可推送到商品页")
+    stores = list_stores()
+    store_ids = body.store_ids or []
+    if not store_ids:
+        store_ids = [s["id"] for s in stores]
+    existing = {s["id"]: s for s in stores}
+    store_ids = [sid for sid in store_ids if sid in existing]
+    if not store_ids:
+        raise HTTPException(status_code=400, detail="未找到可推送的店铺，请先在「店铺嵌入」页添加")
+
+    push_body = {
+        "sku": body.sku or job.get("sku", ""),
+        "product_url": body.product_url or "",
+        "product_id": body.product_id or "",
+    }
+    results = {}
+    pushed = []
+    push_notes = []
+    for sid in store_ids:
+        store = existing[sid]
+        res = push_store(job, store, push_body)
+        results[sid] = res
+        if res["ok"]:
+            pushed.append(sid)
+            push_notes.append(f"{store['name']}: {res['message']}")
+        else:
+            push_notes.append(f"{store['name']}: 失败 {res['message']}")
+
+    prev = job.get("pushed_stores", [])
+    for sid in pushed:
+        if sid not in prev:
+            prev.append(sid)
+    message = "; ".join(push_notes) if push_notes else "未推送任何店铺"
     return patch_job(
         job_id,
         {
             "sku": body.sku or job.get("sku", ""),
-            "message": f"已推送到商品页 {body.product_url or job.get('title', '')}",
-            "pushed": True,
+            "message": message,
+            "pushed": bool(pushed),
+            "pushed_stores": prev,
+            "push_results": results,
         },
     )
 
@@ -390,6 +663,7 @@ def license_status():
         "idm_vton_license": "CC BY-NC-SA 4.0",
         "idm_vton_commercial_use": "禁止",
         "sdxl_available": status["sdxl_available"],
+        "gpu_available": status["gpu_available"],
         "current_engine": status["engine"],
         "compliance_advice": status["compliance_advice"],
     }

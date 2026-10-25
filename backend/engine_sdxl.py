@@ -34,7 +34,7 @@ GARMENT_PROMPT_SUFFIX = {
 
 
 def sdxl_available() -> tuple[bool, str]:
-    required = ["sdxl_base", "controlnet"]
+    required = ["sdxl_base", "controlnet_openpose", "controlnet_canny"]
     missing = [d for d in required if not (SDXL_DIR / d).exists()]
     if missing:
         return False, f"缺少权重: {', '.join(missing)}"
@@ -49,14 +49,14 @@ def sdxl_available() -> tuple[bool, str]:
 
 def _get_openpose_control(image: Image.Image) -> Image.Image:
     from controlnet_aux import OpenPoseDetector
-    detector = OpenPoseDetector.from_pretrained("lllyasviel/ControlNet-v1-1")
+    detector = OpenPoseDetector.from_pretrained("lllyasviel/Annotators")
     control = detector(image)
     return control
 
 
 def _get_canny_control(image: Image.Image) -> Image.Image:
     from controlnet_aux import CannyDetector
-    detector = CannyDetector.from_pretrained("lllyasviel/ControlNet-v1-1")
+    detector = CannyDetector.from_pretrained("lllyasviel/Annotators")
     control = detector(image, resolution=1024)
     return control
 
@@ -109,10 +109,10 @@ def compose_tryon_sdxl(
     scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
 
     controlnet_pose = ControlNetModel.from_pretrained(
-        str(SDXL_DIR / "controlnet"), torch_dtype=dtype
+        str(SDXL_DIR / "controlnet_openpose"), torch_dtype=dtype
     )
     controlnet_canny = ControlNetModel.from_pretrained(
-        str(SDXL_DIR / "controlnet"), torch_dtype=dtype
+        str(SDXL_DIR / "controlnet_canny"), torch_dtype=dtype
     )
 
     pipe = StableDiffusionXLControlNetPipeline.from_pretrained(

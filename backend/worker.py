@@ -1,12 +1,16 @@
+import os
 import threading
 import time
 import traceback
 from pathlib import Path
 
 from engine import compose_tryon, engine_status, guess_audience, guess_garment_type
-from store import BASES, RESULTS, UPLOADS, get_job, list_jobs, patch_job, settings as load_settings
+from store import BASES, RESULTS, UPLOADS, claim_next_job, find_in_dir, patch_job, settings as load_settings
 
-_stop = threading.Event()
+def _default_workers() -> int:
+    from os import cpu_count, getenv
+
+    return max(1, min(int(getenv("WORKERS", "4")), cpu_count() or 4))
 
 
 def _base_file(base: dict) -> Path:
@@ -16,14 +20,17 @@ def _base_file(base: dict) -> Path:
 
 
 def process_job(job: dict, bases: list[dict]) -> None:
-    patch_job(job["id"], {"status": "running", "progress": 8, "message": "读取底图与服装"})
+    patch_job(job["id"], {"progress": 8, "message": "读取底图与服装"})
     base = next((b for b in bases if b["id"] == job["base_id"]), None)
     if not base:
         raise RuntimeError("未找到指定模特底座")
-    src = UPLOADS / Path(job["source_url"]).name
-    if not src.exists():
-        src = UPLOADS / job["source_name"]
-    if not src.exists():
+    src = UPLOADS / Path(job["source_url"]).name if job.get("source_url") else None
+    if not (src and src.exists()):
+        src = UPLOADS / job["source_name"] if job.get("source_name") else None
+    if not (src and src.exists()):
+        name = Path(job.get("source_url") or job.get("source_name", "")).name
+        src = find_in_dir(UPLOADS, name)
+    if not (src and src.exists()):
         raise RuntimeError("服装原图不存在")
     base_path = _base_file(base)
     if not base_path.exists():
@@ -69,38 +76,49 @@ def process_job(job: dict, bases: list[dict]) -> None:
     )
 
 
-def loop() -> None:
-    job = None
-    while not _stop.is_set():
+def _worker_loop() -> None:
+    while True:
+        job = claim_next_job()
+        if job is None:
+            time.sleep(0.4)
+            continue
         try:
-            jobs = list_jobs()
-            queued = [j for j in jobs if j["status"] == "queued"]
-            if not queued:
-                time.sleep(0.6)
-                continue
-            job = queued[-1]
             from store import load_state
 
             bases = load_state()["bases"]
             process_job(job, bases)
         except Exception as exc:
             try:
-                if job:
-                    patch_job(
-                        job["id"],
-                        {
-                            "status": "failed",
-                            "progress": 100,
-                            "message": "生成失败",
-                            "error": str(exc),
-                        },
-                    )
+                patch_job(
+                    job["id"],
+                    {
+                        "status": "failed",
+                        "progress": 100,
+                        "message": "生成失败",
+                        "error": str(exc),
+                    },
+                )
             except Exception:
                 traceback.print_exc()
-            time.sleep(0.4)
 
 
-def start_worker() -> threading.Thread:
-    t = threading.Thread(target=loop, name="tryon-worker", daemon=True)
-    t.start()
-    return t
+class WorkerPool:
+    def __init__(self, workers: int | None = None) -> None:
+        self._workers = max(1, int(workers if workers is not None else _default_workers()))
+        self._threads: list[threading.Thread] = []
+
+    def start(self) -> None:
+        for i in range(self._workers):
+            t = threading.Thread(target=_worker_loop, name=f"tryon-worker-{i}", daemon=True)
+            t.start()
+            self._threads.append(t)
+
+    def join(self) -> None:
+        for t in self._threads:
+            t.join(timeout=0.1)
+
+
+def start_worker(workers: int | None = None) -> WorkerPool:
+    pool = WorkerPool(workers if workers is not None else _default_workers())
+    pool.start()
+    return pool
