@@ -14,5 +14,4 @@ backend/data/state.tmp
 backend/data/state.lock
 
 dist/
-.monkeycode/
 .monkeycode-tmp-files/
