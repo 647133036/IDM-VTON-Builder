@@ -268,6 +268,29 @@ input, select, textarea {
   padding: 4px;
   margin-bottom: 8px;
 }
+.upload-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+  flex-wrap: wrap;
+}
+.cat-filter {
+  background: #0e1016;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+.upload-list {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+  padding: 4px;
+}
 .upload-item {
   position: relative;
   cursor: pointer;
@@ -280,6 +303,10 @@ input, select, textarea {
 .upload-item:hover {
   border-color: var(--gold);
   transform: translateY(-2px);
+}
+.upload-item.selected {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 2px rgba(212,180,131,.3);
 }
 .upload-item img {
   width: 100%;

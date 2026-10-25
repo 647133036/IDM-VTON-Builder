@@ -1,22 +1,12 @@
 import './style.css'
 
 const TOKEN_KEY = 'atelier_token'
-const AUDIENCE_LABEL = {
-  women: '女装',
-  men: '男装',
-  girls: '女童',
-  boys: '男童',
-  baby: '婴幼儿',
-  auto: '自动识别'
-}
-
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
-  user: null,
   view: 'batch',
+  user: null,
   bases: [],
   jobs: [],
-  uploads: [],
   stats: {},
   settings: {},
   selectedBase: '',
@@ -27,7 +17,10 @@ const state = {
   background: 'white',
   error: '',
   previewJob: '',
-  license: null
+  license: null,
+  uploads: [],
+  uploadCategories: {},
+  selectedUploads: [],
 }
 
 async function api(path, options = {}) {
@@ -221,8 +214,13 @@ function batchView() {
           <button class="btn ghost" id="samples">载入示例平铺图</button>
           <button class="btn ghost" id="clear">清空</button>
         </div>
+        ${state.selectedUploads.length ? `
+        <div class="row" style="margin-top:12px;padding:10px;background:rgba(212,180,131,.1);border-radius:10px">
+          <small>已选择 ${state.selectedUploads.length} 张图片</small>
+          <button class="btn gold small" id="add-selected">加入生成队列</button>
+        </div>` : ''}
         <p class="err" id="batch-err">${state.error}</p>
-        <h3 style="margin-top:18px">已上传图片库 · 点击加入</h3>
+        <h3 style="margin-top:18px">已上传图片库 · 点击选择</h3>
         <div class="upload-lib" id="upload-lib">${uploadLibrary()}</div>
         <h3 style="margin-top:18px">示例服装库 · 点击加入</h3>
         <div class="cloth-lib" id="cloth-lib">${clothLibrary()}</div>
@@ -334,13 +332,26 @@ function clothLibrary() {
 
 function uploadLibrary() {
   if (!state.uploads.length) return '<p class="hint">暂无已上传的图片。上传的图片会自动保存到此处，下次可直接选择复用。</p>'
-  return state.uploads.slice(0, 24).map((u) => `
-    <div class="cloth-item upload-item" data-upload="${u.name}">
-      <img src="${u.url}" alt="${u.name}" loading="lazy" />
-      <span>${u.name.replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
-      <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="删除">x</button>
+  return `
+    <div class="upload-toolbar">
+      <select id="cat-filter" class="cat-filter">
+        <option value="">全部分类</option>
+        <option value="default">未分类</option>
+        ${state.uploadCategories ? Object.keys(state.uploadCategories).filter(c => c !== 'default').map(c => `<option value="${c}">${c}</option>`).join('') : ''}
+      </select>
+      <button class="btn ghost small" id="cat-move">移动到分类</button>
+      <input type="text" id="cat-name" placeholder="分类名称" style="width:120px" hidden />
     </div>
-  `).join('')
+    <div class="upload-list">
+      ${state.uploads.slice(0, 24).map((u) => `
+        <div class="cloth-item upload-item ${state.selectedUploads.includes(u.name) ? 'selected' : ''}" data-upload="${u.name}">
+          <img src="${u.url}" alt="${u.name}" loading="lazy" />
+          <span>${u.name.replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
+          <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="删除">x</button>
+        </div>
+      `).join('')}
+    </div>
+  `
 }
 
 function jobCards(jobs) {
@@ -448,7 +459,26 @@ function bindDashboard() {
     document.querySelector('#bg').onchange = (e) => { state.background = e.target.value }
     document.querySelector('#run').onclick = submitBatch
     document.querySelector('#samples').onclick = loadSamples
-    document.querySelector('#clear').onclick = () => { state.files = []; renderFileThumbs() }
+    document.querySelector('#clear').onclick = () => { state.files = []; state.selectedUploads = []; renderFileThumbs(); render() }
+    const addSelected = document.querySelector('#add-selected')
+    if (addSelected) {
+      addSelected.onclick = async () => {
+        for (const name of state.selectedUploads) {
+          try {
+            const res = await fetch(`/files/uploads/${name}`)
+            const blob = await res.blob()
+            state.files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
+          } catch (e) {
+            console.error('加载图片失败', name, e)
+          }
+        }
+        state.selectedUploads = []
+        renderFileThumbs()
+        const run = document.querySelector('#run')
+        if (run) run.textContent = `一键生成 ${state.files.length} 件`
+        render()
+      }
+    }
     renderFileThumbs()
   }
   const addBase = document.querySelector('#add-base')
@@ -474,18 +504,59 @@ function bindDashboard() {
     item.onclick = async (e) => {
       if (e.target.dataset.delUpload) return
       const name = item.dataset.upload
-      try {
-        const res = await fetch(`/files/uploads/${name}`)
-        const blob = await res.blob()
-        state.files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
-        renderFileThumbs()
-        const run = document.querySelector('#run')
-        if (run) run.textContent = `一键生成 ${state.files.length} 件`
-      } catch (e) {
-        console.error('加载已上传图片失败', e)
+      if (state.selectedUploads.includes(name)) {
+        state.selectedUploads = state.selectedUploads.filter(n => n !== name)
+      } else {
+        state.selectedUploads.push(name)
       }
+      render()
     }
   })
+  const catFilter = document.querySelector('#cat-filter')
+  if (catFilter) {
+    catFilter.onchange = () => {
+      const cat = catFilter.value
+      if (!cat) {
+        refreshUploads()
+        render()
+      } else {
+        api(`/api/uploads/${cat}`).then(data => {
+          state.uploads = data
+          render()
+        })
+      }
+    }
+  }
+  const catMove = document.querySelector('#cat-move')
+  const catName = document.querySelector('#cat-name')
+  if (catMove) {
+    catMove.onclick = () => {
+      catName.hidden = !catName.hidden
+      catName.focus()
+    }
+    catName.onkeydown = async (e) => {
+      if (e.key === 'Enter' && catName.value && state.selectedUploads.length) {
+        const category = catName.value.trim()
+        for (const name of state.selectedUploads) {
+          await api(`/api/uploads/${name}/move`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ category })
+          })
+        }
+        state.selectedUploads = []
+        catName.value = ''
+        catName.hidden = true
+        await refreshUploads()
+        render()
+      }
+      if (e.key === 'Escape') {
+        catName.value = ''
+        catName.hidden = true
+        render()
+      }
+    }
+  }
   document.querySelectorAll('[data-del-upload]').forEach((btn) => {
     btn.onclick = async (e) => {
       e.stopPropagation()
@@ -633,7 +704,12 @@ async function refreshJobs() {
 
 async function refreshUploads() {
   try {
-    state.uploads = await api('/api/uploads')
+    const [uploads, categories] = await Promise.all([
+      api('/api/uploads'),
+      api('/api/uploads/categories')
+    ])
+    state.uploads = uploads
+    state.uploadCategories = categories
   } catch {}
 }
 

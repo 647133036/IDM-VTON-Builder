@@ -1,5 +1,6 @@
 from pathlib import Path
 from typing import Optional
+import shutil
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -190,6 +191,50 @@ def api_delete_upload(filename: str, _: dict = Depends(current_user)):
         trash_dest.unlink()
     p.replace(trash_dest)
     return {"ok": True, "filename": safe_name}
+
+
+@app.post("/api/uploads/{filename}/move")
+def api_move_upload(filename: str, category: str = "default", _: dict = Depends(current_user)):
+    safe_name = Path(filename).name
+    p = UPLOADS / safe_name
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    category = Path(category).name
+    cat_dir = UPLOADS / category
+    cat_dir.mkdir(parents=True, exist_ok=True)
+    dest = cat_dir / safe_name
+    if dest.exists():
+        dest.unlink()
+    p.replace(dest)
+    return {"ok": True, "filename": safe_name, "category": category}
+
+
+@app.get("/api/uploads/categories")
+def api_upload_categories(_: dict = Depends(current_user)):
+    categories = {"default": 0}
+    for p in UPLOADS.iterdir():
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            categories["default"] += 1
+        elif p.is_dir():
+            count = sum(1 for f in p.iterdir() if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
+            categories[p.name] = count
+    return categories
+
+
+@app.get("/api/uploads/{category}/{filename}")
+def api_get_upload(category: str, filename: str, _: dict = Depends(current_user)):
+    safe_category = Path(category).name
+    safe_name = Path(filename).name
+    p = UPLOADS / safe_category / safe_name
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    return {
+        "name": p.name,
+        "url": public_url(p),
+        "size": p.stat().st_size,
+        "mtime": int(p.stat().st_mtime),
+        "category": safe_category,
+    }
 
 
 @app.get("/api/jobs/{job_id}")

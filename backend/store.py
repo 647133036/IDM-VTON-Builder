@@ -23,6 +23,7 @@ _lock = threading.Lock()
 DEFAULT_STATE = {
     "bases": [],
     "jobs": [],
+    "uploads": [],
     "settings": {
         "output_long_side": 2048,
         "background": "white",
