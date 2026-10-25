@@ -8,7 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from auth import USERS, current_user, issue_token
-from engine import guess_audience, guess_garment_type
+from engine import engine_status, guess_audience, guess_garment_type
 from store import (
     BASES,
     DATA,
@@ -231,7 +231,7 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(current_user)):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "engine": load_settings().get("engine")}
+    return {"ok": True, "engine": load_settings().get("engine"), "engine_detail": engine_status()}
 
 
 @app.get("/api/download/{job_id}")

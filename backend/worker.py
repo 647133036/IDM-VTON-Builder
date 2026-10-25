@@ -3,7 +3,7 @@ import time
 import traceback
 from pathlib import Path
 
-from engine import compose_tryon, guess_audience, guess_garment_type
+from engine import compose_tryon, engine_status, guess_audience, guess_garment_type
 from store import BASES, RESULTS, UPLOADS, get_job, list_jobs, patch_job, settings as load_settings
 
 _stop = threading.Event()
@@ -40,6 +40,10 @@ def process_job(job: dict, bases: list[dict]) -> None:
     cfg = load_settings()
     long_side = int(cfg.get("output_long_side", 2048))
     background = job.get("background") or cfg.get("background", "white")
+    engine_info = engine_status()
+    engine_name = engine_info["engine"]
+    engine_label = "IDM-VTON 扩散模型" if engine_info["idm_vton_available"] else "合成引擎（无GPU回退）"
+    patch_job(job["id"], {"progress": 35, "message": f"调用 {engine_label}"})
     result = compose_tryon(base_path, src, audience, garment_type, long_side, background)
     patch_job(job["id"], {"progress": 78, "message": "输出成品图"})
 

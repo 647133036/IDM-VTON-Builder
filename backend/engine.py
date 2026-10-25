@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+import os
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +20,34 @@ GARMENT_BOX = {
     "lower": dict(y=0.92, h=0.95),
     "onesie": dict(y=0.00, h=1.35),
 }
+
+GARMENT_PROMPTS = {
+    "upper": "a model wearing this shirt",
+    "dress": "a model wearing this dress",
+    "lower": "a model wearing these pants",
+    "onesie": "a model wearing this onesie",
+}
+
+WEIGHTS_DIR = Path(os.getenv("IDM_WEIGHTS_DIR", str(Path(__file__).resolve().parent.parent / "IDM-VTON" / "ckpt")))
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_IDM_DIR = _REPO_ROOT / "IDM-VTON"
+
+
+def _idm_vton_available() -> tuple[bool, str]:
+    ckpt = _IDM_DIR / "ckpt"
+    required = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
+    missing = [d for d in required if not (ckpt / d).exists()]
+    if missing:
+        return False, f"缺少权重: {', '.join(missing)}"
+    if not (ckpt / "unet" / "diffusion_pytorch_model.safetensors").exists() and not (ckpt / "unet" / "diffusion_pytorch_model.bin").exists():
+        return False, "unet 权重文件不存在"
+    try:
+        import torch
+    except ImportError:
+        return False, "未安装 torch"
+    if not torch.cuda.is_available():
+        return False, "无可用 GPU"
+    return True, "ok"
 
 
 def detect_garment_crop(img: Image.Image) -> Image.Image:
@@ -102,13 +133,13 @@ def match_color(garment: Image.Image) -> Image.Image:
     return g
 
 
-def compose_tryon(
+def _composite_engine(
     base_path: Path,
     garment_path: Path,
     audience: str,
     garment_type: str,
-    long_side: int = 2048,
-    background: str = "white",
+    long_side: int,
+    background: str,
 ) -> Image.Image:
     base = Image.open(base_path).convert("RGBA")
     w, h = base.size
@@ -166,6 +197,168 @@ def compose_tryon(
     if abs(scale - 1) > 0.01:
         result = result.resize((int(rw * scale), int(rh * scale)), Image.Resampling.LANCZOS)
     return result
+
+
+_engine_state: dict = {"pipe": None, "available": None, "reason": ""}
+
+
+def _load_idm_vton_pipeline():
+    if _engine_state["available"] is False:
+        return None
+    if _engine_state["pipe"] is not None:
+        return _engine_state["pipe"]
+
+    avail, reason = _idm_vton_available()
+    if not avail:
+        _engine_state["available"] = False
+        _engine_state["reason"] = reason
+        return None
+
+    _engine_state["available"] = True
+    _engine_state["reason"] = ""
+
+    sys_path = str(_IDM_DIR)
+    if sys_path not in os.environ.get("PYTHONPATH", ""):
+        os.environ["PYTHONPATH"] = sys_path + os.pathsep + os.environ.get("PYTHONPATH", "")
+
+    import sys
+    if sys_path not in sys.path:
+        sys.path.insert(0, sys_path)
+
+    import torch
+    from diffusers import AutoencoderKL, DDPMScheduler
+    from transformers import AutoTokenizer, CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
+    from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
+    from src.unet_hacked_tryon import UNet2DConditionModel
+    from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
+
+    ckpt_path = str(_IDM_DIR / "ckpt")
+    device = torch.device("cuda:0")
+
+    unet = UNet2DConditionModel.from_pretrained(ckpt_path, subfolder="unet", torch_dtype=torch.float16)
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(ckpt_path, subfolder="unet_encoder", torch_dtype=torch.float16)
+    vae = AutoencoderKL.from_pretrained(ckpt_path, subfolder="vae", torch_dtype=torch.float16)
+    scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder="scheduler")
+
+    text_encoder = CLIPTextModel.from_pretrained(ckpt_path, subfolder="text_encoder", torch_dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer")
+    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(ckpt_path, subfolder="text_encoder_2", torch_dtype=torch.float16)
+    tokenizer_2 = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer_2")
+
+    pipe = TryonPipeline(
+        vae=vae,
+        text_encoder=text_encoder,
+        text_encoder_2=text_encoder_2,
+        tokenizer=tokenizer,
+        tokenizer_2=tokenizer_2,
+        unet=unet,
+        unet_encoder=unet_encoder,
+        scheduler=scheduler,
+    )
+    pipe.to(device)
+    pipe.enable_vae_slicing()
+    pipe.enable_attention_slicing()
+
+    _engine_state["pipe"] = pipe
+    return pipe
+
+
+def _idm_vton_engine(
+    base_path: Path,
+    garment_path: Path,
+    audience: str,
+    garment_type: str,
+    long_side: int,
+    background: str,
+) -> Image.Image:
+    import torch
+    from PIL import Image as PILImage
+
+    pipe = _load_idm_vton_pipeline()
+    if pipe is None:
+        return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background)
+
+    device = pipe.device if hasattr(pipe, "device") else torch.device("cuda:0")
+
+    base_img = PILImage.open(base_path).convert("RGB")
+    garment_img = PILImage.open(garment_path).convert("RGB")
+
+    target_w, target_h = 768, 1024
+    human_img = base_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+    cloth_img = garment_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+
+    prompt = GARMENT_PROMPTS.get(garment_type, "a model wearing this garment")
+    negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
+
+    mask_img = PILImage.new("RGB", (target_w, target_h), (0, 0, 0))
+    mask_draw = ImageDraw.Draw(mask_img)
+    box = dict(TORSOS.get(audience, TORSOS["women"]))
+    mx = int(box["x"] * target_w)
+    my = int(box["y"] * target_h)
+    mw = int(box["w"] * target_w)
+    mh = int(box["h"] * target_h)
+    mask_draw.rectangle([mx, my, mx + mw, my + mh], fill=(255, 255, 255))
+    mask_img = mask_img.filter(ImageFilter.GaussianBlur(16))
+
+    generator = torch.Generator(device=device).manual_seed(42)
+
+    with torch.no_grad():
+        with torch.amp.autocast(device_type="cuda"):
+            output = pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=human_img,
+                mask_image=mask_img,
+                cloth=cloth_img,
+                width=target_w,
+                height=target_h,
+                num_inference_steps=30,
+                guidance_scale=2.0,
+                generator=generator,
+                output_type="pil",
+            )
+
+    result = output.images[0] if hasattr(output, "images") else output
+
+    if background == "white":
+        bg = PILImage.new("RGB", result.size, (255, 255, 255))
+        bg.paste(result, mask=result.split()[-1] if result.mode == "RGBA" else None)
+        result = bg
+
+    rw, rh = result.size
+    scale = long_side / max(rw, rh)
+    if abs(scale - 1) > 0.01:
+        result = result.resize((int(rw * scale), int(rh * scale)), PILImage.Resampling.LANCZOS)
+    return result
+
+
+def compose_tryon(
+    base_path: Path,
+    garment_path: Path,
+    audience: str,
+    garment_type: str,
+    long_side: int = 2048,
+    background: str = "white",
+) -> Image.Image:
+    avail, reason = _idm_vton_available()
+    if avail:
+        try:
+            return _idm_vton_engine(base_path, garment_path, audience, garment_type, long_side, background)
+        except Exception:
+            pass
+    return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background)
+
+
+def engine_status() -> dict:
+    avail, reason = _idm_vton_available()
+    return {
+        "idm_vton_available": avail,
+        "reason": reason if not avail else "",
+        "engine": "idm-vton" if avail else "idm-vton-composite-fallback",
+        "weights_dir": str(WEIGHTS_DIR),
+        "idm_vton_dir": str(_IDM_DIR),
+    }
 
 
 def guess_audience(filename: str, fallback: str = "women") -> str:
