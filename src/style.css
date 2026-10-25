@@ -222,6 +222,42 @@ input, select, textarea {
   padding: 16px 20px;
   border-top: 1px solid var(--line);
 }
+.cloth-lib {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 8px;
+  max-height: 320px;
+  overflow: auto;
+  padding: 4px;
+}
+.cloth-item {
+  cursor: pointer;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  background: #0a0c11;
+  transition: border-color .15s, transform .15s;
+}
+.cloth-item:hover {
+  border-color: var(--gold);
+  transform: translateY(-2px);
+}
+.cloth-item img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  display: block;
+}
+.cloth-item span {
+  display: block;
+  font-size: 10px;
+  color: var(--muted);
+  text-align: center;
+  padding: 3px 2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 @media (max-width: 980px) {
   .kpis, .grid, .bases { grid-template-columns: 1fr 1fr; }

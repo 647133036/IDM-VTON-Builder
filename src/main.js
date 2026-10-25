@@ -204,6 +204,8 @@ function batchView() {
           <button class="btn ghost" id="clear">清空</button>
         </div>
         <p class="err" id="batch-err">${state.error}</p>
+        <h3 style="margin-top:18px">示例服装库 · 点击加入</h3>
+        <div class="cloth-lib" id="cloth-lib">${clothLibrary()}</div>
         <h3 style="margin-top:18px">最近任务</h3>
         <div class="queue">${jobCards(state.jobs.slice(0, 8))}</div>
       </section>
@@ -293,8 +295,19 @@ GET  /api/download/{id}</div>
 function baseCards() {
   return state.bases.map((b) => `
     <div class="base ${state.selectedBase === b.id ? 'sel' : ''}" data-id="${b.id}">
-      <img src="${b.url}" alt="${b.name}" />
-      <em>${AUDIENCE_LABEL[b.audience] || b.name}</em>
+      <img src="${b.url}" alt="${escapeHtml(b.name)}" />
+      <em>${AUDIENCE_LABEL[b.audience] || escapeHtml(b.name)}</em>
+    </div>
+  `).join('')
+}
+
+const CLOTH_NAMES = ['04469_00.jpg','04743_00.jpg','09133_00.jpg','09163_00.jpg','09164_00.jpg','09166_00.jpg','09176_00.jpg','09236_00.jpg','09256_00.jpg','09263_00.jpg','09266_00.jpg','09290_00.jpg','09305_00.jpg','10165_00.jpg','14627_00.jpg','14673_00.jpg']
+
+function clothLibrary() {
+  return CLOTH_NAMES.map((n) => `
+    <div class="cloth-item" data-cloth="${n}">
+      <img src="/examples/cloth/${n}" alt="${n}" loading="lazy" />
+      <span>${n.replace(/\.jpg$/,'')}</span>
     </div>
   `).join('')
 }
@@ -411,6 +424,21 @@ function bindDashboard() {
   if (addBase) {
     addBase.onclick = saveBase
   }
+  document.querySelectorAll('[data-cloth]').forEach((item) => {
+    item.onclick = async () => {
+      const name = item.dataset.cloth
+      try {
+        const res = await fetch(`/examples/cloth/${name}`)
+        const blob = await res.blob()
+        state.files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
+        renderFileThumbs()
+        const run = document.querySelector('#run')
+        if (run) run.textContent = `一键生成 ${state.files.length} 件`
+      } catch (e) {
+        console.error('加载示例服装失败', e)
+      }
+    }
+  })
   document.querySelectorAll('[data-push]').forEach((btn) => {
     btn.onclick = async () => {
       await api(`/api/jobs/${btn.dataset.push}/push`, {
@@ -452,9 +480,8 @@ function renderFileThumbs() {
 }
 
 async function loadSamples() {
-  const names = ['09163_00.jpg', '04469_00.jpg', '04743_00.jpg', '09166_00.jpg', '09290_00.jpg', '14627_00.jpg']
   const files = []
-  for (const name of names) {
+  for (const name of CLOTH_NAMES) {
     const res = await fetch(`/examples/cloth/${name}`)
     const blob = await res.blob()
     files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
