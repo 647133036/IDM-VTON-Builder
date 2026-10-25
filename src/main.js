@@ -181,11 +181,12 @@ function basesView() {
     <div class="grid">
       <section class="panel">
         <h3>当前模特底座</h3>
-        <p class="hint">底座是固定前视人台。换衣时只替换服装区域，脸、手、姿态和背景保持不变。可上传自家模特替换默认底座。</p>
+        <p class="hint">底座是固定前视人台。换衣时只替换服装区域，脸、手、姿态和背景保持不变。可上传自家模特替换默认底座。任务选「自动识别」时，受众优先取所选手底的受众标签。</p>
         <div class="bases">${state.bases.map((b) => `
           <div class="base ${state.selectedBase === b.id ? 'sel' : ''}" data-id="${b.id}">
-            <img src="${b.url}" alt="${b.name}" />
-            <em>${b.name}</em>
+            <img src="${b.url}" alt="${escapeHtml(b.name)}" />
+            <em>${escapeHtml(b.name)}</em>
+            <button class="btn ghost small" data-del="${b.id}" title="下架此底座">下架</button>
           </div>`).join('')}</div>
       </section>
       <section class="panel">
@@ -317,7 +318,27 @@ function bindDashboard() {
   })
   document.querySelector('#logout').onclick = logout
   document.querySelectorAll('.base').forEach((el) => {
-    el.onclick = () => { state.selectedBase = el.dataset.id; render() }
+    el.onclick = (e) => {
+      if (e.target.dataset.del) return
+      const base = state.bases.find((b) => b.id === el.dataset.id)
+      if (base && base.audience) state.audience = base.audience
+      state.selectedBase = el.dataset.id
+      render()
+    }
+  })
+  document.querySelectorAll('[data-del]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation()
+      if (!confirm('确认下架此底座？已生成的任务不受影响。')) return
+      try {
+        await api(`/api/bases/${btn.dataset.del}`, { method: 'DELETE' })
+        if (state.selectedBase === btn.dataset.del) state.selectedBase = ''
+        await refreshJobs()
+        render()
+      } catch (err) {
+        alert(err.message)
+      }
+    }
   })
   const drop = document.querySelector('#drop')
   const file = document.querySelector('#file')

@@ -125,6 +125,8 @@ input, select, textarea {
 .base.sel { border-color: var(--gold); }
 .base img { width: 100%; aspect-ratio: 3/4; object-fit: cover; display: block; }
 .base em { position: absolute; left: 8px; bottom: 8px; font-style: normal; font-size: 11px; background: rgba(0,0,0,.55); padding: 4px 7px; border-radius: 999px; }
+.base [data-del] { position: absolute; top: 6px; right: 6px; padding: 3px 8px; font-size: 11px; border-radius: 999px; background: rgba(0,0,0,.6); color: #e9dcbf; border: 1px solid rgba(255,255,255,.2); }
+.base [data-del]:hover { background: rgba(198,90,90,.85); border-color: transparent; color: #fff; }
 
 .queue { display: grid; gap: 10px; }
 .job {

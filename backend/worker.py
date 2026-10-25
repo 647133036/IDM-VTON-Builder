@@ -31,7 +31,7 @@ def process_job(job: dict, bases: list[dict]) -> None:
 
     audience = job.get("audience") or "auto"
     if audience == "auto":
-        audience = guess_audience(job.get("source_name", ""), base.get("audience", "women"))
+        audience = base.get("audience") or guess_audience(job.get("source_name", ""), "women")
     garment_type = job.get("garment_type") or "auto"
     if garment_type == "auto":
         garment_type = guess_garment_type(job.get("source_name", ""))

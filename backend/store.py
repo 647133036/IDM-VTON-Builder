@@ -12,9 +12,10 @@ JOBS_DIR = DATA / "jobs"
 UPLOADS = DATA / "uploads"
 RESULTS = DATA / "results"
 BASES = DATA / "bases"
+TRASH = DATA / "trash"
 STATE_FILE = DATA / "state.json"
 
-for p in (JOBS_DIR, UPLOADS, RESULTS, BASES):
+for p in (JOBS_DIR, UPLOADS, RESULTS, BASES, TRASH):
     p.mkdir(parents=True, exist_ok=True)
 
 _lock = threading.Lock()
@@ -160,6 +161,26 @@ def update_base(base_id: str, patch: dict) -> dict:
         raise KeyError(base_id)
 
     return with_state(_upd)
+
+
+def delete_base(base_id: str) -> None:
+    def _del(state: dict):
+        remaining = [b for b in state["bases"] if b["id"] != base_id]
+        if len(remaining) == len(state["bases"]):
+            raise KeyError(base_id)
+        state["bases"] = remaining
+
+    with_state(_del)
+    src = BASES / f"{base_id}.png"
+    if not src.exists():
+        src = next((p for p in BASES.iterdir() if p.name.startswith(base_id)), None)
+    if src and src.exists():
+        dest = TRASH / src.name
+        i = 1
+        while dest.exists():
+            dest = TRASH / f"{src.stem}_{i}{src.suffix}"
+            i += 1
+        src.replace(dest)
 
 
 def create_job(payload: dict) -> dict:

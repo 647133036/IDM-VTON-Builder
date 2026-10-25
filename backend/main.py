@@ -17,6 +17,7 @@ from store import (
     add_base,
     create_job,
     get_job,
+    delete_base,
     list_bases,
     list_jobs,
     patch_job,
@@ -150,6 +151,15 @@ def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(current_user
         raise HTTPException(status_code=404, detail="底座不存在") from exc
 
 
+@app.delete("/api/bases/{base_id}")
+def api_delete_base(base_id: str, _: dict = Depends(current_user)):
+    try:
+        delete_base(base_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="底座不存在") from exc
+    return {"ok": True, "id": base_id}
+
+
 @app.get("/api/jobs")
 def api_jobs(_: dict = Depends(current_user)):
     return list_jobs()
@@ -183,8 +193,8 @@ async def api_batch(
         name = upload.filename or f"garment_{uid('g')}.jpg"
         dest = UPLOADS / f"{uid('src')}_{Path(name).name}"
         dest.write_bytes(raw)
-        resolved_audience = audience if audience != "auto" else guess_audience(name)
-        resolved_type = garment_type if garment_type != "auto" else guess_garment_type(name)
+        resolved_audience = audience if audience != "auto" else audience
+        resolved_type = garment_type if garment_type != "auto" else garment_type
         job = create_job(
             {
                 "base_id": base_id,
