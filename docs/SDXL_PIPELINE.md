@@ -93,6 +93,80 @@ SDXL pipeline 效果略逊于 IDM-VTON，但完全合规。
 2. **训练自定义 IP-Adapter** — 针对服装风格优化
 3. **增加后处理** — 色彩校正、边缘融合
 
+## 实操调试小贴士
+
+### 1. ControlNet 双路控制
+
+只用 IP-Adapter 换衣服，可能会把原平铺图的背景也带过去，或者衣服位置不对。
+
+必须用 ControlNet 双路控制：
+
+- **OpenPose**（从模特底图提取）— 锁定姿势，防止身体变形
+- **Canny**（从平铺图提取）— 提取服装边缘，保持形状
+
+```python
+control_pose = _get_openpose_control(human_img)
+control_canny = _get_canny_control(cloth_img)
+
+pipe(
+    control_image=[control_pose, control_canny],
+    controlnet_conditioning_scale=[0.8, 0.6],  # 调整权重
+)
+```
+
+### 2. 童装比例修复
+
+SDXL 生成童装时，容易生成"大头娃娃"。
+
+已在 `AUDIENCE_PROMPTS` 和 `AUDIENCE_NEGATIVE` 中针对童装优化：
+
+```python
+# 正向 prompt
+"girls": "a child model wearing this garment, correct proportions, realistic body"
+
+# 负向 prompt
+"girls": "adult body, distorted proportions, big head, small body"
+```
+
+### 3. 背景处理
+
+客户要求纯色底时：
+
+- **White Background** — 自动合成纯白底
+- **Transparent** — 使用 Rembg 一键去背景
+
+```python
+if background == "transparent":
+    result = _remove_background(result)  # 使用 rembg
+elif background == "white":
+    # 合成纯白底
+```
+
+Rembg 是开源工具，效果较好，无需复杂抠图代码。
+
+### 4. 权重调优
+
+ControlNet 权重需要调整：
+
+```python
+# OpenPose 权重高，保持身体结构
+# Canny 权重低，只保留服装边缘
+controlnet_conditioning_scale=[0.8, 0.6]
+```
+
+如果衣服"飘"在空中，提高 Canny 权重到 0.8。
+
+如果身体变形，提高 OpenPose 权重到 0.9。
+
+### 5. 生成参数
+
+```python
+num_inference_steps=30  # 质量优先
+guidance_scale=7.5      # 适中
+```
+
+速度优先可降到 20 步。
+
 ## 环境变量
 
 | 变量 | 默认值 | 说明 |

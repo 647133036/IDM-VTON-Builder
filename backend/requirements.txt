@@ -11,3 +11,11 @@ aiofiles==24.1.0
 # diffusers>=0.27.0
 # transformers>=4.40.0
 # accelerate>=0.30.0
+
+# SDXL 商用合规 pipeline 依赖（需要 CUDA GPU）
+# torch>=2.1.0
+# diffusers>=0.27.0
+# transformers>=4.40.0
+# accelerate>=0.30.0
+# controlnet-aux>=0.0.7
+# rembg>=2.0.50

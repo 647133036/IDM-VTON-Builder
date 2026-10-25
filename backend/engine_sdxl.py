@@ -9,9 +9,32 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 SDXL_DIR = _REPO_ROOT / "models" / "sdxl"
 _IDM_DIR = _REPO_ROOT / "IDM-VTON"
 
+AUDIENCE_PROMPTS = {
+    "women": "a fashion model wearing this garment, full body front view, professional fashion photography",
+    "men": "a male fashion model wearing this garment, full body front view, professional fashion photography",
+    "girls": "a child model wearing this garment, correct proportions, realistic body, full body front view",
+    "boys": "a boy child model wearing this garment, correct proportions, realistic body, full body front view",
+    "baby": "a baby model wearing this garment, correct proportions, realistic body, full body front view",
+}
+
+AUDIENCE_NEGATIVE = {
+    "women": "worst quality, low quality, monochrome, bad anatomy, extra limbs, missing limbs, adult body on child",
+    "men": "worst quality, low quality, monochrome, bad anatomy, extra limbs, missing limbs, female body",
+    "girls": "worst quality, low quality, adult body, distorted proportions, big head, small body, extra limbs",
+    "boys": "worst quality, low quality, adult body, distorted proportions, big head, small body, extra limbs",
+    "baby": "worst quality, low quality, adult body, distorted proportions, big head, extra limbs, missing limbs",
+}
+
+GARMENT_PROMPT_SUFFIX = {
+    "upper": "shirt, t-shirt, blouse",
+    "dress": "dress, gown, skirt",
+    "lower": "pants, trousers, shorts, jeans",
+    "onesie": "onesie, romper, baby body",
+}
+
 
 def sdxl_available() -> tuple[bool, str]:
-    required = ["sdxl_base", "controlnet", "ip_adapter"]
+    required = ["sdxl_base", "controlnet"]
     missing = [d for d in required if not (SDXL_DIR / d).exists()]
     if missing:
         return False, f"缺少权重: {', '.join(missing)}"
@@ -24,6 +47,28 @@ def sdxl_available() -> tuple[bool, str]:
     return True, "ok"
 
 
+def _get_openpose_control(image: Image.Image) -> Image.Image:
+    from controlnet_aux import OpenPoseDetector
+    detector = OpenPoseDetector.from_pretrained("lllyasviel/ControlNet-v1-1")
+    control = detector(image)
+    return control
+
+
+def _get_canny_control(image: Image.Image) -> Image.Image:
+    from controlnet_aux import CannyDetector
+    detector = CannyDetector.from_pretrained("lllyasviel/ControlNet-v1-1")
+    control = detector(image, resolution=1024)
+    return control
+
+
+def _remove_background(image: Image.Image) -> Image.Image:
+    try:
+        from rembg import remove
+        return remove(image)
+    except ImportError:
+        return image
+
+
 def compose_tryon_sdxl(
     base_path: Path,
     garment_path: Path,
@@ -33,6 +78,7 @@ def compose_tryon_sdxl(
     background: str = "white",
 ) -> Image.Image:
     import torch
+    from PIL import Image as PILImage
 
     try:
         from diffusers import (
@@ -51,26 +97,27 @@ def compose_tryon_sdxl(
     garment_img = Image.open(garment_path).convert("RGB")
 
     target_w, target_h = 1024, 1024
-    human_img = base_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    cloth_img = garment_img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+    human_img = base_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+    cloth_img = garment_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
 
-    prompt_map = {
-        "upper": "a fashion model wearing this shirt, full body front view",
-        "dress": "a fashion model wearing this dress, full body front view",
-        "lower": "a fashion model wearing these pants, full body front view",
-        "onesie": "a baby wearing this onesie, full body front view",
-    }
-    prompt = prompt_map.get(garment_type, "a fashion model wearing this garment")
-    negative_prompt = "worst quality, low quality, monochrome, bad anatomy, extra limbs, missing limbs"
+    prompt = AUDIENCE_PROMPTS.get(audience, AUDIENCE_PROMPTS["women"])
+    garment_suffix = GARMENT_PROMPT_SUFFIX.get(garment_type, "")
+    if garment_suffix:
+        prompt = f"{prompt}, wearing {garment_suffix}"
+    negative_prompt = AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE["women"])
 
     scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
-    controlnet = ControlNetModel.from_pretrained(
+
+    controlnet_pose = ControlNetModel.from_pretrained(
+        str(SDXL_DIR / "controlnet"), torch_dtype=dtype
+    )
+    controlnet_canny = ControlNetModel.from_pretrained(
         str(SDXL_DIR / "controlnet"), torch_dtype=dtype
     )
 
     pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
         str(SDXL_DIR / "sdxl_base"),
-        controlnet=controlnet,
+        controlnet=[controlnet_pose, controlnet_canny],
         scheduler=scheduler,
         torch_dtype=dtype,
         variant="fp16",
@@ -99,7 +146,8 @@ def compose_tryon_sdxl(
     except Exception:
         pass
 
-    control_image = human_img.copy()
+    control_pose = _get_openpose_control(human_img)
+    control_canny = _get_canny_control(cloth_img)
 
     generator = torch.Generator(device=device).manual_seed(42)
 
@@ -109,7 +157,8 @@ def compose_tryon_sdxl(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 image=human_img,
-                control_image=control_image,
+                control_image=[control_pose, control_canny],
+                controlnet_conditioning_scale=[0.8, 0.6],
                 width=target_w,
                 height=target_h,
                 num_inference_steps=30,
@@ -120,18 +169,25 @@ def compose_tryon_sdxl(
 
     result = output.images[0]
 
-    if background == "white":
-        bg = Image.new("RGB", result.size, (255, 255, 255))
-        bg.paste(result, mask=result.split()[-1] if result.mode == "RGBA" else None)
-        result = bg
+    if background == "transparent":
+        result = _remove_background(result)
+    elif background == "white":
+        if result.mode == "RGBA":
+            bg = PILImage.new("RGB", result.size, (255, 255, 255))
+            bg.paste(result, mask=result.split()[-1])
+            result = bg
+        else:
+            result = PILImage.new("RGB", result.size, (255, 255, 255))
+            result.paste(result.convert("RGB"))
 
     rw, rh = result.size
     scale = long_side / max(rw, rh)
     if abs(scale - 1) > 0.01:
-        result = result.resize((int(rw * scale), int(rh * scale)), Image.Resampling.LANCZOS)
+        result = result.resize((int(rw * scale), int(rh * scale)), PILImage.Resampling.LANCZOS)
 
     del pipe
-    del controlnet
+    del controlnet_pose
+    del controlnet_canny
     if device.type == "cuda":
         torch.cuda.empty_cache()
 

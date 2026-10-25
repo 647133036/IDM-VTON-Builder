@@ -25,8 +25,14 @@ huggingface-cli download stabilityai/stable-diffusion-xl-base-1.0 \
     --local-dir "${MODEL_DIR}/sdxl_base"
 
 echo ""
-echo "==> 下载 ControlNet..."
+echo "==> 下载 ControlNet Canny..."
 huggingface-cli download lllyasviel/control_v11p_sd15_canny \
+    --include "*.safetensors" \
+    --local-dir "${MODEL_DIR}/controlnet"
+
+echo ""
+echo "==> 下载 ControlNet OpenPose..."
+huggingface-cli download lllyasviel/control_v11p_sd15_openpose \
     --include "*.safetensors" \
     --local-dir "${MODEL_DIR}/controlnet"
 
@@ -44,7 +50,7 @@ huggingface-cli download h94/IP-Adapter \
 
 echo ""
 echo "==> 安装 Python 依赖..."
-pip install -q torch>=2.1.0 diffusers>=0.27.0 transformers>=4.40.0 accelerate>=0.30.0
+pip install -q torch>=2.1.0 diffusers>=0.27.0 transformers>=4.40.0 accelerate>=0.30.0 controlnet-aux>=0.0.7 rembg>=2.0.50
 
 echo ""
 echo "==> 完成!"
