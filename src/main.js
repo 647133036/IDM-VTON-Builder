@@ -24,7 +24,8 @@ const state = {
   garmentType: 'auto',
   outputFormat: 'jpg',
   background: 'white',
-  error: ''
+  error: '',
+  previewJob: ''
 }
 
 async function api(path, options = {}) {
@@ -111,6 +112,40 @@ function dashboardView() {
       ${state.view === 'bases' ? basesView() : ''}
       ${state.view === 'queue' ? queueView() : ''}
       ${state.view === 'embed' ? embedView() : ''}
+      ${state.previewJob ? previewModal() : ''}
+    </div>
+  `
+}
+
+function previewModal() {
+  const job = state.jobs.find((j) => j.id === state.previewJob)
+  if (!job) return ''
+  const base = state.bases.find((b) => b.id === job.base_id)
+  return `
+    <div class="modal" id="preview-modal">
+      <div class="modal-inner">
+        <div class="modal-head">
+          <div>
+            <h3>成品大图预览</h3>
+            <small>${escapeHtml(job.title || job.source_name)} · ${AUDIENCE_LABEL[job.audience] || job.audience} · ${escapeHtml(job.garment_type)}</small>
+          </div>
+          <button class="btn ghost small" id="close-preview">关闭</button>
+        </div>
+        <div class="modal-body">
+          <div class="preview-col">
+            <span class="preview-label">原服装图</span>
+            <img class="preview-img" src="${job.source_url}" alt="原服装" />
+          </div>
+          <div class="preview-col main">
+            <span class="preview-label">成品 · ${base ? escapeHtml(base.name) : '底座'}</span>
+            <img class="preview-img big" src="${job.result_url}" alt="成品" />
+          </div>
+        </div>
+        <div class="modal-foot">
+          <a class="btn gold" href="/api/download/${job.id}" download>下载 ${job.result_url.split('.').pop().toUpperCase()}</a>
+          <button class="btn ghost" id="close-preview-2">关闭</button>
+        </div>
+      </div>
     </div>
   `
 }
@@ -268,16 +303,17 @@ function jobCards(jobs) {
   if (!jobs.length) return '<p class="hint">暂无任务</p>'
   return jobs.map((j) => `
     <article class="job" data-id="${j.id}">
-      <img src="${j.preview_url || j.source_url}" alt="" />
+      <img class="${j.status === 'done' ? 'zoomable' : ''}" src="${j.preview_url || j.source_url}" alt="" data-preview="${j.status === 'done' ? j.id : ''}" />
       <div class="meta">
-        <b>${j.title || j.source_name}</b>
-        <small>${AUDIENCE_LABEL[j.audience] || j.audience} · ${j.message}</small>
+        <b>${escapeHtml(j.title || j.source_name)}</b>
+        <small>${AUDIENCE_LABEL[j.audience] || j.audience} · ${escapeHtml(j.message)}</small>
         <div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       </div>
       <div>
         <div class="status ${j.status}">${j.status}</div>
         <div class="actions">
-          ${j.status === 'done' ? `<a class="btn ghost small" href="/api/download/${j.id}" data-dl="${j.id}">下载</a>
+          ${j.status === 'done' ? `<button class="btn ghost small" data-preview="${j.id}">大图预览</button>
+          <a class="btn ghost small" href="/api/download/${j.id}" data-dl="${j.id}">下载</a>
           <button class="btn ghost small" data-push="${j.id}">推送到商品页</button>` : ''}
         </div>
       </div>
@@ -340,6 +376,16 @@ function bindDashboard() {
       }
     }
   })
+  document.querySelectorAll('[data-preview]').forEach((el) => {
+    if (!el.dataset.preview) return
+    el.onclick = () => { state.previewJob = el.dataset.preview; render() }
+  })
+  const closePv = document.querySelector('#close-preview')
+  const closePv2 = document.querySelector('#close-preview-2')
+  if (closePv) closePv.onclick = () => { state.previewJob = ''; render() }
+  if (closePv2) closePv2.onclick = () => { state.previewJob = ''; render() }
+  const modal = document.querySelector('#preview-modal')
+  if (modal) modal.onclick = (e) => { if (e.target === modal) { state.previewJob = ''; render() } }
   const drop = document.querySelector('#drop')
   const file = document.querySelector('#file')
   if (drop && file) {
