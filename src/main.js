@@ -16,6 +16,7 @@ const state = {
   view: 'batch',
   bases: [],
   jobs: [],
+  uploads: [],
   stats: {},
   settings: {},
   selectedBase: '',
@@ -221,6 +222,8 @@ function batchView() {
           <button class="btn ghost" id="clear">清空</button>
         </div>
         <p class="err" id="batch-err">${state.error}</p>
+        <h3 style="margin-top:18px">已上传图片库 · 点击加入</h3>
+        <div class="upload-lib" id="upload-lib">${uploadLibrary()}</div>
         <h3 style="margin-top:18px">示例服装库 · 点击加入</h3>
         <div class="cloth-lib" id="cloth-lib">${clothLibrary()}</div>
         <h3 style="margin-top:18px">最近任务</h3>
@@ -325,6 +328,17 @@ function clothLibrary() {
     <div class="cloth-item" data-cloth="${n}">
       <img src="/examples/cloth/${n}" alt="${n}" loading="lazy" />
       <span>${n.replace(/\.jpg$/,'')}</span>
+    </div>
+  `).join('')
+}
+
+function uploadLibrary() {
+  if (!state.uploads.length) return '<p class="hint">暂无已上传的图片。上传的图片会自动保存到此处，下次可直接选择复用。</p>'
+  return state.uploads.slice(0, 24).map((u) => `
+    <div class="cloth-item upload-item" data-upload="${u.name}">
+      <img src="${u.url}" alt="${u.name}" loading="lazy" />
+      <span>${u.name.replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
+      <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="删除">x</button>
     </div>
   `).join('')
 }
@@ -453,6 +467,35 @@ function bindDashboard() {
         if (run) run.textContent = `一键生成 ${state.files.length} 件`
       } catch (e) {
         console.error('加载示例服装失败', e)
+      }
+    }
+  })
+  document.querySelectorAll('[data-upload]').forEach((item) => {
+    item.onclick = async (e) => {
+      if (e.target.dataset.delUpload) return
+      const name = item.dataset.upload
+      try {
+        const res = await fetch(`/files/uploads/${name}`)
+        const blob = await res.blob()
+        state.files.push(new File([blob], name, { type: blob.type || 'image/jpeg' }))
+        renderFileThumbs()
+        const run = document.querySelector('#run')
+        if (run) run.textContent = `一键生成 ${state.files.length} 件`
+      } catch (e) {
+        console.error('加载已上传图片失败', e)
+      }
+    }
+  })
+  document.querySelectorAll('[data-del-upload]').forEach((btn) => {
+    btn.onclick = async (e) => {
+      e.stopPropagation()
+      if (!confirm('确认删除此图片？')) return
+      try {
+        await api(`/api/uploads/${btn.dataset.delUpload}`, { method: 'DELETE' })
+        await refreshUploads()
+        render()
+      } catch (err) {
+        alert(err.message)
       }
     }
   })
@@ -588,8 +631,15 @@ async function refreshJobs() {
   if (!state.selectedBase && bases[0]) state.selectedBase = bases[0].id
 }
 
+async function refreshUploads() {
+  try {
+    state.uploads = await api('/api/uploads')
+  } catch {}
+}
+
 async function boot() {
   await refreshJobs()
+  await refreshUploads()
   try {
     state.license = await api('/api/license')
   } catch {}
@@ -598,9 +648,10 @@ async function boot() {
     if (!state.token) return
     try {
       await refreshJobs()
+      await refreshUploads()
       if (state.view === 'queue') render()
     } catch {}
-  }, 2500)
+  }, 5000)
 }
 
 if (state.token) boot()

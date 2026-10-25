@@ -165,6 +165,33 @@ def api_jobs(_: dict = Depends(current_user)):
     return list_jobs()
 
 
+@app.get("/api/uploads")
+def api_list_uploads(_: dict = Depends(current_user)):
+    items = []
+    for p in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            items.append({
+                "name": p.name,
+                "url": public_url(p),
+                "size": p.stat().st_size,
+                "mtime": int(p.stat().st_mtime),
+            })
+    return items
+
+
+@app.delete("/api/uploads/{filename}")
+def api_delete_upload(filename: str, _: dict = Depends(current_user)):
+    safe_name = Path(filename).name
+    p = UPLOADS / safe_name
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    trash_dest = TRASH / f"upload_{safe_name}"
+    if trash_dest.exists():
+        trash_dest.unlink()
+    p.replace(trash_dest)
+    return {"ok": True, "filename": safe_name}
+
+
 @app.get("/api/jobs/{job_id}")
 def api_job(job_id: str, _: dict = Depends(current_user)):
     try:
