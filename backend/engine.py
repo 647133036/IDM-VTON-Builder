@@ -31,9 +31,24 @@ GARMENT_PROMPTS = {
 WEIGHTS_DIR = Path(os.getenv("IDM_WEIGHTS_DIR", str(Path(__file__).resolve().parent.parent / "IDM-VTON" / "ckpt")))
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _IDM_DIR = _REPO_ROOT / "IDM-VTON"
+_LICENSE_MODE = os.getenv("LICENSE_MODE", "").strip().lower()
+
+
+def _license_allows_idm() -> tuple[bool, str]:
+    if _LICENSE_MODE == "commercial":
+        return False, "LICENSE_MODE=commercial 禁用 IDM-VTON（CC BY-NC-SA 禁止商用）"
+    if _LICENSE_MODE == "research":
+        return True, ""
+    if _LICENSE_MODE == "":
+        return False, "未设置 LICENSE_MODE 环境变量，IDM-VTON 默认禁用"
+    return False, f"未知 LICENSE_MODE={_LICENSE_MODE}，仅支持 research 或 commercial"
 
 
 def _idm_vton_available() -> tuple[bool, str]:
+    allowed, reason = _license_allows_idm()
+    if not allowed:
+        return False, reason
+
     ckpt = _IDM_DIR / "ckpt"
     required = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
     missing = [d for d in required if not (ckpt / d).exists()]
@@ -352,10 +367,15 @@ def compose_tryon(
 
 def engine_status() -> dict:
     avail, reason = _idm_vton_available()
+    license_allowed, license_reason = _license_allows_idm()
     return {
         "idm_vton_available": avail,
         "reason": reason if not avail else "",
         "engine": "idm-vton" if avail else "idm-vton-composite-fallback",
+        "license_mode": _LICENSE_MODE or "unset",
+        "license_allows_idm": license_allowed,
+        "license_reason": license_reason if not license_allowed else "",
+        "commercial_compliant": _LICENSE_MODE == "commercial",
         "weights_dir": str(WEIGHTS_DIR),
         "idm_vton_dir": str(_IDM_DIR),
     }

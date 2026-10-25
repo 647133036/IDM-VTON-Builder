@@ -105,7 +105,27 @@ STORE_JWT_SECRET=replace-me
 STORE_ADMIN_PASSWORD=replace-me
 STORE_STAFF_PASSWORD=replace-me
 IDM_WEIGHTS_DIR=/path/to/IDM-VTON/ckpt  # 可选，默认 IDM-VTON/ckpt
+LICENSE_MODE=research  # research（测试）或 commercial（生产）
 ```
+
+### 许可证合规
+
+IDM-VTON 采用 **CC BY-NC-SA 4.0**，禁止商业用途。电商换衣是商业用途，与 IDM-VTON 许可冲突。
+
+通过 `LICENSE_MODE` 环境变量控制引擎可用性：
+
+| 模式 | IDM-VTON | 商用合规 | 适用场景 |
+|------|----------|----------|----------|
+| `research` | 可用（需 GPU） | 不合规 | 测试、学习、内部验证 |
+| `commercial` | 禁用 | 合规 | 生产环境（需商用模型） |
+| 未设置 | 禁用 | 需确认 | 默认状态 |
+
+- 研究模式：`export LICENSE_MODE=research`，IDM-VTON 可用但不得用于生产
+- 商业模式：`export LICENSE_MODE=commercial`，IDM-VTON 禁用，必须使用商用模型
+
+完整合规说明见 `docs/LICENSE_COMPLIANCE.md`。
+
+访问 `/api/license` 可查看当前合规状态。
 
 ## 许可
 

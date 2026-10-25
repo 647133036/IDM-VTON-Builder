@@ -25,7 +25,8 @@ const state = {
   outputFormat: 'jpg',
   background: 'white',
   error: '',
-  previewJob: ''
+  previewJob: '',
+  license: null
 }
 
 async function api(path, options = {}) {
@@ -101,6 +102,7 @@ function dashboardView() {
           <button id="logout" class="${''}">退出</button>
         </nav>
       </header>
+      ${licenseBanner()}
       <section class="kpis">
         ${kpi('队列', state.stats.queued)}
         ${kpi('生成中', state.stats.running)}
@@ -115,6 +117,21 @@ function dashboardView() {
       ${state.previewJob ? previewModal() : ''}
     </div>
   `
+}
+
+function licenseBanner() {
+  if (!state.license) return ''
+  const l = state.license
+  if (l.license_mode === 'commercial') {
+    return `<div class="banner warn"><strong>商业模式</strong>：IDM-VTON 已禁用（CC BY-NC-SA 禁止商用），当前使用 ${l.current_engine}。请使用商用模型或 API。</div>`
+  }
+  if (l.license_mode === 'research') {
+    if (l.idm_vton_available) {
+      return `<div class="banner info"><strong>研究模式</strong>：IDM-VTON 可用，仅限测试/学习，不得用于生产。详见 <a href="/docs/LICENSE_COMPLIANCE.md" target="_blank">合规说明</a>。</div>`
+    }
+    return `<div class="banner info"><strong>研究模式</strong>：IDM-VTON 不可用（缺少 GPU 或权重），当前使用 ${l.current_engine}。</div>`
+  }
+  return `<div class="banner warn"><strong>未设置 LICENSE_MODE</strong>：建议设置 research（测试）或 commercial（生产）。详见 <a href="/docs/LICENSE_COMPLIANCE.md" target="_blank">合规说明</a>。</div>`
 }
 
 function previewModal() {
@@ -573,6 +590,9 @@ async function refreshJobs() {
 
 async function boot() {
   await refreshJobs()
+  try {
+    state.license = await api('/api/license')
+  } catch {}
   render()
   setInterval(async () => {
     if (!state.token) return
