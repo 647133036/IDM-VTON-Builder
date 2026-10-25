@@ -15,6 +15,7 @@ from store import (
     BASES,
     DATA,
     RESULTS,
+    TRASH,
     UPLOADS,
     add_base,
     create_job,
