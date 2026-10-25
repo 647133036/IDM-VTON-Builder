@@ -8,9 +8,9 @@
 
 `0.1.0` 是可运行的预发骨架，用来验证「固定底图 + 换衣 + 店铺嵌入」这条链路。
 
-已具备：登录、可更换底座、批量队列、下载 / 推送、iframe 嵌入。
+已具备：登录、可更换底座、批量队列、下载 / 推送、iframe 嵌入、成品大图预览。
 
-当前引擎是服务端合成流水线。有 GPU 后，把 `backend/engine.py` 换成仓库内 `IDM-VTON/` 官方推理。
+引擎采用双轨策略：有 GPU + 权重时走 IDM-VTON 扩散模型（出真图），无 GPU 时自动回退合成引擎（兜底）。引擎选择全自动，无需手动切换。
 
 ## 能做什么
 
@@ -18,19 +18,23 @@
 - 一次拖入几十到上百张服装图，只出正面，长边 2048px
 - 白底 JPEG 或透明 PNG
 - 前端嵌进现有店铺 admin，后端跑在你的云账号
+- 示例服装库，点击即加入批量队列
+- 成品大图预览弹窗，左右对照原图与成品
 
 ## 目录
 
 ```text
-backend/          FastAPI 登录、底座、队列、合成引擎
+backend/          FastAPI 登录、底座、队列、IDM-VTON 引擎包装器
 src/               店铺后台 SPA
 public/embed.html  iframe 嵌入页
 public/widget.js   店铺挂件
-docs/              安装与员工上手
-IDM-VTON/          官方虚拟试穿仓库（GPU 推理用）
+public/examples/   示例服装图与模特图
+docs/              安装、GPU 部署、员工上手
+scripts/           权重下载脚本
+IDM-VTON/          官方虚拟试穿仓库（git submodule）
 ```
 
-## 启动
+## 快速启动（无 GPU）
 
 ```bash
 pip3 install --break-system-packages -r backend/requirements.txt
@@ -45,6 +49,34 @@ npm run dev
 前端把 `/api` 和 `/files` 反代到 `8000`。
 
 演示账号：`admin / admin123`，`staff / staff123`。
+
+## GPU 部署（IDM-VTON 扩散引擎）
+
+有 NVIDIA GPU（最低 24GB VRAM）时，可启用 IDM-VTON 扩散模型引擎，获得官方级画质。
+
+```bash
+# 1. 克隆仓库（含 submodule）
+git clone https://github.com/647133036/IDM-VTON-Builder.git
+cd IDM-VTON-Builder
+git submodule update --init --recursive
+
+# 2. 下载 IDM-VTON 权重（约 20-30GB）
+bash scripts/download_weights.sh
+
+# 3. 安装后端依赖
+cd backend
+pip install -r requirements.txt
+pip install torch>=2.1.0 diffusers>=0.27.0 transformers>=4.40.0 accelerate>=0.30.0
+
+# 4. 启动后端
+python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+
+# 5. 验证引擎状态
+curl http://localhost:8000/api/health
+# 期望 idm_vton_available: true
+```
+
+完整 GPU 部署指南见 `docs/GPU_DEPLOY.md`，含硬件要求、性能参考、Docker 部署、常见问题。
 
 ## 嵌进店铺
 
@@ -62,6 +94,7 @@ npm run dev
 ## 文档
 
 - 安装部署：`docs/INSTALL.md`
+- GPU 部署：`docs/GPU_DEPLOY.md`
 - 员工上手：`docs/STAFF_QUICKSTART.md`
 - 可打印页：`docs/STAFF_QUICKSTART.html`
 
@@ -71,6 +104,7 @@ npm run dev
 STORE_JWT_SECRET=replace-me
 STORE_ADMIN_PASSWORD=replace-me
 STORE_STAFF_PASSWORD=replace-me
+IDM_WEIGHTS_DIR=/path/to/IDM-VTON/ckpt  # 可选，默认 IDM-VTON/ckpt
 ```
 
 ## 许可
