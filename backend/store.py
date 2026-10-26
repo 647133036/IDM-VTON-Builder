@@ -23,13 +23,16 @@ for p in (JOBS_DIR, UPLOADS, RESULTS, BASES, TRASH):
 _lock = threading.Lock()
 
 ETHNICITY_DEFAULTS = [
-    {"value": "east", "label": "东方"},
-    {"value": "west", "label": "西方"},
-    {"value": "north", "label": "北美"},
-    {"value": "africa", "label": "非洲"},
+    {"value": "western_europe", "label": "西欧"},
+    {"value": "eastern_europe", "label": "东欧"},
+    {"value": "west_asia", "label": "西亚"},
     {"value": "central_asia", "label": "中亚"},
+    {"value": "east_asia", "label": "东亚"},
     {"value": "southeast_asia", "label": "东南亚"},
-    {"value": "mongol", "label": "蒙古"},
+    {"value": "africa", "label": "非洲"},
+    {"value": "north_america", "label": "北美"},
+    {"value": "south_america", "label": "南美"},
+    {"value": "oceania", "label": "澳洲"},
 ]
 
 DEFAULT_STATE = {
@@ -128,7 +131,7 @@ def seed_bases_if_empty() -> None:
                     "name": "女装 · 前视模特 A",
                     "audience": "women",
                     "age_band": "adult",
-                    "ethnicity": "east",
+                    "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "women_01.png",
                     "notes": "正面站姿，手臂微张，适合上衣/连衣裙",
@@ -138,7 +141,7 @@ def seed_bases_if_empty() -> None:
                     "name": "男装 · 前视模特 A",
                     "audience": "men",
                     "age_band": "adult",
-                    "ethnicity": "west",
+                    "ethnicity": "western_europe",
                     "pose": "front",
                     "file": "men_01.png",
                     "notes": "正面站姿，适合 T 恤/衬衫/针织",
@@ -148,7 +151,7 @@ def seed_bases_if_empty() -> None:
                     "name": "女童 · 前视模特",
                     "audience": "girls",
                     "age_band": "kids",
-                    "ethnicity": "east",
+                    "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "girl_01.png",
                     "notes": "约 7 岁女童，适合童装上衣/裙子",
@@ -158,7 +161,7 @@ def seed_bases_if_empty() -> None:
                     "name": "男童 · 前视模特",
                     "audience": "boys",
                     "age_band": "kids",
-                    "ethnicity": "east",
+                    "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "boy_01.png",
                     "notes": "约 7 岁男童，适合童装 T 恤/短裤",
@@ -168,7 +171,7 @@ def seed_bases_if_empty() -> None:
                     "name": "婴幼儿 · 前视模特",
                     "audience": "baby",
                     "age_band": "baby",
-                    "ethnicity": "east",
+                    "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "baby_01.png",
                     "notes": "约 2 岁婴幼儿，适合连体衣/哈衣",
@@ -188,22 +191,25 @@ def seed_bases_if_empty() -> None:
                 )
             return
         fallback = {
-            "base_women_01": "east",
-            "base_men_01": "west",
-            "base_girl_01": "east",
-            "base_boy_01": "east",
-            "base_baby_01": "east",
+            "base_women_01": "east_asia",
+            "base_men_01": "western_europe",
+            "base_girl_01": "east_asia",
+            "base_boy_01": "east_asia",
+            "base_baby_01": "east_asia",
         }
         for item in state["bases"]:
             if "ethnicity" not in item:
-                item["ethnicity"] = fallback.get(item["id"], "east")
+                item["ethnicity"] = fallback.get(item["id"], "east_asia")
 
     with_state(_seed)
 
 
 ETHNICITY_MIGRATION = {
-    "slav": "west",
-    "mongol": "southeast_asia",
+    "slav": "western_europe",
+    "east": "east_asia",
+    "west": "western_europe",
+    "north": "north_america",
+    "mongol": "east_asia",
 }
 
 
@@ -213,7 +219,7 @@ def list_bases() -> list[dict]:
     for b in load_state()["bases"]:
         eth = b.get("ethnicity")
         if eth and eth not in valid:
-            b["ethnicity"] = ETHNICITY_MIGRATION.get(eth, "east")
+            b["ethnicity"] = ETHNICITY_MIGRATION.get(eth, "east_asia")
     return load_state()["bases"]
 
 
@@ -378,7 +384,7 @@ def delete_ethnicity(value: str) -> None:
         state["ethnicities"] = remaining
         for b in state["bases"]:
             if b.get("ethnicity") == value:
-                b["ethnicity"] = "east"
+                b["ethnicity"] = "east_asia"
 
     with_state(_del)
 

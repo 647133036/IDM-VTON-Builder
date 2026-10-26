@@ -192,7 +192,7 @@ async def api_add_base(
     name: str = Form(...),
     audience: str = Form("women"),
     age_band: str = Form("adult"),
-    ethnicity: str = Form("east"),
+    ethnicity: str = Form("east_asia"),
     notes: str = Form(""),
     file: UploadFile = File(...),
     _: dict = Depends(current_user),

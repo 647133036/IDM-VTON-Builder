@@ -135,3 +135,19 @@ This feature is a web-based virtual try-on dashboard embedded inside an existing
 1. WHEN the audience is baby/toddler, boys or girls, the System SHALL use child-appropriate proportions for the output body.
 2. WHEN the source garment photo has no clean background, the System SHALL remove the background and synthesize either a white background or a transparent channel.
 3. WHEN the source garment photo needs segmentation, the System SHALL use the backend image processing pipeline to isolate the garment.
+
+### Requirement 12: Audience-specific garment fit quality
+
+**User Story:** AS admin staff, I want output images where the garment fits the model realistically for its target audience, SO THAT the photos look like real product shots instead of a distorted or "scaled-down adult" rendition.
+
+#### Acceptance Criteria
+
+1. WHEN the audience is adult women and the garment is a dress or one-piece, the System SHALL preserve the waistline, skirt hem drape and collar or strap fit of the garment.
+2. WHEN the audience is adult women and the garment has a fitted bodice, the System SHALL keep the waist and chest seams aligned with the body silhouette.
+3. WHEN the audience is adult men and the garment is a shirt, jacket or coat, the System SHALL render crisp shoulder lines, correct shoulder-width proportion and a structured silhouette rather than a soft or slouchy fit.
+4. WHEN the audience is men and the garment has sleeves, the System SHALL keep sleeve length proportional to the model base.
+5. WHEN the audience is children (baby/toddler, boys, girls), the System SHALL render the garment with child-appropriate head-to-body ratio, limb length and fullness, so that the outfit reads as a garment cut for a child rather than a scaled-down adult garment.
+6. WHEN the audience is young men and the garment is an oversized fit such as hoodies or loose outerwear, the System SHALL render the dropped-shoulder effect and relaxed drape naturally.
+7. WHEN the audience is young adults and the pose is dynamic, the System SHALL keep garment geometry stable and natural in motion rather than distorted.
+8. WHEN the audience is young women, the System SHALL handle both fitted and oversized silhouettes, keeping the fit natural under casual poses.
+9. WHEN the audience is not explicitly specified, the System SHALL derive the fit quality rules from the selected base audience label.

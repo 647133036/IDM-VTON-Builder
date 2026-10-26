@@ -1,5 +1,5 @@
 import './style.css'
-import { t, getLang, setLang, fmtAudience, fmtAge } from './i18n'
+import { t, getLang, setLang, fmtAudience, fmtAge, fmtEthnicity } from './i18n'
 
 const TOKEN_KEY = 'atelier_token'
 const AUDIENCE_LABEL = {
@@ -13,7 +13,7 @@ const AUDIENCE_LABEL = {
 const AGE_LABEL = { adult: 'adult', kids: 'kids', baby: 'baby' }
 function ethnicityLabel(value) {
   const hit = (state.ethnicities || []).find((e) => e.value === value)
-  return hit ? hit.label : (value || '')
+  return hit ? fmtEthnicity(hit.value, hit.label) : (value || '')
 }
 const state = {
   token: localStorage.getItem(TOKEN_KEY) || '',
@@ -240,7 +240,7 @@ function batchView() {
           <label>${t('eth.filter')}
             <select id="eth-filter">
               <option value="">${t('eth.all')}</option>
-              ${(state.ethnicities || []).map((e) => `<option value="${e.value}" ${state.ethnicity === e.value ? 'selected' : ''}>${escapeHtml(e.label)}</option>`).join('')}
+              ${(state.ethnicities || []).map((e) => `<option value="${e.value}" ${state.ethnicity === e.value ? 'selected' : ''}>${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
             </select>
           </label>
         </div>
@@ -341,7 +341,7 @@ function basesView() {
             <label>${t('form.ethnicity')}
               <select id="bbeth">
                 <option value="">${t('base.keep')}</option>
-                ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(e.label)}</option>`).join('')}
+                ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
               </select>
             </label>
           </div>
@@ -351,7 +351,7 @@ function basesView() {
           <div class="base ${state.selectedBase === b.id ? 'sel' : ''} ${state.selectedBases.includes(b.id) ? 'batch-sel' : ''}" data-id="${b.id}">
             <img src="${b.url}" alt="${escapeHtml(b.name)}" />
             <em>${escapeHtml(b.name)}</em>
-            <small>${fmtAudience(b.audience) || b.audience || '—'} · ${fmtAge(b.age_band) || b.age_band || '—'} · ${escapeHtml(state.ethnicities.find(x => x.value === b.ethnicity)?.label || b.ethnicity || '—')}</small>
+            <small>${fmtAudience(b.audience) || b.audience || '—'} · ${fmtAge(b.age_band) || b.age_band || '—'} · ${escapeHtml((() => { const hit = state.ethnicities.find(x => x.value === b.ethnicity); return hit ? fmtEthnicity(hit.value, hit.label) : (b.ethnicity || '—') })())}</small>
             <div class="row" style="flex:none">
               <label title="${t('base.batchTitle')}"><input type="checkbox" data-bsel="${b.id}" ${state.selectedBases.includes(b.id) ? 'checked' : ''} /> ${t('base.batch')}</label>
               <button class="btn ghost small" data-del="${b.id}" title="${t('base.retireTitle')}">${t('base.retire')}</button>
@@ -380,7 +380,7 @@ function basesView() {
           </label>
           <label>${t('form.ethnicity')}
             <select id="beth">
-              ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(e.label)}</option>`).join('')}
+              ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
             </select>
           </label>
         </div>
@@ -394,7 +394,7 @@ function basesView() {
           <div class="eth-list">
             ${(state.ethnicities || []).map((e) => `
               <div class="eth-item">
-                <span>${escapeHtml(e.label)}</span>
+                <span>${escapeHtml(fmtEthnicity(e.value, e.label))}</span>
                 <code>${escapeHtml(e.value)}</code>
                 <div class="row" style="flex:none">
                   <button class="btn ghost small eth-rename" data-value="${e.value}" data-label="${escapeHtml(e.label)}">${t('eth.rename')}</button>

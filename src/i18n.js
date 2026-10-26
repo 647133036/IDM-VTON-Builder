@@ -55,6 +55,16 @@ const messages = {
     'step.base': '1. 选择固定底图',
     'eth.filter': '人种筛选',
     'eth.all': '全部',
+    'eth.east_asia': '东亚',
+    'eth.southeast_asia': '东南亚',
+    'eth.western_europe': '西欧',
+    'eth.eastern_europe': '东欧',
+    'eth.west_asia': '西亚',
+    'eth.central_asia': '中亚',
+    'eth.africa': '非洲',
+    'eth.north_america': '北美',
+    'eth.south_america': '南美',
+    'eth.oceania': '澳洲',
     'step.output': '2. 品类与输出',
     'form.audience': '受众',
     'form.garment': '服装',
@@ -232,6 +242,16 @@ const messages = {
     'step.base': '1. Select a fixed base',
     'eth.filter': 'Ethnicity filter',
     'eth.all': 'All',
+    'eth.east_asia': 'East Asian',
+    'eth.southeast_asia': 'Southeast Asian',
+    'eth.western_europe': 'Western European',
+    'eth.eastern_europe': 'Eastern European',
+    'eth.west_asia': 'West Asian',
+    'eth.central_asia': 'Central Asian',
+    'eth.africa': 'African',
+    'eth.north_america': 'North American',
+    'eth.south_america': 'South American',
+    'eth.oceania': 'Oceanian',
     'step.output': '2. Category & output',
     'form.audience': 'Audience',
     'form.garment': 'Garment',
@@ -392,4 +412,10 @@ export function fmtAudience(key) {
 
 export function fmtAge(key) {
   return t(`age.${key}`) || key
+}
+
+export function fmtEthnicity(value, fallback) {
+  const key = `eth.${value}`
+  const translated = t(key)
+  return translated && translated !== key ? translated : (fallback || value || '')
 }
