@@ -8,7 +8,7 @@ const messages = {
     'nav.queue': '任务队列',
     'nav.embed': '店铺嵌入',
     'nav.logout': '退出',
-    'nav.storePrefix': '固定底图 + 换衣',
+    'nav.storePrefix': '一件成衣，百身模特，即试即推',
     'nav.embedStore': '嵌入店铺',
     // kpis
     'kpi.queued': '队列',
@@ -191,7 +191,7 @@ const messages = {
     'nav.queue': 'Job Queue',
     'nav.embed': 'Store Embeds',
     'nav.logout': 'Logout',
-    'nav.storePrefix': 'Fixed base + Avatar Try-On',
+    'nav.storePrefix': 'One garment, every mannequin',
     'nav.embedStore': 'Embedded store',
     'kpi.queued': 'Queued',
     'kpi.running': 'Running',

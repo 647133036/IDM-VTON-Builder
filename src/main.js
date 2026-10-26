@@ -90,7 +90,7 @@ function loginView() {
   return `
     <div class="login">
       <div class="login-card">
-        <h1>Atelier</h1>
+        <h1>MannequinForge</h1>
         <p>${t('login.subtitle')}</p>
         <label>${t('login.acc')}<input id="u" value="admin" /></label>
         <label>${t('login.pwd')}<input id="p" type="password" value="admin123" /></label>
@@ -107,7 +107,7 @@ function dashboardView() {
     <div class="wrap">
       <header class="top">
         <div class="brand">
-          <h1>Atelier Studio</h1>
+          <h1>MannequinForge</h1>
           <span>${state.user?.name || 'Store Admin'} · ${t('nav.storePrefix')}${state.storeCode ? ` · ${t('nav.embedStore')} ${escapeHtml(state.storeCode)}` : ''}</span>
         </div>
         <nav class="nav">
