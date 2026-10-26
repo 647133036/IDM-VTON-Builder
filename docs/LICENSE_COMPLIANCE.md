@@ -53,6 +53,21 @@ IDM-VTON 不可用于生产环境。需要替换为允许商用的模型：
 - 生产阶段：切换到商用模型（commercial 模式）
 - 通过 `LICENSE_MODE` 环境变量切换
 
+## Stability AI Community License 合规（SDXL 基础模型）
+
+商用 pipeline 的 SDXL base 模型遵循 **Stability AI Community License**（Last Updated 2026-07-05）。商用目的使用或分发前，必须同时满足以下义务：
+
+| 义务 | 要求 | 本项目落地 |
+|------|------|------------|
+| 注册 | 商用目的使用或分发前，必须在 Stability AI 完成免费注册 | 上线前填注册表单 |
+| 附协议副本 | 向第三方分发时附带本协议副本 | 随产品 / 服务分发协议副本 |
+| Notice 文件 | 随分发附带 Notice 文件，文本固定：`This Stability AI Model is licensed under the Stability AI Community License, Copyright © Stability AI Ltd. All Rights Reserved` | 仓库根目录 `NOTICE` |
+| 显著署名 | 在相关网站、用户界面、about 页或产品文档显著展示 `Powered by Stability AI` | 前端页脚 + README |
+
+**收入门槛**：你与关联公司合计年收入低于 $100 万时，商用免费但必须注册；超过门槛协议自动终止，需另行申请付费 Enterprise License。
+
+> 注意：ControlNet / IP-Adapter 等其余组件各自遵循其许可证；IDM-VTON 的 CC BY-NC-SA 禁令与 Stability 协议无关，商用仍须替换或购买授权。
+
 ## 运行时门禁
 
 `backend/engine.py` 根据 `LICENSE_MODE` 环境变量决定引擎可用性：
@@ -89,6 +104,8 @@ export LICENSE_MODE=commercial
 - [ ] 商业模式：替换为商用模型或 API
 - [ ] 保留所有授权文件（LICENSE.txt）
 - [ ] 署名（BY）：在产出物中标注来源
+- [ ] Stability AI：完成商用注册、附带协议副本与 NOTICE 文件
+- [ ] Stability AI：在界面 / 文档显著展示 `Powered by Stability AI`
 
 ## 责任声明
 

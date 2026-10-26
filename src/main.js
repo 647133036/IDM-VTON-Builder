@@ -97,6 +97,7 @@ function loginView() {
         <button class="btn gold" id="login">${t('login.btn')}</button>
         <button class="btn ghost" id="login-lang" style="width:100%;margin-top:10px">${getLang() === 'zh' ? 'Switch to English' : '切换到中文'}</button>
         <p class="err" id="login-err"></p>
+        <p class="foot">${t('footer.powered')} · ${t('footer.licenseNote')}</p>
       </div>
     </div>
   `
@@ -133,6 +134,7 @@ function dashboardView() {
       ${state.view === 'embed' ? embedView() : ''}
       ${state.previewJob ? previewModal() : ''}
       ${state.pushJob ? pushModal() : ''}
+      <footer class="foot">${t('footer.powered')} · ${t('footer.licenseNote')}</footer>
     </div>
   `
 }

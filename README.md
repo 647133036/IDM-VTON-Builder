@@ -261,6 +261,13 @@ GET  /api/health | /api/license        # 引擎 / GPU / 合规状态
 
 **IDM-VTON submodule**：遵循上游 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)，**禁止商用，商用需购买授权**。
 
+**SDXL 基础模型**：遵循 **Stability AI Community License**。商用必须：
+1. 在 Stability AI 完成**免费注册**（商用目的使用或分发前）
+2. 随分发附带协议副本与仓库根目录 `NOTICE` 文件
+3. 在界面与文档**显著展示 `Powered by Stability AI`**（本项目已在前端页脚落实）
+
+收入门槛：你与关联公司合计年收入低于 $100 万时商用免费（仍需注册）；超过门槛需申请付费 Enterprise License。完整核对见 `docs/LICENSE_COMPLIANCE.md`。
+
 商用部署请设置 `LICENSE_MODE=commercial`，系统会自动禁用 IDM-VTON，使用 SDXL 商用 pipeline。
 
 ```bash

@@ -194,6 +194,9 @@ const messages = {
     'upl.delCatConfirm': '确认删除分类「{c}」？其中图片将移回未分类。',
     'upl.uploadFail': '上传失败',
     'upl.uploadFileFail': '上传 {n} 失败: {msg}',
+    // footer
+    'footer.powered': 'Powered by Stability AI',
+    'footer.licenseNote': 'SDXL 基础模型遵循 Stability AI Community License，商用需注册并署名，详见合规说明。',
   },
   en: {
     'nav.batch': 'Batch Try-On',
@@ -376,6 +379,8 @@ const messages = {
     'upl.delCatConfirm': 'Delete category "{c}"? Its images move back to Uncategorized.',
     'upl.uploadFail': 'Upload failed',
     'upl.uploadFileFail': 'Uploading {n} failed: {msg}',
+    'footer.powered': 'Powered by Stability AI',
+    'footer.licenseNote': 'The SDXL base model is licensed under the Stability AI Community License; commercial use requires registration and attribution. See the compliance notes.',
   },
 }
 

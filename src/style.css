@@ -442,6 +442,15 @@ input, select, textarea {
 }
 .eth-item .row .btn, .cat-item .row .btn { flex: none; }
 
+.foot {
+  margin-top: 24px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 11px;
+  text-align: center;
+}
+
 @media (max-width: 980px) {
   .kpis, .grid, .bases { grid-template-columns: 1fr 1fr; }
   .grid { grid-template-columns: 1fr; }
