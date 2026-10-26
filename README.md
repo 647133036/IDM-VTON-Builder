@@ -163,19 +163,24 @@ LICENSE_MODE=research python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 ## 测试
 
-后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。
+后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。前端组件测试用 vitest 覆盖 i18n 字典与人种翻译。
 
 ```bash
 pip3 install --break-system-packages pytest httpx
 cd backend
 python3 -m pytest tests/ -q
+
+# 前端组件测试
+cd /workspace
+npm test
 ```
 
 覆盖分层：
 
-- **单元测试**（`tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支
-- **集成测试**（`tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、健康与许可接口
-- **系统测试**（`tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
+- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支
+- **组件测试**（`src/i18n.test.js`）：中英文切换、占位符插值、10 地域人种翻译、自定义人种回退原文
+- **集成测试**（`backend/tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、健康与许可接口
+- **系统测试**（`backend/tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
 
 ## 目录结构
 
