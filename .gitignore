@@ -15,3 +15,7 @@ backend/data/state.lock
 
 dist/
 .monkeycode-tmp-files/
+
+models/
+training/dataset/
+training/output/

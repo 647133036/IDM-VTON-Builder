@@ -142,6 +142,10 @@ def compose_tryon_sdxl(
     pipe.to(device)
     pipe.enable_attention_slicing()
 
+    lora_dir = SDXL_DIR / "lora"
+    if (lora_dir / "adapter_model.safetensors").exists():
+        pipe.load_lora_weights(str(lora_dir))
+
     ip_adapter_path = str(SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin")
     if (SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin").exists():
         try:
