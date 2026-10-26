@@ -9,7 +9,7 @@
 - 白底 JPEG 或透明 PNG
 - 已上传图片形成可复用图片库，支持服饰分类管理与批量调整分类
 - 底座分类（受众 / 年龄带 / 人种）可管理、可批量调整
-- 人种标签可自定义（默认：东方 / 西方 / 北美 / 非洲 / 中亚 / 东南亚 / 蒙古）
+- 人种标签可自定义（默认 10 个地理区域：西欧 / 东欧 / 西亚 / 中亚 / 东亚 / 东南亚 / 非洲 / 北美 / 南美 / 澳洲），换衣引擎按底座人种修正体型（肩宽、躯干比例）
 - 多店铺管理：每店铺独立 embed 嵌入链接，商品标识通过 `store` 参数区分
 - 真实推送：Shopify Admin API 上传商品图，WordPress REST 媒体 + WooCommerce 商品关联
 - 成品大图预览弹窗，左右对照原图与成品
@@ -159,12 +159,29 @@ LICENSE_MODE=research python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 - 上传自家模特底座：名称 / 受众 / 年龄带 / 人种 / 备注 / 底图
 - 底座列表显示完整分类标签，支持多选后「批量调整分类」
-- 「人种管理」面板：新增 / 改名 / 删除人种；删除人种时引用底座回退到「东方」
+- 「人种管理」面板：新增 / 改名 / 删除人种；删除人种时引用底座回退到「东亚」
+
+## 测试
+
+后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。
+
+```bash
+pip3 install --break-system-packages pytest httpx
+cd backend
+python3 -m pytest tests/ -q
+```
+
+覆盖分层：
+
+- **单元测试**（`tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支
+- **集成测试**（`tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、健康与许可接口
+- **系统测试**（`tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
 
 ## 目录结构
 
 ```text
 backend/          FastAPI 后端、引擎包装器、推送适配器
+  tests/          pytest 测试（单元 / 集成 / 系统）
 src/              前端 SPA + i18n 字典
 public/           嵌入页、挂件、示例图
 docs/             文档

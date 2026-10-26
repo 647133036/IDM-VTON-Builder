@@ -224,6 +224,8 @@ async def api_add_base(
 @app.patch("/api/bases/{base_id}")
 def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(current_user)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    if "ethnicity" in patch and patch["ethnicity"] not in {e["value"] for e in list_ethnicities()}:
+        raise HTTPException(status_code=400, detail=f"未知人种标签: {patch['ethnicity']}")
     try:
         return update_base(base_id, patch)
     except KeyError as exc:
@@ -578,13 +580,11 @@ async def api_batch(
         name = upload.filename or f"garment_{uid('g')}.jpg"
         dest = UPLOADS / f"{uid('src')}_{Path(name).name}"
         dest.write_bytes(raw)
-        resolved_audience = audience if audience != "auto" else audience
-        resolved_type = garment_type if garment_type != "auto" else garment_type
         job = create_job(
             {
                 "base_id": base_id,
-                "audience": resolved_audience,
-                "garment_type": resolved_type,
+                "audience": audience,
+                "garment_type": garment_type,
                 "output_format": output_format,
                 "background": background,
                 "source_name": name,

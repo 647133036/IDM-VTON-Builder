@@ -216,11 +216,12 @@ ETHNICITY_MIGRATION = {
 def list_bases() -> list[dict]:
     seed_bases_if_empty()
     valid = {e["value"] for e in list_ethnicities()}
-    for b in load_state()["bases"]:
+    data = load_state()
+    for b in data["bases"]:
         eth = b.get("ethnicity")
         if eth and eth not in valid:
             b["ethnicity"] = ETHNICITY_MIGRATION.get(eth, "east_asia")
-    return load_state()["bases"]
+    return data["bases"]
 
 
 def add_base(meta: dict) -> dict:
