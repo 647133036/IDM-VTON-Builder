@@ -25,6 +25,19 @@ AUDIENCE_NEGATIVE = {
     "baby": "worst quality, low quality, adult body, distorted proportions, big head, extra limbs, missing limbs",
 }
 
+ETHNICITY_PROMPTS = {
+    "western_europe": "a model with a slender build, long legs, relatively narrow hips, European body proportions",
+    "eastern_europe": "a model with a taller body, slightly broader shoulders, Eastern European body proportions",
+    "west_asia": "a model with a medium height, curvy hips, Middle Eastern body proportions",
+    "central_asia": "a model with a compact build, shorter legs relative to torso, Central Asian body proportions",
+    "east_asia": "a model with a slim petite frame, narrower shoulders, longer torso relative to legs, East Asian body proportions",
+    "southeast_asia": "a model with a smaller and slimmer body, narrower shoulders, Southeast Asian body proportions",
+    "africa": "a model with long arms and legs, athletic build, African body proportions",
+    "north_america": "a model with a larger and fuller body, wider waist, North American body proportions",
+    "south_america": "a model with an hourglass figure, prominent waist-hip contrast, South American body proportions",
+    "oceania": "a model with slightly longer legs, fuller body, Australian and Pacific body proportions",
+}
+
 GARMENT_PROMPT_SUFFIX = {
     "upper": "shirt, t-shirt, blouse",
     "dress": "dress, gown, skirt",
@@ -76,6 +89,7 @@ def compose_tryon_sdxl(
     garment_type: str,
     long_side: int = 2048,
     background: str = "white",
+    ethnicity: str = "western_europe",
 ) -> Image.Image:
     import torch
     from PIL import Image as PILImage
@@ -101,6 +115,8 @@ def compose_tryon_sdxl(
     cloth_img = garment_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
 
     prompt = AUDIENCE_PROMPTS.get(audience, AUDIENCE_PROMPTS["women"])
+    eth_prompt = ETHNICITY_PROMPTS.get(ethnicity, ETHNICITY_PROMPTS["western_europe"])
+    prompt = f"{prompt}, {eth_prompt}"
     garment_suffix = GARMENT_PROMPT_SUFFIX.get(garment_type, "")
     if garment_suffix:
         prompt = f"{prompt}, wearing {garment_suffix}"

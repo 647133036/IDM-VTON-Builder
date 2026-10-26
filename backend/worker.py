@@ -51,7 +51,8 @@ def process_job(job: dict, bases: list[dict]) -> None:
     engine_name = engine_info["engine"]
     engine_label = "IDM-VTON 扩散模型" if engine_info["idm_vton_available"] else "合成引擎（无GPU回退）"
     patch_job(job["id"], {"progress": 35, "message": f"调用 {engine_label}"})
-    result = compose_tryon(base_path, src, audience, garment_type, long_side, background)
+    ethnicity = base.get("ethnicity") or ""
+    result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
     patch_job(job["id"], {"progress": 78, "message": "输出成品图"})
 
     ext = "png" if job.get("output_format") == "png" or background == "transparent" else "jpg"

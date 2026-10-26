@@ -14,6 +14,31 @@ TORSOS = {
     "baby": dict(x=0.24, y=0.24, w=0.52, h=0.46, shoulder=0.90, hem=0.78, neck=0.28, sleeve=0.14),
 }
 
+ETHNICITY_FIT = {
+    "western_europe": dict(w=1.00, h=1.00, shoulder=1.00),
+    "eastern_europe": dict(w=1.02, h=1.02, shoulder=1.02),
+    "west_asia": dict(w=1.01, h=1.00, shoulder=1.01),
+    "central_asia": dict(w=0.98, h=1.00, shoulder=0.98),
+    "east_asia": dict(w=0.95, h=1.02, shoulder=0.95),
+    "southeast_asia": dict(w=0.94, h=0.99, shoulder=0.94),
+    "africa": dict(w=1.00, h=0.96, shoulder=1.00),
+    "north_america": dict(w=1.06, h=1.02, shoulder=1.05),
+    "south_america": dict(w=1.03, h=1.00, shoulder=1.02),
+    "oceania": dict(w=1.03, h=0.98, shoulder=1.02),
+}
+
+
+def torso_box(audience: str, ethnicity: str) -> dict:
+    box = dict(TORSOS.get(audience, TORSOS["women"]))
+    fit = ETHNICITY_FIT.get(ethnicity, ETHNICITY_FIT["western_europe"])
+    ow = box["w"]
+    box["w"] *= fit["w"]
+    box["h"] *= fit["h"]
+    box["shoulder"] *= fit["shoulder"]
+    box["x"] += (ow - box["w"]) / 2
+    return box
+
+
 GARMENT_BOX = {
     "upper": dict(y=0.00, h=1.00),
     "dress": dict(y=0.00, h=1.55),
@@ -155,6 +180,7 @@ def _composite_engine(
     garment_type: str,
     long_side: int,
     background: str,
+    ethnicity: str = "western_europe",
 ) -> Image.Image:
     base = Image.open(base_path).convert("RGBA")
     w, h = base.size
@@ -164,7 +190,7 @@ def _composite_engine(
     garment = garment.convert("RGBA")
     garment.putalpha(alpha)
 
-    box = dict(TORSOS.get(audience, TORSOS["women"]))
+    box = torso_box(audience, ethnicity)
     adj = GARMENT_BOX.get(garment_type, GARMENT_BOX["upper"])
     box["y"] = box["y"] + adj["y"] * box["h"]
     box["h"] = box["h"] * adj["h"]
@@ -300,13 +326,14 @@ def _idm_vton_engine(
     garment_type: str,
     long_side: int,
     background: str,
+    ethnicity: str = "western_europe",
 ) -> Image.Image:
     import torch
     from PIL import Image as PILImage
 
     pipe = _load_idm_vton_pipeline()
     if pipe is None:
-        return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background)
+        return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
 
     device = pipe.device if hasattr(pipe, "device") else torch.device("cuda:0")
 
@@ -322,7 +349,7 @@ def _idm_vton_engine(
 
     mask_img = PILImage.new("RGB", (target_w, target_h), (0, 0, 0))
     mask_draw = ImageDraw.Draw(mask_img)
-    box = dict(TORSOS.get(audience, TORSOS["women"]))
+    box = torso_box(audience, ethnicity)
     mx = int(box["x"] * target_w)
     my = int(box["y"] * target_h)
     mw = int(box["w"] * target_w)
@@ -369,13 +396,14 @@ def compose_tryon(
     garment_type: str,
     long_side: int = 2048,
     background: str = "white",
+    ethnicity: str = "western_europe",
 ) -> Image.Image:
     license_allowed, _ = _license_allows_idm()
     if license_allowed:
         avail, _ = _idm_vton_available()
         if avail:
             try:
-                return _idm_vton_engine(base_path, garment_path, audience, garment_type, long_side, background)
+                return _idm_vton_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
             except Exception:
                 pass
 
@@ -384,12 +412,12 @@ def compose_tryon(
             from engine_sdxl import sdxl_available, compose_tryon_sdxl
             sdxl_avail, sdxl_reason = sdxl_available()
             if sdxl_avail:
-                return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background)
+                return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
             raise RuntimeError(f"commercial 模式无可用商用引擎: {sdxl_reason}")
         except ImportError:
             raise RuntimeError("commercial 模式需要 SDXL 引擎，请安装 diffusers 等依赖")
 
-    return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background)
+    return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
 
 
 def engine_status() -> dict:
