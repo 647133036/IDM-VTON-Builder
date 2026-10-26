@@ -6,4 +6,7 @@ accelerate>=0.30.0
 safetensors>=0.4.0
 pillow>=10.0.0
 numpy>=1.24.0
+pandas>=2.0.0
+opencv-python-headless>=4.8.0
+controlnet-aux>=0.0.7
 modelscope>=1.15.0

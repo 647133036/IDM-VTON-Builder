@@ -44,12 +44,16 @@ def main() -> int:
     parser.add_argument("--cloth", type=Path, default=Path("public/examples/cloth"))
     parser.add_argument("--human", type=Path, default=Path("public/examples/human"))
     parser.add_argument("--out", type=Path, default=Path("training/dataset"))
+    parser.add_argument("--groups", nargs="*", default=("cloth", "human"),
+                        help="subsets to include, in order: cloth human")
     parser.add_argument("--force", action="store_true", help="overwrite existing normalized images and captions")
     args = parser.parse_args()
 
     args.out.mkdir(parents=True, exist_ok=True)
 
     for source, kind in [(args.cloth, "cloth"), (args.human, "human")]:
+        if kind not in args.groups:
+            continue
         if not source.exists():
             print(f"skip {kind}: {source} not found")
             continue
