@@ -42,9 +42,10 @@ case "$MODEL" in
 
   controlnet)
     DATASET_DIR="${DATASET_DIR:-training/cn_dataset}"
-    OUTPUT_DIR="${OUTPUT_DIR:-models/sdxl/controlnet}"
-    STEPS="${STEPS:-800}"
     CONDITION="${CONDITION:-openpose}"
+    # 默认输出到引擎实际扫描的目录(models/sdxl/controlnet_<condition>)。
+    OUTPUT_DIR="${OUTPUT_DIR:-models/sdxl/controlnet_${CONDITION}}"
+    STEPS="${STEPS:-800}"
 
     python3 training/prepare_controlnet_data.py \
       --source public/examples/human \

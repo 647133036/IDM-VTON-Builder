@@ -259,14 +259,22 @@ def test_stores_crud(client, auth_headers):
 
     r = client.patch(
         f"/api/stores/{store['id']}",
-        json={"api_key": "newtok12345"},
+        json={"api_key": "shpat_newtok_12345"},
         headers=auth_headers,
     )
     assert r.status_code == 200
     assert r.json()["api_key"] == ""
     assert r.json()["has_api_key"] is True
-    assert r.json()["api_key_masked"] == "ne***45"
-    assert "newtok12345" not in r.text
+    # 长 key 仅暴露首尾各 3 位。
+    assert r.json()["api_key_masked"] == "shp***345"
+    assert "shpat_newtok_12345" not in r.text
+
+    # 短 key(<=8 位)整体隐藏,避免掩码泄露过半字符。
+    client.patch(f"/api/stores/{store['id']}", json={"api_key": "newtok1"}, headers=auth_headers)
+    assert r.status_code == 200
+    r = client.get("/api/stores", headers=auth_headers)
+    short = next(s for s in r.json() if s["id"] == store["id"])
+    assert short["api_key_masked"] == "***"
 
     assert client.delete(f"/api/stores/{store['id']}", headers=auth_headers).status_code == 200
 
@@ -378,6 +386,62 @@ def test_staff_cannot_push(client, auth_headers):
     ).status_code in (403, 404)
 
 
+def test_staff_cannot_manage_bases_categories_or_moves(client):
+    """H-02: staff 不能新建/改底座、批量改底座、移动文件、建分类(仅 admin)。"""
+    r = client.post(
+        "/api/auth/login",
+        json={"username": "staff", "password": "staff123"},
+    )
+    assert r.status_code == 200
+    staff_headers = {"Authorization": f"Bearer {r.json()['token']}"}
+
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (200, 60, 60)).save(buf, format="PNG")
+    png = buf.getvalue()
+
+    r = client.post(
+        "/api/bases",
+        data={"name": "staff 底座", "audience": "women", "ethnicity": "east_asia"},
+        files={"file": ("b.png", png, "image/png")},
+        headers=staff_headers,
+    )
+    assert r.status_code == 403
+    assert (
+        client.post(
+            "/api/bases/batch/patch",
+            json={"ids": ["base_women_01"], "patch": {"ethnicity": "north_america"}},
+            headers=staff_headers,
+        ).status_code
+        == 403
+    )
+    assert (
+        client.patch("/api/bases/base_women_01", json={"ethnicity": "north_america"}, headers=staff_headers).status_code
+        == 403
+    )
+
+    # 先由 admin 上传一个文件,再验证 staff 不能移动/建分类。
+    admin = client.post("/api/auth/login", json={"username": "admin", "password": "admin123"})
+    admin_headers = {"Authorization": f"Bearer {admin.json()['token']}"}
+    up = client.post(
+        "/api/uploads",
+        data={"category": ""},
+        files={"file": ("move_me.png", png, "image/png")},
+        headers=admin_headers,
+    )
+    assert up.status_code == 200
+    filename = up.json()["name"]
+
+    assert (
+        client.post(f"/api/uploads/{filename}/move", json={"category": "staffcat"}, headers=staff_headers).status_code
+        == 403
+    )
+    assert client.post("/api/uploads/categories", json={"name": "staffcat"}, headers=staff_headers).status_code == 403
+
+
 def test_update_settings(client, auth_headers):
     r = client.patch("/api/settings", json={"store_name": "MannequinForge Test"}, headers=auth_headers)
     assert r.status_code == 200
@@ -453,3 +517,65 @@ def test_batch_invalid_background_rejected(client, auth_headers):
     )
     assert r.status_code == 400
     assert "background" in r.json()["detail"]
+
+
+def test_pixel_bomb_rejected(client, auth_headers):
+    """H-10: 超大像素图(解压炸弹)必须 400,即使字节数很小。"""
+    import io
+
+    from PIL import Image
+
+    # 6000x6000 = 36M 像素,PNG 压缩后远小于 20MB。
+    buf = io.BytesIO()
+    Image.new("1", (9000, 9000), 0).save(buf, format="PNG")
+    r = client.post(
+        "/api/uploads",
+        data={"category": ""},
+        files={"file": ("bomb.png", buf.getvalue(), "image/png")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "pixels" in r.json()["detail"]
+
+
+def test_batch_count_limit(client, auth_headers):
+    """H-10: 批量超过 _MAX_BATCH_FILES 张必须 400。"""
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (1, 2, 3)).save(buf, format="PNG")
+    png = buf.getvalue()
+    files = [("files", (f"g{i}.png", png, "image/png")) for i in range(51)]
+    r = client.post(
+        "/api/jobs/batch",
+        data={"base_id": "base_women_01", "audience": "auto", "garment_type": "auto"},
+        files=files,
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "Too many files" in r.json()["detail"]
+
+
+def test_move_to_default_does_not_create_subdir(client, auth_headers):
+    """P2-5: move/upload 到保留字 default 应落在根目录,不建 default 子目录。"""
+    r = client.post(
+        "/api/uploads",
+        data={"category": "default"},
+        files={"file": ("d.png", _png_bytes((9, 9, 9)), "image/png")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["category"] == "default"
+
+
+def test_health_does_not_leak_abs_paths(client):
+    """P2-11: /api/health 不得暴露本地绝对路径。"""
+    r = client.get("/api/health")
+    assert r.status_code == 200
+    detail = r.json()["engine_detail"]
+    assert "weights_dir" not in detail
+    assert "idm_vton_dir" not in detail
+    assert "sdxl_dir" not in detail
+    assert "/" not in str(detail.get("idm_vton_reason", "")) or "no" in str(detail.get("idm_vton_reason", "")).lower()

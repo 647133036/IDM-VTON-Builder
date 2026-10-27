@@ -151,10 +151,11 @@ def _get_sdxl_pipe(device, dtype):
     ip_adapter_loaded = False
     if ip_adapter_bin.exists():
         try:
+            # 直接以本地目录作为 pretrained_model_name_or_path,避免回连 HF(H-05)。
             pipe.load_ip_adapter(
-                "h94/IP-Adapter",
-                subfolder="sdxl_models",
+                str(ip_adapter_bin.parent),
                 weight_name=str(ip_adapter_bin.name),
+                download_kwargs={"local_files_only": True},
             )
             pipe.set_ip_adapter_scale(0.8)
             ip_adapter_loaded = True

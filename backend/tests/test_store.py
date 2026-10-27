@@ -151,3 +151,27 @@ def test_settings_and_stats():
 
     s = stats()
     assert set(s) >= {"total", "queued", "running", "done", "failed", "bases"}
+
+
+def test_delete_base_exact_name_only(client=None):
+    """P3-5: delete_base 只按精确名删,不误删 base_10.png。"""
+    import store as s
+
+    s.seed_bases_if_empty()
+    # 先放一个 base_10.png(名字前缀与 base_1 冲突)。
+    (s.BASES / "base_10.png").write_bytes(b"x")
+    delete_base("base_women_01")
+    # base_10.png 必须仍在。
+    assert (s.BASES / "base_10.png").exists()
+
+
+def test_delete_all_bases_does_not_reseed(client=None):
+    """P3-6: 删除全部底座后,再次 list_bases 不自动补种。"""
+    import store as s
+
+    s.seed_bases_if_empty()
+    for b in list_bases():
+        delete_base(b["id"])
+    assert list_bases() == []
+    # 二次确认仍为空。
+    assert list_bases() == []

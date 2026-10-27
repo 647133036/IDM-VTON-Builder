@@ -111,8 +111,9 @@ def _encode_text(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompts, 
     ids_2 = tok(tokenizer_2, prompts)
     with torch.no_grad():
         enc = text_encoder(ids.input_ids).last_hidden_state
-        out_2 = text_encoder_2(ids_2.input_ids)
-    prompt_embeds = torch.cat([enc, out_2.last_hidden_state], dim=-1)
+        # SDXL 约定:text_encoder_2 取 hidden_states[-2],而非 last_hidden_state。
+        out_2 = text_encoder_2(ids_2.input_ids, output_hidden_states=True)
+    prompt_embeds = torch.cat([enc, out_2.hidden_states[-2]], dim=-1)
     pooled_embeds = getattr(out_2, "text_embeds", None)
     if pooled_embeds is None:
         pooled_embeds = out_2.pooler_output

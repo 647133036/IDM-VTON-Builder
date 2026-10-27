@@ -60,6 +60,11 @@ start_worker()
 _SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
 _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+# 像素炸弹上限:解压后像素数不得超过此值。
+_MAX_IMAGE_PIXELS = 64_000_000
+# 单次批量任务上限:张数 + 累计体积。
+_MAX_BATCH_FILES = 50
+_MAX_BATCH_BYTES = 200 * 1024 * 1024
 _PUBLIC_DIRS = {"uploads", "results", "bases"}
 
 
@@ -93,6 +98,21 @@ def _safe_name(value: str) -> str:
     return name
 
 
+def _safe_category(value: str) -> str:
+    # 分类名禁止使用保留字 default,避免与"未分类"根目录冲突(P2-5)。
+    name = _safe_name(value)
+    if name == "default":
+        raise HTTPException(status_code=400, detail="Category 'default' is reserved")
+    return name
+
+
+def _category_dir(category: str) -> Path:
+    # 空/缺省/保留字 default 一律落在"未分类"根目录,不再创建 default 子目录。
+    if not category or category == "default":
+        return UPLOADS
+    return UPLOADS / _safe_category(category)
+
+
 def _validate_image_bytes(raw: bytes) -> tuple[bytes, str]:
     if len(raw) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="File too large (max 20MB)")
@@ -101,11 +121,17 @@ def _validate_image_bytes(raw: bytes) -> tuple[bytes, str]:
     from PIL import Image
 
     try:
-        img = Image.open(io.BytesIO(raw))
-        img.verify()
+        with Image.open(io.BytesIO(raw)) as img:
+            width, height = img.size
+            # 按像素数上限显式拒绝,防止解压炸弹(H-10)。
+            if width * height > _MAX_IMAGE_PIXELS:
+                raise HTTPException(status_code=400, detail=f"Too many pixels (max {_MAX_IMAGE_PIXELS})")
+            fmt = (img.format or "").upper()
+            img.verify()
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail="Invalid image file") from exc
-    fmt = (img.format or "").upper()
     ext_map = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
     ext = ext_map.get(fmt)
     if ext is None:
@@ -241,7 +267,7 @@ async def api_add_base(
     ethnicity: str = Form("east_asia"),
     notes: str = Form(""),
     file: UploadFile = File(...),
-    _: dict = Depends(current_user),
+    _: dict = Depends(require_admin),
 ):
     if ethnicity not in {e["value"] for e in list_ethnicities()}:
         raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {ethnicity}")
@@ -273,7 +299,7 @@ async def api_add_base(
 
 
 @app.patch("/api/bases/{base_id}")
-def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(current_user)):
+def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(require_admin)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     if "ethnicity" in patch and patch["ethnicity"] not in {e["value"] for e in list_ethnicities()}:
         raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {patch['ethnicity']}")
@@ -284,7 +310,7 @@ def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(current_user
 
 
 @app.post("/api/bases/batch/patch")
-def api_patch_bases_batch(body: BaseBatchPatch, _: dict = Depends(current_user)):
+def api_patch_bases_batch(body: BaseBatchPatch, _: dict = Depends(require_admin)):
     patch = {k: v for k, v in body.patch.items() if v is not None}
     if not patch:
         raise HTTPException(status_code=400, detail="No updatable fields provided")
@@ -365,7 +391,8 @@ def _mask_store(item: dict, origin: str) -> dict:
     item["api_key"] = ""
     item["has_api_key"] = bool(key)
     if key:
-        item["api_key_masked"] = key[:2] + "***" + key[-2:] if len(key) > 4 else "***"
+        # 短 key 整体隐藏;长 key 仅暴露首尾各 3 位。
+        item["api_key_masked"] = key[:3] + "***" + key[-3:] if len(key) > 8 else "***"
     item["embed_url"] = embed_url(origin, item["id"])
     return item
 
@@ -491,7 +518,7 @@ class MoveBody(BaseModel):
 
 
 @app.post("/api/uploads/{filename}/move")
-def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_user)):
+def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(require_admin)):
     safe_name = _safe_name(filename)
     p = UPLOADS / safe_name
     if not p.is_file():
@@ -505,10 +532,10 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
         raise HTTPException(status_code=404, detail="Image not found")
     if p.suffix.lower() not in _IMAGE_SUFFIXES:
         raise HTTPException(status_code=400, detail="Only image files can be moved here")
-    category = _safe_name(body.category) if body.category else "default"
+    category = body.category or "default"
     if p.parent.name == category:
         return {"ok": True, "filename": p.name, "category": category}
-    cat_dir = UPLOADS / category
+    cat_dir = _category_dir(category)
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
     i = 1
@@ -520,7 +547,7 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
 
 
 @app.post("/api/uploads/categories")
-def api_add_upload_category(body: CategoryBody, _: dict = Depends(current_user)):
+def api_add_upload_category(body: CategoryBody, _: dict = Depends(require_admin)):
     name = _safe_name(body.name)
     if name == "default":
         raise HTTPException(status_code=400, detail="Category 'default' is reserved")
@@ -606,8 +633,8 @@ async def api_upload_to_library(
     content = await file.read()
     _, ext = _validate_image_bytes(content)
     safe_name = f"upload_{uuid.uuid4().hex[:8]}{ext}"
-    cat = _safe_name(category) if category else "default"
-    cat_dir = UPLOADS / cat
+    cat = category or "default"
+    cat_dir = _category_dir(cat)
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
     dest.write_bytes(content)
@@ -657,15 +684,25 @@ async def api_batch(
     _validate_batch_params(audience, garment_type, background, output_format)
     if not files:
         raise HTTPException(status_code=400, detail="Please upload at least one garment image")
+    if len(files) > _MAX_BATCH_FILES:
+        raise HTTPException(status_code=400, detail=f"Too many files (max {_MAX_BATCH_FILES})")
     bases = list_bases()
     if not any(b["id"] == base_id for b in bases):
         raise HTTPException(status_code=400, detail="Base model not found")
     jobs = []
     prepared = []
+    total_bytes = 0
     for upload in files:
         raw = await upload.read()
         if not raw:
             continue
+        # 累计体积校验:防止超大批量拖垮磁盘/CPU。
+        total_bytes += len(raw)
+        if total_bytes > _MAX_BATCH_BYTES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Batch too large (max {_MAX_BATCH_BYTES // (1024 * 1024)}MB)",
+            )
         _, ext = _validate_image_bytes(raw)
         display_name = upload.filename or f"garment{ext}"
         prepared.append((raw, ext, display_name))
@@ -745,7 +782,11 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(require_admin)):
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "engine": load_settings().get("engine"), "engine_detail": engine_status()}
+    detail = engine_status()
+    # 不向前端暴露本地绝对路径(weights_dir/idm_vton_dir/sdxl_dir)。
+    for _k in ("weights_dir", "idm_vton_dir", "sdxl_dir"):
+        detail.pop(_k, None)
+    return {"ok": True, "engine": load_settings().get("engine"), "engine_detail": detail}
 
 
 @app.get("/api/license")

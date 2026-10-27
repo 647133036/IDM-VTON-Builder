@@ -54,7 +54,8 @@ class _ControlNetCaptionDataset:
         img = Image.open(img_path).convert("RGB").resize((self.resolution, self.resolution), Image.LANCZOS)
         cond = Image.open(cond_path).convert("RGB").resize((self.resolution, self.resolution), Image.LANCZOS)
         t = transforms.ToTensor()
-        return t(img) * 2.0 - 1.0, t(cond) * 2.0 - 1.0, caption
+        # 训练目标图归一化到 [-1,1] 供 VAE;ControlNet 条件图保持 [0,1](与推理端一致)。
+        return t(img) * 2.0 - 1.0, t(cond), caption
 
 
 def _encode_prompts(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompts, device, dtype):
@@ -73,8 +74,9 @@ def _encode_prompts(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompt
     ids_2 = tok(tokenizer_2, prompts)
     with torch.no_grad():
         hidden = text_encoder(ids.input_ids).last_hidden_state
-        out_2 = text_encoder_2(ids_2.input_ids)
-    prompt_embeds = torch.cat([hidden, out_2.last_hidden_state], dim=-1).to(dtype)
+        # SDXL 约定:text_encoder_2 取 hidden_states[-2],而非 last_hidden_state。
+        out_2 = text_encoder_2(ids_2.input_ids, output_hidden_states=True)
+    prompt_embeds = torch.cat([hidden, out_2.hidden_states[-2]], dim=-1).to(dtype)
     pooled = getattr(out_2, "text_embeds", None)
     if pooled is None:
         pooled = out_2.pooler_output

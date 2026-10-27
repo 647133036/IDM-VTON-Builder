@@ -80,7 +80,7 @@ def _idm_vton_available() -> tuple[bool, str]:
     if not allowed:
         return False, reason
 
-    ckpt = _IDM_DIR / "ckpt"
+    ckpt = WEIGHTS_DIR
     required = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
     missing = [d for d in required if not (ckpt / d).exists()]
     if missing:
@@ -306,7 +306,7 @@ def _load_idm_vton_pipeline():
         CLIPTextModelWithProjection,
     )
 
-    ckpt_path = str(_IDM_DIR / "ckpt")
+    ckpt_path = str(WEIGHTS_DIR)
     device = torch.device("cuda:0")
 
     unet = UNet2DConditionModel.from_pretrained(ckpt_path, subfolder="unet", torch_dtype=torch.float16)

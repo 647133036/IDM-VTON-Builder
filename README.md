@@ -186,7 +186,7 @@ MODEL=lora_family bash run_train.sh
 - ControlNet 条件图归一化到 `[0,1]`，与推理端一致
 - 数据准备：`python3 prepare_dataset.py` + `python3 prepare_controlnet_data.py`
 
-训练依赖见 `training/requirements.txt`（含 `torchvision`、`tensorboard`）。
+训练依赖见 `training/requirements.txt`（含 `torchvision`，不含 `tensorboard`，训练日志走 stdout）。
 
 ## 多店铺与推送
 
@@ -202,7 +202,7 @@ MODEL=lora_family bash run_train.sh
 | API 凭证 | Shopify Admin token · WordPress: `用户名:应用密码` |
 | 默认商品 ID | 可选，推送时优先取请求里的 `product_id` |
 
-API 凭证加密存储，列表接口仅返回掩码值，编辑凭证需 admin 权限。
+API 凭证在本地 `state.json` 中以明文存储（文件权限 `0600`，不加密、不上传），列表/编辑响应仅返回掩码值；新增、编辑、删除凭证均需 admin 权限。
 
 ### 推送
 

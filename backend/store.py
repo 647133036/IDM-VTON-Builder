@@ -42,6 +42,8 @@ DEFAULT_STATE = {
     "uploads": [],
     "stores": [],
     "ethnicities": ETHNICITY_DEFAULTS,
+    # 仅首次启动种子一次;管理员删除全部底座后不再自动补种(P3-6)。
+    "_bases_seeded": False,
     "settings": {
         "output_long_side": 2048,
         "background": "white",
@@ -128,6 +130,10 @@ def find_in_dir(directory: Path, name: str) -> Path | None:
 
 def seed_bases_if_empty() -> None:
     def _seed(state: dict):
+        # 已种子过就不再补种,管理员删空后保持为空(P3-6)。
+        if state.get("_bases_seeded"):
+            return
+        state["_bases_seeded"] = True
         if not state["bases"]:
             catalog = [
                 {
@@ -255,16 +261,19 @@ def delete_base(base_id: str) -> None:
         state["bases"] = remaining
 
     with_state(_del)
-    src = BASES / f"{base_id}.png"
-    if not src.exists():
-        src = next((p for p in BASES.iterdir() if p.name.startswith(base_id)), None)
-    if src and src.exists():
-        dest = TRASH / src.name
+    # 仅按精确文件名删除,避免 startswith 误删(base_1 不应匹配 base_10.png)。
+    for p in sorted(BASES.iterdir()):
+        if not p.is_file():
+            continue
+        if p.stem != base_id:
+            continue
+        dest = TRASH / p.name
         i = 1
         while dest.exists():
-            dest = TRASH / f"{src.stem}_{i}{src.suffix}"
+            dest = TRASH / f"{p.stem}_{i}{p.suffix}"
             i += 1
-        src.replace(dest)
+        p.replace(dest)
+        break
 
 
 def create_job(payload: dict) -> dict:
