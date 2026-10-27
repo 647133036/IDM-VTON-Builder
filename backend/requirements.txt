@@ -6,6 +6,8 @@ numpy==2.2.4
 pyjwt==2.10.1
 aiofiles==24.1.0
 requests==2.32.3
+# 合成引擎的简易 2D 变形(网格变形)依赖;纯 CPU,无 GPU 要求。
+opencv-python-headless>=4.9.0
 
 # IDM-VTON GPU 推理依赖（需要 CUDA GPU）
 # torch>=2.1.0

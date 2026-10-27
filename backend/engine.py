@@ -52,6 +52,14 @@ GARMENT_BOX = {
     "onesie": dict(y=0.00, h=1.35),
 }
 
+# 简易 2D 变形的强度(0~1):越大越贴合模特轮廓。纯 CPU,不依赖 GPU。
+GARMENT_WARP_STRENGTH = {
+    "upper": 0.42,
+    "dress": 0.48,
+    "onesie": 0.42,
+    "lower": 0.28,
+}
+
 GARMENT_PROMPTS = {
     "upper": "a model wearing this shirt",
     "dress": "a model wearing this dress",
@@ -181,6 +189,61 @@ def match_color(garment: Image.Image) -> Image.Image:
     return g
 
 
+def _silhouette_scale(ys: np.ndarray, box: dict, strength: float) -> np.ndarray:
+    """每行的水平缩放系数,让衣料跟随躯干轮廓(肩宽、腰部收窄、下摆展开)。
+
+    依据 shirt_mask 的轮廓关键点插值;强度 0 表示不缩放(原样贴图)。
+    """
+    if strength <= 0:
+        return np.ones_like(ys)
+    shoulder = box["shoulder"]
+    hem = box["hem"]
+    neck = box["neck"]
+    sleeve = box["sleeve"]
+    pit = 0.10 + sleeve
+    # (y, 半宽占 box 宽度比例) 关键点:颈/肩/腋下/下摆。
+    keys = np.array(
+        [
+            [0.00, neck / 2],
+            [0.10, shoulder / 2],
+            [pit, (shoulder + 0.02) / 2],
+            [0.97, hem / 2],
+            [1.00, hem / 2],
+        ]
+    )
+    ratio = np.interp(ys, keys[:, 0], keys[:, 1])
+    ratio = np.clip(ratio, 0.35, 0.55)  # 限制极端收窄
+    full = 0.5  # 未变形时衣料近似铺满 box 宽度
+    scale = 1.0 - strength * (1.0 - ratio / full)
+    return np.clip(scale, 0.72, 1.06)
+
+
+def _warp_garment(garment: Image.Image, box: dict, strength: float) -> Image.Image:
+    """水平网格变形:沿躯干轮廓收窄/放宽,肩部略展、腰部收、下摆贴合。
+
+    纯 CPU(cv2.remap 双线性采样),无 GPU 依赖;cv2 缺失时原样返回。
+    """
+    if strength <= 0:
+        return garment
+    try:
+        import cv2
+    except ImportError:
+        return garment
+    tw, th = garment.size
+    if tw < 4 or th < 4:
+        return garment
+    arr = np.asarray(garment.convert("RGBA")).astype(np.float32)
+    ys = np.linspace(0.0, 1.0, th)
+    scale = _silhouette_scale(ys, box, strength)
+    cx = (tw - 1) / 2.0
+    xg, yg = np.meshgrid(np.arange(tw, dtype=np.float32), np.arange(th, dtype=np.float32))
+    # 目标像素 -> 源像素:沿中心线按该行缩放系数反算。
+    map_x = (cx + (xg - cx) / scale[:, None]).astype(np.float32)
+    map_y = yg.astype(np.float32)
+    out = cv2.remap(arr, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
+    return Image.fromarray(out.astype(np.uint8), "RGBA")
+
+
 def _composite_engine(
     base_path: Path,
     garment_path: Path,
@@ -211,6 +274,8 @@ def _composite_engine(
     th = max(th, 32)
 
     fitted = fit_garment(garment, (tw, th))
+    # 简易 2D 变形:让衣料贴合模特躯干轮廓(肩/腰/下摆)。
+    fitted = _warp_garment(fitted, box, GARMENT_WARP_STRENGTH.get(garment_type, 0.4))
     body = shirt_mask(tw, th, box)
     g_a = fitted.split()[-1]
     merged_a = ImageEnhance.Brightness(g_a).enhance(1.0)
@@ -220,10 +285,12 @@ def _composite_engine(
     )
     fitted.putalpha(merged_a)
 
-    shadow = merged_a.filter(ImageFilter.GaussianBlur(8))
+    # 接触阴影:模糊半径随衣料尺寸缩放,略偏移并加深,模拟身体投影。
+    blur_r = max(4, int(max(tw, th) * 0.035))
+    shadow = merged_a.filter(ImageFilter.GaussianBlur(blur_r))
     shadow_layer = Image.new("RGBA", base.size, (25, 20, 16, 0))
     shadow_img = Image.new("L", base.size, 0)
-    shadow_img.paste(ImageEnhance.Brightness(shadow).enhance(0.35), (tx + 2, ty + 6))
+    shadow_img.paste(ImageEnhance.Brightness(shadow).enhance(0.42), (tx + 2, ty + int(th * 0.02)))
     shadow_layer.putalpha(shadow_img)
 
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))

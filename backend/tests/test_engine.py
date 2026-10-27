@@ -2,6 +2,8 @@ import pytest
 from engine import (
     ETHNICITY_FIT,
     TORSOS,
+    _silhouette_scale,
+    _warp_garment,
     compose_tryon,
     engine_status,
     guess_audience,
@@ -161,3 +163,51 @@ def test_engine_status_shape():
         "idm-vton",
         "sdxl-commercial",
     )
+
+
+def test_silhouette_scale_is_smooth_and_bounded():
+    import numpy as np
+
+    box = torso_box("women", "east_asia")
+    ys = np.linspace(0, 1, 101)
+    s = _silhouette_scale(ys, box, 0.42)
+    assert s.min() >= 0.72
+    assert s.max() <= 1.06
+    # 腰部应比肩部略窄(曲线贴合躯干)。
+    shoulder = float(np.interp(0.10, ys, s))
+    waist = float(np.interp(0.5, ys, s))
+    assert waist < shoulder
+
+
+def test_silhouette_scale_zero_strength_is_identity():
+    import numpy as np
+
+    box = torso_box("women", "western_europe")
+    ys = np.linspace(0, 1, 8)
+    assert np.allclose(_silhouette_scale(ys, box, 0.0), 1.0)
+
+
+def test_warp_garment_changes_pixels():
+    import numpy as np
+    from PIL import Image
+
+    # 纯色渐变衣料:无变形时左右对称,变形后中心列采样点偏移,像素必不同。
+    w, h = 200, 260
+    x = np.tile(np.linspace(0, 255, w), (h, 1))
+    img = Image.fromarray(x.astype(np.uint8), "L").convert("RGBA")
+    box = torso_box("women", "east_asia")
+    out = _warp_garment(img, box, 0.42)
+    assert out.size == img.size
+    assert out.mode == "RGBA"
+    a = np.asarray(img.convert("RGBA"))
+    b = np.asarray(out.convert("RGBA"))
+    assert not np.array_equal(a, b)
+
+
+def test_warp_garment_noop_without_cv2_or_zero_strength():
+    from PIL import Image
+
+    img = Image.new("RGBA", (80, 100), (200, 40, 40, 255))
+    box = torso_box("women", "east_asia")
+    out = _warp_garment(img, box, 0.0)
+    assert out is img or out.size == img.size
