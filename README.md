@@ -16,19 +16,32 @@
 - 界面中英文一键切换（登录页 / 导航栏按钮），语言偏好本地持久化
 - 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底），UI 横幅实时显示当前引擎与 GPU 状态
 
+## 安全
+
+本项目经过安全审查并修复了所有严重和高优先级问题：
+
+- **文件服务鉴权**：`/files/{path}` 需登录且仅暴露 uploads/results/bases 白名单目录，state.json 等内部文件不可访问
+- **上传路径校验**：文件名和分类名通过正则白名单校验，拒绝 `.`、`..`、路径穿越
+- **图片内容验证**：所有上传入口使用 PIL 解码校验，拒绝非图片文件（HTML/脚本等），最大 20MB
+- **JWT 密钥**：无硬编码默认值，未设置环境变量时随机生成（每次重启失效）
+- **账号密码**：无公开默认密码，未设置环境变量时随机生成并输出到日志
+- **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看，删除/推送/设置/人种管理需 admin
+- **凭据脱敏**：`/api/stores` 不返回明文 api_key，仅返回 `has_api_key` 和掩码值
+- **文件权限**：state.json 权限 600
+
 ## 图片规格
 
 **上传（服装图 / 底座图）**
-- 文件大小：无硬性限制
-- 格式：仅校验 MIME 是否为图片，支持 JPG / PNG / WEBP 等
+- 文件大小：最大 20MB
+- 格式：PNG / JPEG / WEBP（服务端 PIL 解码校验，拒绝伪造 Content-Type）
 - 分辨率与宽高比：不拦截，任意尺寸均可上传
 
 **生成处理**
 - 合成引擎：服装图先自动裁剪主体，再按目标躯干框等比缩放并居中适配
-- SDXL 商用引擎：底图与服装图统一缩放到 1024×1024 后送 ControlNet + IP-Adapter
+- SDXL 商用引擎：底图与服装图统一缩放到 1024x1024 后送 ControlNet + IP-Adapter
 
 **输出成品**
-- 长边统一 2048px（`output_long_side`，可配置），宽高比跟随底座图（预置底座为 3:4 竖版，约 1536×2048）
+- 长边统一 2048px（`output_long_side`，可配置），宽高比跟随底座图（预置底座为 3:4 竖版，约 1536x2048）
 - 背景支持白底 JPEG 或透明 PNG
 
 > 建议：输入图尽量不小于 512px 短边，避免放大后细节模糊。
@@ -42,7 +55,7 @@
 
 **后端**
 - Python 3 + FastAPI + Uvicorn
-- PyJWT 认证（admin / staff 双账号）
+- PyJWT 认证（admin / staff 双账号，角色权限分离）
 - PIL / NumPy 图像处理（合成引擎）
 - 数据持久化：JSON 文件 + 文件锁（无数据库）
 
@@ -51,9 +64,14 @@
 - SDXL + ControlNet + IP-Adapter：商用合规 pipeline（有 GPU 时启用）
 - 合成引擎：无 GPU 环境下的兜底方案
 
+**训练**
+- SDXL LoRA 训练（`training/train_lora_sdxl.py`）：diffusers 官方 `save_lora_weights` 格式
+- SDXL ControlNet 训练（`training/train_controlnet_sdxl.py`）
+- 一键脚本：`MODEL=lora bash training/run_train.sh`
+
 **部署**
 - Git submodule 管理依赖
-- 环境变量控制引擎选择
+- 环境变量控制引擎选择与凭据注入
 - 许可证合规检查（研究 / 商用模式分流）
 
 ## 快速启动（无 GPU）
@@ -61,16 +79,25 @@
 ```bash
 # 后端
 pip3 install --break-system-packages -r backend/requirements.txt
-python3 -m uvicorn backend.main:app --host 0.0.0.0 --port 8000
+cd backend
+python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 
-# 前端
+# 前端（新终端）
 npm install
 npm run dev
 ```
 
-前端把 `/api` 和 `/files` 反代到 `8000`。
+前端 Vite 开发服务器把 `/api` 和 `/files` 反代到 `8000`。
 
-首次启动时，后端会为 `admin` 和 `staff` 账号生成随机密码并输出到进程日志。生产部署请通过环境变量 `STORE_ADMIN_PASSWORD`、`STORE_STAFF_PASSWORD`、`STORE_JWT_SECRET`（至少 32 字节）注入凭据，缺失时使用随机值。
+首次启动时，后端会为 `admin` 和 `staff` 账号生成随机密码并输出到进程日志。生产部署请通过环境变量注入凭据：
+
+```bash
+export STORE_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+export STORE_ADMIN_PASSWORD="your-secure-password"
+export STORE_STAFF_PASSWORD="your-secure-password"
+```
+
+缺失时使用随机值（每次重启失效），仅适合本地开发。
 
 ## GPU 部署（商用模式）
 
@@ -80,7 +107,7 @@ npm run dev
 # 1. 克隆仓库（含 submodule）
 git clone https://github.com/647133036/IDM-VTON-Builder.git
 cd IDM-VTON-Builder
-git submodule update --init --recursive
+git submodule update --init --recursive --depth 1
 
 # 2. 下载 SDXL 权重（约 12-15GB）
 bash scripts/download_sdxl_weights.sh
@@ -88,10 +115,13 @@ bash scripts/download_sdxl_weights.sh
 # 3. 安装后端依赖
 cd backend
 pip install -r requirements.txt
-pip install torch>=2.1.0 diffusers>=0.27.0 transformers>=4.40.0 accelerate>=0.30.0 controlnet-aux rembg
+pip install "torch>=2.1.0" "diffusers>=0.27.0" "transformers>=4.40.0" "accelerate>=0.30.0" controlnet-aux rembg
 
 # 4. 启动后端（商用模式）
-LICENSE_MODE=commercial python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
+export LICENSE_MODE=commercial
+export STORE_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
+export STORE_ADMIN_PASSWORD="your-secure-password"
+python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 
 # 5. 验证引擎状态
 curl http://localhost:8000/api/license
@@ -107,10 +137,35 @@ curl http://localhost:8000/api/license
 bash scripts/download_weights.sh
 
 # 启动后端（研究模式）
+cd backend
 LICENSE_MODE=research python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 研究模式下 IDM-VTON 仅限测试 / 学习，禁止商用。
+
+## SDXL 训练
+
+项目内置 SDXL LoRA 和 ControlNet 训练脚本，支持在魔搭（ModelScope）Notebook 或本地 GPU 上训练。
+
+```bash
+# LoRA 训练（推荐，约 11 分钟 / 800 步）
+cd training
+MODEL=lora bash run_train.sh
+
+# ControlNet 训练
+MODEL=controlnet bash run_train.sh
+
+# LoRA 族（服装 + 人像双 LoRA）
+MODEL=lora_family bash run_train.sh
+```
+
+训练要点：
+- CUDA 训练使用 `bfloat16`（Ampere+ GPU），CPU 回退 `float32`
+- LoRA 保存为 diffusers 官方格式（`pytorch_lora_weights.safetensors`）
+- ControlNet 条件图归一化到 `[0,1]`，与推理端一致
+- 数据准备：`python3 prepare_dataset.py` + `python3 prepare_controlnet_data.py`
+
+训练依赖见 `training/requirements.txt`（含 `torchvision`、`tensorboard`）。
 
 ## 多店铺与推送
 
@@ -126,12 +181,14 @@ LICENSE_MODE=research python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 | API 凭证 | Shopify Admin token · WordPress: `用户名:应用密码` |
 | 默认商品 ID | 可选，推送时优先取请求里的 `product_id` |
 
+API 凭证加密存储，列表接口仅返回掩码值，编辑凭证需 admin 权限。
+
 ### 推送
 
-完成的任务可勾选一个或多个店铺推送，推送记录（每店 ok / url / message）写入任务。
+完成的任务可勾选一个或多个店铺推送（需 admin 权限），推送记录（每店 ok / url / message）写入任务。
 
 - **Shopify**：Admin API `POST /products/{id}/images.json` 上传商品图
-- **WordPress**：REST `POST /wp-json/wp/v2/media` 上传媒体 → `POST /wc/v3/products/{id}` 关联商品
+- **WordPress**：REST `POST /wp-json/wp/v2/media` 上传媒体 -> `POST /wc/v3/products/{id}` 关联商品
 - **其他平台**：仅打标，不调用外部接口
 - 凭证缺失或外部返回错误时，推送失败会写回任务的 `push_results`，不会误标为已推送
 
@@ -166,76 +223,100 @@ LICENSE_MODE=research python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。前端组件测试用 vitest 覆盖 i18n 字典与人种翻译。
 
 ```bash
+# 后端测试（90 个，含安全回归测试）
 pip3 install --break-system-packages pytest httpx
 cd backend
 python3 -m pytest tests/ -q
 
-# 前端组件测试
+# 前端组件测试（11 个）
 cd /workspace
 npm test
 ```
 
 覆盖分层：
 
-- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支
+- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py` / `test_lora_io.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT 密钥随机化、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支、LoRA 加载格式转换
 - **组件测试**（`src/i18n.test.js`）：中英文切换、占位符插值、10 地域人种翻译、自定义人种回退原文
-- **集成测试**（`backend/tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、健康与许可接口
+- **集成测试**（`backend/tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、state.json 访问拦截、HTML 上传拦截、store 凭据脱敏、staff 权限隔离、健康与许可接口
 - **系统测试**（`backend/tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
 
 ## 目录结构
 
 ```text
 backend/          FastAPI 后端、引擎包装器、推送适配器
-  tests/          pytest 测试（单元 / 集成 / 系统）
+  tests/          pytest 测试（单元 / 集成 / 系统，90 个）
 src/              前端 SPA + i18n 字典
 public/           嵌入页、挂件、示例图
 docs/             文档
 scripts/          权重下载脚本
-IDM-VTON/         官方虚拟试穿仓库（git submodule）
+training/         SDXL LoRA / ControlNet 训练脚本
+  lora_io.py      LoRA 加载共享模块（diffusers / PEFT 双格式）
+IDM-VTON/         官方虚拟试衣仓库（git submodule）
 ```
 
 ## 环境变量
 
 ```bash
-STORE_JWT_SECRET=replace-me
-STORE_ADMIN_PASSWORD=replace-me
-STORE_STAFF_PASSWORD=replace-me
+# 必填（生产环境，缺失时随机生成仅适合开发）
+STORE_JWT_SECRET=<至少 32 字节的随机字符串>
+STORE_ADMIN_PASSWORD=<管理员密码>
+STORE_STAFF_PASSWORD=<员工密码>
+
+# 引擎选择
 LICENSE_MODE=commercial  # commercial（生产）或 research（测试）
-IDM_WEIGHTS_DIR=/path/to/IDM-VTON/ckpt  # 可选
+
+# 可选
+IDM_WEIGHTS_DIR=/path/to/IDM-VTON/ckpt
 ```
 
 ## 引擎选择
 
 | LICENSE_MODE | 引擎优先级 | 商用合规 |
 |---|---|---|
-| `commercial` | SDXL → 合成引擎 | 合规 |
-| `research` | IDM-VTON → 合成引擎 | 不合规 |
+| `commercial` | SDXL -> 合成引擎（SDXL 不可用时自动回退） | 合规 |
+| `research` | IDM-VTON -> 合成引擎 | 不合规 |
 | 未设置 | 合成引擎 | 需确认 |
 
 访问 `/api/license` 查看当前引擎、GPU 与合规状态；页面顶部横幅同步展示。
 
 ## API 概览
 
+所有 `/api/*` 接口（除 `/api/auth/login`、`/api/health`、`/api/license`）需 Bearer token 鉴权。标注 **[admin]** 的接口需管理员权限。
+
 ```text
 POST /api/auth/login
+GET  /api/me
+GET  /api/stats
+GET|PATCH /api/settings                      # PATCH [admin]
+
 GET  /api/bases
-POST /api/bases                        # 上传底座
+POST /api/bases                              # 上传底座
 PATCH /api/bases/{id}
-POST /api/bases/batch/patch            # 批量调整底座分类
-DELETE /api/bases/{id}
-GET|POST /api/ethnicities              # 人种管理
-PATCH|DELETE /api/ethnicities/{value}
-GET|POST /api/stores                   # 多店铺管理
-PATCH|DELETE /api/stores/{id}
+POST /api/bases/batch/patch                  # 批量调整底座分类
+DELETE /api/bases/{id}                       # [admin]
+
+GET|POST /api/ethnicities                    # 人种管理，POST [admin]
+PATCH|DELETE /api/ethnicities/{value}        # [admin]
+
+GET|POST /api/stores                         # POST [admin]
+PATCH|DELETE /api/stores/{id}                # [admin]
+
 POST /api/jobs/batch
 GET  /api/jobs
-POST /api/jobs/{id}/push               # body: {"store_ids":["x"],"product_id":"123"}
+GET  /api/jobs/{id}
+POST /api/jobs/{id}/push                     # [admin]
 GET  /api/download/{id}
-GET  /api/uploads                      # 图片库
-POST /api/uploads/{filename}/move      # 调整图片分类
-GET|POST /api/uploads/categories       # 服饰分类管理
-PATCH|DELETE /api/uploads/categories/{category}
-GET  /api/health | /api/license        # 引擎 / GPU / 合规状态
+
+GET  /api/uploads                            # 图片库
+POST /api/uploads                            # 上传图片（PIL 校验）
+DELETE /api/uploads/{filename}               # [admin]
+POST /api/uploads/{filename}/move            # [admin]
+GET|POST /api/uploads/categories             # POST [admin]
+PATCH|DELETE /api/uploads/categories/{cat}   # [admin]
+GET  /api/uploads/{category}/{filename}
+
+GET  /files/{path}                           # 需鉴权，仅图片，白名单目录
+GET  /api/health | /api/license              # 公开
 ```
 
 ## 感谢
@@ -273,5 +354,5 @@ GET  /api/health | /api/license        # 引擎 / GPU / 合规状态
 ```bash
 # 初始化 submodule
 git clone <本仓库>
-git submodule update --init --recursive
+git submodule update --init --recursive --depth 1
 ```
