@@ -254,6 +254,9 @@ cd /workspace
 npm install
 npm test
 
+# 前端构建（会捕获模块语法错误，必须通过）
+npm run build
+
 # 静态检查（ruff check + ruff format）
 python3 -m ruff check backend/ training/
 python3 -m ruff format --check backend/ training/

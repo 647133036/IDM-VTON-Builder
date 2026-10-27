@@ -42,6 +42,10 @@ Entries discovered by the Agent during task execution should follow this format:
       * `python3 -m ruff format --check backend/ training/` (from the repo root)
       * `python3 -m pytest tests/ -q` (run from the `backend/` directory)
       * `npm test` (from the repo root; needs `npm install` first)
+  - `npm run build` (from the repo root) MUST also pass before pushing: it is the only
+    check that catches JS module syntax errors. `npm test` only covers `src/i18n.js`,
+    not `src/main.js`, so a stray paren in `main.js` will not fail `npm test` but will
+    blank out the SPA (vite dev server logs it, but nothing surfaces that log).
   - `ruff` only sees the repo layout when both `backend/` and `training/` are passed as
     explicit path arguments from the repo root; `training/` does not exist under `backend/`.
   - Security fixes must ship with a regression test that fails before the fix is applied

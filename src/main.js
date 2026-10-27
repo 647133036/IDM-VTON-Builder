@@ -547,7 +547,7 @@ function uploadLibrary() {
       ${state.uploads.slice(0, 24).map((u) => `
         <div class="cloth-item upload-item ${state.selectedUploads.includes(u.name) ? 'selected' : ''}" data-upload="${escapeHtml(u.name)}">
           <img src="${escapeHtml(u.url)}" alt="${escapeHtml(u.name)}" loading="lazy" />
-          <span>${escapeHtml(u.name.replace(/^upload_[^_]+_/, '').replace(/^src_[^_]+_/, '').slice(0, 20)))}</span>
+          <span>${escapeHtml(u.name.replace(/^upload_[^_]+_/, '').replace(/^src_[^_]+_/, '').slice(0, 20))}</span>
           <button class="btn ghost small del-upload" data-del-upload="${escapeHtml(u.name)}" title="${t('upl.del')}">x</button>
         </div>
       `).join('')}
