@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 
 logger = logging.getLogger("atelier.engine")
+
+_GPU_LOCK = threading.Lock()
 
 TORSOS = {
     "women": dict(x=0.21, y=0.178, w=0.58, h=0.39, shoulder=0.96, hem=0.62, neck=0.22, sleeve=0.22),
@@ -82,7 +85,9 @@ def _idm_vton_available() -> tuple[bool, str]:
     missing = [d for d in required if not (ckpt / d).exists()]
     if missing:
         return False, f"Missing weights: {', '.join(missing)}"
-    if not (ckpt / "unet" / "diffusion_pytorch_model.safetensors").exists() and not (ckpt / "unet" / "diffusion_pytorch_model.bin").exists():
+    unet_weight = ckpt / "unet"
+    missing_unet = not (unet_weight / "diffusion_pytorch_model.safetensors").exists()
+    if missing_unet and not (unet_weight / "diffusion_pytorch_model.bin").exists():
         return False, "unet weight file missing"
     try:
         import torch
@@ -248,11 +253,17 @@ _engine_state: dict = {"pipe": None, "available": None, "reason": ""}
 
 def _get_compliance_advice(engine: str, license_mode: str, sdxl_avail: bool) -> str:
     if license_mode == "commercial" and engine == "sdxl-commercial":
-        return "Commercial mode: using SDXL commercial engine; compliant."
-    if license_mode == "commercial" and engine == "no-compliant-engine":
-        return "Commercial mode: no commercial engine available; download SDXL weights or switch LICENSE_MODE=research."
+        return (
+            "Commercial mode: using SDXL commercial engine; register on the "
+            "Stability AI model page and complete attribution."
+        )
+    if license_mode == "commercial" and engine == "composite-fallback":
+        return (
+            "Commercial mode: SDXL weights missing, using the in-repo composite engine "
+            "(original PIL code, no third-party weights); compliant but limited in fidelity."
+        )
     if license_mode == "research" and engine == "idm-vton":
-        return "Research mode: using IDM-VTON; non-commercial use only."
+        return "Research mode: using IDM-VTON; non-commercial use only (CC BY-NC-SA 4.0)."
     if license_mode == "research" and engine == "composite-fallback":
         return "Research mode: IDM-VTON unavailable, using composite engine (limited results)."
     if license_mode == "":
@@ -280,28 +291,36 @@ def _load_idm_vton_pipeline():
         os.environ["PYTHONPATH"] = sys_path + os.pathsep + os.environ.get("PYTHONPATH", "")
 
     import sys
+
     if sys_path not in sys.path:
         sys.path.insert(0, sys_path)
 
     import torch
     from diffusers import AutoencoderKL, DDPMScheduler
-    from transformers import AutoTokenizer, CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-
     from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
-    from src.unet_hacked_tryon import UNet2DConditionModel
     from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
+    from src.unet_hacked_tryon import UNet2DConditionModel
+    from transformers import (
+        AutoTokenizer,
+        CLIPTextModel,
+        CLIPTextModelWithProjection,
+    )
 
     ckpt_path = str(_IDM_DIR / "ckpt")
     device = torch.device("cuda:0")
 
     unet = UNet2DConditionModel.from_pretrained(ckpt_path, subfolder="unet", torch_dtype=torch.float16)
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(ckpt_path, subfolder="unet_encoder", torch_dtype=torch.float16)
+    unet_encoder = UNet2DConditionModel_ref.from_pretrained(
+        ckpt_path, subfolder="unet_encoder", torch_dtype=torch.float16
+    )
     vae = AutoencoderKL.from_pretrained(ckpt_path, subfolder="vae", torch_dtype=torch.float16)
     scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder="scheduler")
 
     text_encoder = CLIPTextModel.from_pretrained(ckpt_path, subfolder="text_encoder", torch_dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer")
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(ckpt_path, subfolder="text_encoder_2", torch_dtype=torch.float16)
+    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+        ckpt_path, subfolder="text_encoder_2", torch_dtype=torch.float16
+    )
     tokenizer_2 = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer_2")
 
     pipe = TryonPipeline(
@@ -362,21 +381,20 @@ def _idm_vton_engine(
 
     generator = torch.Generator(device=device).manual_seed(42)
 
-    with torch.no_grad():
-        with torch.amp.autocast(device_type="cuda"):
-            output = pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                image=human_img,
-                mask_image=mask_img,
-                cloth=cloth_img,
-                width=target_w,
-                height=target_h,
-                num_inference_steps=30,
-                guidance_scale=2.0,
-                generator=generator,
-                output_type="pil",
-            )
+    with _GPU_LOCK, torch.no_grad(), torch.amp.autocast(device_type="cuda"):
+        output = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image=human_img,
+            mask_image=mask_img,
+            cloth=cloth_img,
+            width=target_w,
+            height=target_h,
+            num_inference_steps=30,
+            guidance_scale=2.0,
+            generator=generator,
+            output_type="pil",
+        )
 
     result = output.images[0] if hasattr(output, "images") else output
 
@@ -406,19 +424,25 @@ def compose_tryon(
         avail, _ = _idm_vton_available()
         if avail:
             try:
-                return _idm_vton_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
+                return _idm_vton_engine(
+                    base_path, garment_path, audience, garment_type, long_side, background, ethnicity
+                )
             except Exception:
-                pass
+                logger.exception("IDM-VTON engine failed; falling back to composite engine")
 
     if _LICENSE_MODE == "commercial":
+        sdxl_reason = ""
         try:
-            from engine_sdxl import sdxl_available, compose_tryon_sdxl
+            from engine_sdxl import compose_tryon_sdxl, sdxl_available
+
             sdxl_avail, sdxl_reason = sdxl_available()
             if sdxl_avail:
-                return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
+                return compose_tryon_sdxl(
+                    base_path, garment_path, audience, garment_type, long_side, background, ethnicity
+                )
         except ImportError:
             sdxl_reason = "diffusers not installed"
-        logger.warning("commercial SDXL engine unavailable (%s); falling back to composite engine", sdxl_reason)
+        logger.warning("commercial SDXL weights unavailable (%s); using in-repo composite engine", sdxl_reason)
 
     return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
 
@@ -431,15 +455,17 @@ def engine_status() -> dict:
     sdxl_reason = ""
     try:
         from engine_sdxl import sdxl_available
+
         sdxl_avail, sdxl_reason = sdxl_available()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         sdxl_reason = str(e)
 
     gpu_available = False
     try:
         import torch
+
         gpu_available = bool(torch.cuda.is_available())
-    except Exception:
+    except Exception:  # noqa: BLE001
         gpu_available = False
 
     engine = "composite-fallback"
@@ -452,8 +478,8 @@ def engine_status() -> dict:
         engine = "sdxl-commercial"
         commercial_compliant = True
     elif _LICENSE_MODE == "commercial" and not sdxl_avail:
-        engine = "no-compliant-engine"
-        commercial_compliant = False
+        engine = "composite-fallback"
+        commercial_compliant = True
 
     return {
         "idm_vton_available": avail,

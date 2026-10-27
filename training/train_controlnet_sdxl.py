@@ -48,16 +48,11 @@ class _ControlNetCaptionDataset:
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        import numpy as np
         from torchvision import transforms
 
         img_path, cond_path, caption = self.pairs[idx]
-        img = Image.open(img_path).convert("RGB").resize(
-            (self.resolution, self.resolution), Image.LANCZOS
-        )
-        cond = Image.open(cond_path).convert("RGB").resize(
-            (self.resolution, self.resolution), Image.LANCZOS
-        )
+        img = Image.open(img_path).convert("RGB").resize((self.resolution, self.resolution), Image.LANCZOS)
+        cond = Image.open(cond_path).convert("RGB").resize((self.resolution, self.resolution), Image.LANCZOS)
         t = transforms.ToTensor()
         return t(img) * 2.0 - 1.0, t(cond) * 2.0 - 1.0, caption
 
@@ -87,7 +82,6 @@ def _encode_prompts(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompt
 
 
 def _build_models(base_model: str, dtype):
-    import torch
 
     from diffusers import AutoencoderKL, ControlNetModel, DDPMScheduler, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
@@ -153,8 +147,6 @@ def train(args) -> int:
     loader = DataLoader(dataset, batch_size=args.train_batch_size, shuffle=True, num_workers=0)
     print(f"controlnet steps: {args.max_train_steps} on {len(dataset)} pairs", flush=True)
 
-    from torch.utils.tensorboard import SummaryWriter  # noqa: F401
-
     writer = Path(args.output_dir)
     writer.mkdir(parents=True, exist_ok=True)
 
@@ -175,9 +167,7 @@ def train(args) -> int:
 
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
-            timesteps = torch.randint(
-                0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device
-            ).long()
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=device).long()
             noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
             down_block_res_samples, mid_block_res_sample = controlnet(
@@ -194,9 +184,7 @@ def train(args) -> int:
                 timesteps,
                 encoder_hidden_states=prompt_embeds,
                 added_cond_kwargs=added_cond,
-                down_block_additional_residuals=[
-                    sample.to(dtype=dtype) for sample in down_block_res_samples
-                ],
+                down_block_additional_residuals=[sample.to(dtype=dtype) for sample in down_block_res_samples],
                 mid_block_additional_residual=mid_block_res_sample.to(dtype=dtype),
                 return_dict=False,
             )[0]
@@ -241,7 +229,7 @@ def main() -> int:
 
     try:
         return train(args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"train failed: {exc}")
         return 1
 

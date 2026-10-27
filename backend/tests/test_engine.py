@@ -1,8 +1,4 @@
-from pathlib import Path
-
 import pytest
-from PIL import Image
-
 from engine import (
     ETHNICITY_FIT,
     TORSOS,
@@ -108,7 +104,8 @@ def test_compose_tryon_transparent_background(base_image, garment_image):
 
 
 def test_compose_tryon_east_vs_north_pixels_differ(tmp_path):
-    from PIL import Image as PILImage, ImageDraw
+    from PIL import Image as PILImage
+    from PIL import ImageDraw
 
     base = tmp_path / "base_green.png"
     garment = tmp_path / "garment_panel.png"
@@ -141,7 +138,7 @@ def test_compose_tryon_east_vs_north_pixels_differ(tmp_path):
     ea, na = east.convert("RGB"), north.convert("RGB")
     diff = sum(
         1
-        for ex, nx in zip(ea.getdata(), na.getdata())
+        for ex, nx in zip(ea.getdata(), na.getdata(), strict=True)
         if abs(ex[0] - nx[0]) + abs(ex[1] - nx[1]) + abs(ex[2] - nx[2]) > 3
     )
     total = ea.width * ea.height
@@ -163,5 +160,4 @@ def test_engine_status_shape():
         "composite-fallback",
         "idm-vton",
         "sdxl-commercial",
-        "no-compliant-engine",
     )

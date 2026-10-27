@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import fcntl
 import json
@@ -6,7 +7,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / "data"
@@ -86,10 +87,8 @@ def save_state(state: dict) -> None:
         os.fsync(f.fileno())
     os.chmod(tmp, 0o600)
     tmp.replace(STATE_FILE)
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(STATE_FILE, 0o600)
-    except OSError:
-        pass
 
 
 def with_state(fn):
@@ -120,7 +119,7 @@ def public_url(path: Path) -> str:
     return f"/files/{rel}"
 
 
-def find_in_dir(directory: Path, name: str) -> Optional[Path]:
+def find_in_dir(directory: Path, name: str) -> Path | None:
     for p in directory.rglob(Path(name).name):
         if p.is_file():
             return p
@@ -320,7 +319,7 @@ def list_jobs() -> list[dict]:
     return load_state()["jobs"]
 
 
-def claim_next_job() -> Optional[dict]:
+def claim_next_job() -> dict | None:
     def _claim(state: dict):
         for item in state["jobs"]:
             if item["status"] == "queued":
@@ -399,7 +398,7 @@ def list_stores() -> list[dict]:
     return load_state()["stores"]
 
 
-def get_store(store_id: str) -> Optional[dict]:
+def get_store(store_id: str) -> dict | None:
     return next((s for s in load_state()["stores"] if s["id"] == store_id), None)
 
 

@@ -5,14 +5,10 @@ as `done` with downloadable artifacts."""
 import time
 from pathlib import Path
 
-import pytest
 from PIL import Image
-
 from store import (
     BASES,
-    RESULTS,
     UPLOADS,
-    claim_next_job,
     list_jobs,
     seed_bases_if_empty,
 )
@@ -38,6 +34,9 @@ def test_full_worker_loop_drives_job_to_done(client, auth_headers):
     _copy_seed_base()
     _mk(UPLOADS, "sys_ladydress.jpg", (210, 40, 90))
 
+    with (UPLOADS / "sys_ladydress.jpg").open("rb") as f:
+        garment_bytes = f.read()
+
     r = client.post(
         "/api/jobs/batch",
         data={
@@ -47,7 +46,7 @@ def test_full_worker_loop_drives_job_to_done(client, auth_headers):
             "output_format": "jpg",
             "background": "white",
         },
-        files=[("files", ("sys_ladydress.jpg", open(UPLOADS / "sys_ladydress.jpg", "rb").read(), "image/jpeg"))],
+        files=[("files", ("sys_ladydress.jpg", garment_bytes, "image/jpeg"))],
         headers=auth_headers,
     )
     assert r.status_code == 200 and r.json()["count"] == 1
@@ -81,13 +80,15 @@ def test_worker_marks_missing_source_as_failed():
     _mk(UPLOADS, "sys_badsrc.jpg", (5, 5, 5))
     from store import create_job
 
-    job = create_job({
-        "base_id": "base_women_01",
-        "audience": "women",
-        "garment_type": "upper",
-        "source_name": "ghost_not_uploaded.jpg",
-        "source_url": None,
-    })
+    job = create_job(
+        {
+            "base_id": "base_women_01",
+            "audience": "women",
+            "garment_type": "upper",
+            "source_name": "ghost_not_uploaded.jpg",
+            "source_url": None,
+        }
+    )
 
     pool = WorkerPool(workers=1)
     pool.start()

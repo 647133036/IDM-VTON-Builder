@@ -9,17 +9,49 @@ Credentials:
 """
 
 import base64
-import requests
+import ipaddress
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
+import requests
 from store import RESULTS
 
-SHOPIFY_API_VERSION = "2024-01"
+SHOPIFY_API_VERSION = "2024-10"
 
 
 class PushError(RuntimeError):
     pass
+
+
+def _check_host_safe(host: str) -> None:
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise PushError(f"Cannot resolve store hostname: {exc}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            raise PushError("Store URL resolves to a private/reserved IP address")
+
+
+def _validate_shop_url(raw: str, require_suffix: str | None = None) -> str:
+    shop = raw.strip()
+    if not shop:
+        raise PushError("Store URL is empty")
+    if not shop.startswith("http"):
+        shop = f"https://{shop}"
+    parsed = urlparse(shop)
+    if parsed.scheme != "https":
+        raise PushError("Store URL must use HTTPS")
+    host = parsed.hostname or ""
+    if not host:
+        raise PushError("Store URL has no hostname")
+    if require_suffix and not host.endswith(require_suffix):
+        raise PushError(f"Store URL must end with {require_suffix}")
+    _check_host_safe(host)
+    return f"https://{host}{parsed.path}".rstrip("/")
 
 
 def _result_path(job: dict) -> Path:
@@ -36,9 +68,7 @@ def _shopify_shop(store: dict) -> str:
     shop = (store.get("shop_url") or "").strip()
     if not shop:
         raise PushError("Store missing Shopify domain (shop_url)")
-    if not shop.startswith("http"):
-        shop = f"https://{shop}"
-    return shop.rstrip("/")
+    return _validate_shop_url(shop, require_suffix=".myshopify.com")
 
 
 def _shopify_token(store: dict) -> str:
@@ -52,9 +82,7 @@ def _wp_site(store: dict) -> str:
     site = (store.get("shop_url") or "").strip()
     if not site:
         raise PushError("Store missing WordPress site URL (shop_url)")
-    if not site.startswith("http"):
-        site = f"https://{site}"
-    return site.rstrip("/")
+    return _validate_shop_url(site)
 
 
 def _wp_auth(store: dict) -> tuple[str, str]:
@@ -68,7 +96,7 @@ def _wp_auth(store: dict) -> tuple[str, str]:
 
 
 def _resolve_shopify_product_id(job: dict, store: dict, body: dict, fix: str, token: str) -> str:
-    pid = str((body.get("product_id") or store.get("product_id") or "")).strip()
+    pid = str(body.get("product_id") or store.get("product_id") or "").strip()
     if pid:
         if not pid.isdigit():
             raise PushError(f"product_id must be numeric (Shopify product ID), got: {pid}")
@@ -81,6 +109,7 @@ def _resolve_shopify_product_id(job: dict, store: dict, body: dict, fix: str, to
         params={"title": sku},
         headers={"X-Shopify-Access-Token": token},
         timeout=30,
+        allow_redirects=False,
     )
     if r.status_code >= 400:
         raise PushError(f"Shopify product lookup failed ({r.status_code}): {r.text[:200]}")
@@ -91,7 +120,7 @@ def _resolve_shopify_product_id(job: dict, store: dict, body: dict, fix: str, to
 
 
 def _resolve_wp_product_id(job: dict, store: dict, body: dict) -> str:
-    pid = str((body.get("product_id") or store.get("product_id") or "")).strip()
+    pid = str(body.get("product_id") or store.get("product_id") or "").strip()
     if pid:
         if not pid.isdigit():
             raise PushError(f"product_id must be numeric (WooCommerce product ID), got: {pid}")
@@ -121,10 +150,11 @@ def push_shopify(job: dict, store: dict, body: dict) -> dict[str, Any]:
         json=payload,
         headers={"X-Shopify-Access-Token": token},
         timeout=120,
+        allow_redirects=False,
     )
     try:
         data = r.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         data = {}
     if r.status_code >= 400:
         msg = data.get("errors") or data or r.text
@@ -148,10 +178,11 @@ def push_wordpress(job: dict, store: dict, body: dict) -> dict[str, Any]:
             files={"file": (path.name, fh, mime)},
             auth=(user, password),
             timeout=180,
+            allow_redirects=False,
         )
     try:
         data = r.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         data = {}
     if r.status_code >= 400:
         msg = data.get("message") if isinstance(data, dict) else data
@@ -166,16 +197,21 @@ def push_wordpress(job: dict, store: dict, body: dict) -> dict[str, Any]:
             json={"images": [{"id": media_id}]},
             auth=(user, password),
             timeout=120,
+            allow_redirects=False,
         )
         try:
             up_data = up.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             up_data = {}
         if up.status_code >= 400:
             msg = up_data.get("message") if isinstance(up_data, dict) else up_data
             raise PushError(f"WooCommerce product link failed ({up.status_code}): {msg or up.text[:200]}")
         return {"ok": True, "url": url, "message": f"Uploaded media and linked WooCommerce product #{product_ref}"}
-    return {"ok": True, "url": url, "message": f"Uploaded media (SKU {product_ref.split(':')[1] or ''}, no product linked)"}
+    return {
+        "ok": True,
+        "url": url,
+        "message": f"Uploaded media (SKU {product_ref.split(':')[1] or ''}, no product linked)",
+    }
 
 
 PUSHERS = {
@@ -195,5 +231,5 @@ def push_store(job: dict, store: dict, body: dict) -> dict[str, Any]:
         return {"ok": False, "url": "", "message": str(exc)}
     except requests.RequestException as exc:
         return {"ok": False, "url": "", "message": f"Network request failed: {exc}"}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "url": "", "message": f"Push failed: {exc}"}

@@ -175,22 +175,22 @@ function previewModal() {
         <div class="modal-head">
           <div>
             <h3>${t('pv.title')}</h3>
-            <small>${escapeHtml(job.title || job.source_name)} · ${fmtAudience(job.audience) || job.audience} · ${escapeHtml(job.garment_type)}</small>
+            <small>${escapeHtml(job.title || job.source_name)} · ${escapeHtml(fmtAudience(job.audience) || job.audience)} · ${escapeHtml(job.garment_type)}</small>
           </div>
           <button class="btn ghost small" id="close-preview">${t('pv.close')}</button>
         </div>
         <div class="modal-body">
           <div class="preview-col">
             <span class="preview-label">${t('pv.source')}</span>
-            <img class="preview-img" src="${job.source_url}" alt="${t('pv.source')}" />
+            <img class="preview-img" src="${escapeHtml(job.source_url)}" alt="${t('pv.source')}" />
           </div>
           <div class="preview-col main">
             <span class="preview-label">${t('pv.result')} · ${base ? escapeHtml(base.name) : t('pv.base')}</span>
-            <img class="preview-img big" src="${job.result_url}" alt="${t('pv.result')}" />
+            <img class="preview-img big" src="${escapeHtml(job.result_url)}" alt="${t('pv.result')}" />
           </div>
         </div>
         <div class="modal-foot">
-          <a class="btn gold" href="/api/download/${job.id}" download>${t('pv.download')} ${job.result_url.split('.').pop().toUpperCase()}</a>
+          <a class="btn gold" data-dl="${escapeHtml(job.id)}" href="/api/download/${escapeHtml(job.id)}" download>${t('pv.download')} ${escapeHtml(job.result_url.split('.').pop().toUpperCase())}</a>
           <button class="btn ghost" id="close-preview-2">${t('pv.close')}</button>
         </div>
       </div>
@@ -351,9 +351,9 @@ function basesView() {
         </div>
         <div class="bases">${state.bases.map((b) => `
           <div class="base ${state.selectedBase === b.id ? 'sel' : ''} ${state.selectedBases.includes(b.id) ? 'batch-sel' : ''}" data-id="${b.id}">
-            <img src="${b.url}" alt="${escapeHtml(b.name)}" />
+            <img src="${escapeHtml(b.url)}" alt="${escapeHtml(b.name)}" />
             <em>${escapeHtml(b.name)}</em>
-            <small>${fmtAudience(b.audience) || b.audience || '—'} · ${fmtAge(b.age_band) || b.age_band || '—'} · ${escapeHtml((() => { const hit = state.ethnicities.find(x => x.value === b.ethnicity); return hit ? fmtEthnicity(hit.value, hit.label) : (b.ethnicity || '—') })())}</small>
+            <small>${escapeHtml(fmtAudience(b.audience) || b.audience || '—')} · ${escapeHtml(fmtAge(b.age_band) || b.age_band || '—')} · ${escapeHtml((() => { const hit = state.ethnicities.find(x => x.value === b.ethnicity); return hit ? fmtEthnicity(hit.value, hit.label) : (b.ethnicity || '—') })())}</small>
             <div class="row" style="flex:none">
               <label title="${t('base.batchTitle')}"><input type="checkbox" data-bsel="${b.id}" ${state.selectedBases.includes(b.id) ? 'checked' : ''} /> ${t('base.batch')}</label>
               <button class="btn ghost small" data-del="${b.id}" title="${t('base.retireTitle')}">${t('base.retire')}</button>
@@ -489,8 +489,8 @@ function baseCards() {
   const list = state.ethnicity ? state.bases.filter((b) => b.ethnicity === state.ethnicity) : state.bases
   return list.map((b) => `
     <div class="base ${state.selectedBase === b.id ? 'sel' : ''}" data-id="${b.id}">
-      <img src="${b.url}" alt="${escapeHtml(b.name)}" />
-      <em>${ethnicityLabel(b.ethnicity) ? ethnicityLabel(b.ethnicity) + ' · ' : ''}${fmtAudience(b.audience) || escapeHtml(b.name)}</em>
+      <img src="${escapeHtml(b.url)}" alt="${escapeHtml(b.name)}" />
+      <em>${ethnicityLabel(b.ethnicity) ? escapeHtml(ethnicityLabel(b.ethnicity)) + ' · ' : ''}${escapeHtml(fmtAudience(b.audience) || b.name)}</em>
     </div>
   `).join('')
 }
@@ -515,12 +515,12 @@ function uploadLibrary() {
       <select id="cat-filter" class="cat-filter">
         <option value="">${t('upl.all')}</option>
         <option value="default">${t('upl.unsorted')}</option>
-        ${cats.map(c => `<option value="${c}">${c}</option>`).join('')}
+        ${cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
       </select>
       <button class="btn ghost small" id="cat-move">${t('upl.move')}</button>
       <select id="cat-move-select" style="display:none">
         <option value="">${t('upl.choose')}</option>
-        ${cats.map(c => `<option value="${c}">${c}</option>`).join('')}
+        ${cats.map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`).join('')}
         <option value="__new__">${t('upl.new')}</option>
       </select>
       <input type="text" id="cat-name" placeholder="${t('upl.newName')}" style="width:120px;display:none" />
@@ -545,10 +545,10 @@ function uploadLibrary() {
     <div class="upload-list">
       ${!state.uploads.length ? `<p class="hint">${t('upl.noUpload')}</p>` : ''}
       ${state.uploads.slice(0, 24).map((u) => `
-        <div class="cloth-item upload-item ${state.selectedUploads.includes(u.name) ? 'selected' : ''}" data-upload="${u.name}">
-          <img src="${u.url}" alt="${u.name}" loading="lazy" />
-          <span>${u.name.replace(/^upload_[^_]+_/, '').replace(/^src_[^_]+_/, '').slice(0, 20)}</span>
-          <button class="btn ghost small del-upload" data-del-upload="${u.name}" title="${t('upl.del')}">x</button>
+        <div class="cloth-item upload-item ${state.selectedUploads.includes(u.name) ? 'selected' : ''}" data-upload="${escapeHtml(u.name)}">
+          <img src="${escapeHtml(u.url)}" alt="${escapeHtml(u.name)}" loading="lazy" />
+          <span>${escapeHtml(u.name.replace(/^upload_[^_]+_/, '').replace(/^src_[^_]+_/, '').slice(0, 20)))}</span>
+          <button class="btn ghost small del-upload" data-del-upload="${escapeHtml(u.name)}" title="${t('upl.del')}">x</button>
         </div>
       `).join('')}
     </div>
@@ -559,10 +559,10 @@ function jobCards(jobs) {
   if (!jobs.length) return `<p class="hint">${t('queue.empty')}</p>`
   return jobs.map((j) => `
     <article class="job" data-id="${j.id}">
-      <img class="${j.status === 'done' ? 'zoomable' : ''}" src="${j.preview_url || j.source_url}" alt="" data-preview="${j.status === 'done' ? j.id : ''}" />
+      <img class="${j.status === 'done' ? 'zoomable' : ''}" src="${escapeHtml(j.preview_url || j.source_url)}" alt="" data-preview="${escapeHtml(j.status === 'done' ? j.id : '')}" />
       <div class="meta">
         <b>${escapeHtml(j.title || j.source_name)}</b>
-        <small>${fmtAudience(j.audience) || j.audience} · ${escapeHtml(j.message)}</small>
+        <small>${escapeHtml(fmtAudience(j.audience) || j.audience)} · ${escapeHtml(j.message)}</small>
         <div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       </div>
       <div>
@@ -578,7 +578,7 @@ function jobCards(jobs) {
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]))
 }
 
 function bindLogin() {
@@ -1114,7 +1114,7 @@ function renderFileThumbs() {
   const box = document.querySelector('#file-thumbs')
   const run = document.querySelector('#run')
   if (!box) return
-  box.innerHTML = state.files.slice(0, 24).map((f) => `<img src="${URL.createObjectURL(f)}" alt="${f.name}">`).join('')
+  box.innerHTML = state.files.slice(0, 24).map((f) => `<img src="${URL.createObjectURL(f)}" alt="${escapeHtml(f.name)}">`).join('')
   if (run) run.textContent = t('btn.generate', { n: state.files.length })
 }
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import gc
 import os
 import sys
 from pathlib import Path
@@ -24,9 +23,6 @@ def _resolve_base_model(base_model: str) -> str:
 def _make_train_state(dataset_dir: Path):
     import torch
 
-    from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-    from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
-
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
         dtype = torch.bfloat16
@@ -41,7 +37,6 @@ def _make_train_state(dataset_dir: Path):
 
 
 def _load_components(base_model: str, dtype):
-    import torch
 
     from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
     from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
@@ -79,11 +74,6 @@ def _load_prompts(dataset_dir: Path):
 
 class _CaptionDataset:
     def __init__(self, dataset_dir: Path, resolution: int):
-        import torch
-        from PIL import Image
-        from torch.utils.data import Dataset
-
-        img_exts = {".jpg", ".jpeg", ".png"}
         self.items = []
         for img in sorted(dataset_dir.rglob("*.png")):
             txt = img.with_suffix(".txt")
@@ -95,7 +85,6 @@ class _CaptionDataset:
         return len(self.items)
 
     def __getitem__(self, idx):
-        import torch
         from PIL import Image
         from torchvision import transforms
 
@@ -132,10 +121,10 @@ def _encode_text(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompts, 
 
 def train(args) -> int:
     import torch
-    from peft import LoraConfig
-    from peft.utils import get_peft_model_state_dict
     from diffusers import StableDiffusionXLPipeline
     from diffusers.utils import convert_state_dict_to_diffusers
+    from peft import LoraConfig
+    from peft.utils import get_peft_model_state_dict
 
     device, dtype = _make_train_state(args.dataset_dir)
     comps = _load_components(args.base_model, dtype)
@@ -244,7 +233,7 @@ def main() -> int:
 
     try:
         return train(args)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         print(f"train failed: {exc}")
         return 1
 

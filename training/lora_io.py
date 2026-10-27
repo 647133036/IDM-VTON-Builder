@@ -24,7 +24,7 @@ def peft_state_to_diffusers_lora(state: dict) -> dict:
         from diffusers.utils import convert_state_dict_to_diffusers
 
         converted = convert_state_dict_to_diffusers(stripped)
-    except Exception:
+    except Exception:  # noqa: BLE001
         converted = _rewrite_peft_lora_keys(stripped)
     return {k if k.startswith("unet.") else f"unet.{k}": v for k, v in converted.items()}
 

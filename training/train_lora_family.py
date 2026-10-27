@@ -36,6 +36,7 @@ def main() -> int:
         out_dir = args.output_root / kind
         print(f"=== training LoRA: {kind} -> {out_dir} ===", flush=True)
         import argparse as _argparse
+
         train_args = _argparse.Namespace(
             dataset_dir=group_dir,
             base_model=args.base_model,

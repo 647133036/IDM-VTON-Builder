@@ -2,7 +2,7 @@ import logging
 import os
 import secrets
 import time
-from typing import Optional
+from pathlib import Path
 
 import jwt
 from fastapi import Depends, HTTPException
@@ -10,35 +10,53 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 logger = logging.getLogger("atelier.auth")
 
-_env_secret = os.getenv("STORE_JWT_SECRET")
-if _env_secret and len(_env_secret) >= 32:
-    JWT_SECRET = _env_secret
-else:
-    JWT_SECRET = secrets.token_urlsafe(48)
-    if not _env_secret:
+_SECRET_FILE = Path(__file__).resolve().parent / "data" / ".jwt_secret"
+
+
+def _load_or_create_jwt_secret() -> str:
+    env_val = os.getenv("STORE_JWT_SECRET")
+    if env_val and len(env_val) >= 32:
+        return env_val
+    _SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if _SECRET_FILE.exists():
+        try:
+            val = _SECRET_FILE.read_text(encoding="utf-8").strip()
+            if len(val) >= 32:
+                return val
+        except OSError:
+            pass
+    val = secrets.token_urlsafe(48)
+    try:
+        _SECRET_FILE.write_text(val, encoding="utf-8")
+        os.chmod(_SECRET_FILE, 0o600)
+    except OSError as exc:
+        logger.warning("Failed to persist JWT secret to %s: %s", _SECRET_FILE, exc)
+    if not env_val:
         logger.warning(
-            "STORE_JWT_SECRET not set; generated a random secret for this process. "
-            "All tokens will be invalidated on restart. Set STORE_JWT_SECRET for production."
+            "STORE_JWT_SECRET not set; generated and persisted a random secret to %s. "
+            "Set STORE_JWT_SECRET (>=32 bytes) for production.",
+            _SECRET_FILE,
         )
     else:
-        logger.warning(
-            "STORE_JWT_SECRET is shorter than 32 bytes; generated a random secret for this process."
-        )
+        logger.warning("STORE_JWT_SECRET is shorter than 32 bytes; generated and persisted a random secret instead.")
+    return val
 
+
+JWT_SECRET = _load_or_create_jwt_secret()
 JWT_ALG = "HS256"
 TOKEN_TTL = 60 * 60 * 24 * 7
 
 
-def _resolve_password(env_var: str, fallback_label: str) -> str:
+def _resolve_password(env_var: str, username: str) -> str:
     val = os.getenv(env_var)
     if val:
         return val
     generated = secrets.token_urlsafe(12)
-    logger.warning(
-        "%s not set; generated a random password for '%s'. "
-        "Set %s for production or check process logs for the generated credential.",
-        env_var, fallback_label, env_var,
+    print(
+        f"[atelier] {env_var} not set; generated random password for '{username}': {generated}",
+        flush=True,
     )
+    logger.warning("%s not set; generated random password for '%s' (printed to stdout)", env_var, username)
     return generated
 
 
@@ -81,7 +99,7 @@ def decode_token(token: str) -> dict:
     return payload
 
 
-def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)) -> dict:
+def current_user(creds: HTTPAuthorizationCredentials | None = Depends(bearer)) -> dict:
     if creds is None:
         raise HTTPException(status_code=401, detail="Login required")
     return decode_token(creds.credentials)

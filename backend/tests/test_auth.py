@@ -2,9 +2,8 @@ import time
 
 import jwt
 import pytest
-from fastapi import HTTPException
-
 from auth import JWT_ALG, JWT_SECRET, decode_token, issue_token
+from fastapi import HTTPException
 
 
 def test_issue_and_decode_roundtrip():

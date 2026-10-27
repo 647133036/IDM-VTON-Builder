@@ -69,9 +69,7 @@ def main() -> int:
             writer = csv.writer(fh)
             writer.writerow(["image", "conditioning", "caption"])
             for i in range(len(items)):
-                writer.writerow(
-                    [f"images/{i:04d}.png", f"conditioning/{i:04d}.png", args.caption]
-                )
+                writer.writerow([f"images/{i:04d}.png", f"conditioning/{i:04d}.png", args.caption])
 
     print(f"{args.condition} dataset ready: {len(items)} pairs -> {args.out}")
     return 0

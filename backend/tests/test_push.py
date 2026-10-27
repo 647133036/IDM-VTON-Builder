@@ -1,7 +1,4 @@
-from pathlib import Path
-
 import pytest
-
 from push import (
     PushError,
     _result_path,
@@ -11,6 +8,16 @@ from push import (
     _wp_site,
     push_store,
 )
+
+
+@pytest.fixture(autouse=True)
+def _mock_dns(monkeypatch):
+    import push
+
+    def _safe_getaddrinfo(host, *args, **kwargs):
+        return [(0, 0, 0, 0, ("8.8.8.8", 0))]
+
+    monkeypatch.setattr(push.socket, "getaddrinfo", _safe_getaddrinfo)
 
 
 def _job_file(tmp_path):
@@ -24,7 +31,6 @@ def _job_file(tmp_path):
 
 @pytest.fixture()
 def done_job(tmp_path, monkeypatch):
-    from push import RESULTS
 
     png = tmp_path / "job_done.png"
     from PIL import Image
@@ -94,7 +100,7 @@ def test_wp_auth_requires_colon():
 def test_push_shopify_success(done_job, monkeypatch):
     calls = {}
 
-    def fake_post(url, json=None, headers=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None, allow_redirects=None):
         calls["url"] = url
         calls["json"] = json
         calls["headers"] = headers
@@ -122,7 +128,7 @@ def test_push_shopify_success(done_job, monkeypatch):
 
 
 def test_push_shopify_lookup_by_sku_when_no_product_id(done_job, monkeypatch):
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, allow_redirects=None):
         class R:
             status_code = 200
 
@@ -131,7 +137,7 @@ def test_push_shopify_lookup_by_sku_when_no_product_id(done_job, monkeypatch):
 
         return R()
 
-    def fake_post(url, json=None, headers=None, timeout=None):
+    def fake_post(url, json=None, headers=None, timeout=None, allow_redirects=None):
         class R:
             status_code = 200
 
@@ -155,7 +161,7 @@ def test_push_shopify_lookup_by_sku_when_no_product_id(done_job, monkeypatch):
 
 
 def test_push_shopify_not_found_by_sku_returns_failure(done_job, monkeypatch):
-    def fake_get(url, params=None, headers=None, timeout=None):
+    def fake_get(url, params=None, headers=None, timeout=None, allow_redirects=None):
         class R:
             status_code = 200
 
@@ -180,7 +186,7 @@ def test_push_shopify_not_found_by_sku_returns_failure(done_job, monkeypatch):
 def test_push_wordpress_success(done_job, monkeypatch):
     calls = {}
 
-    def fake_post(url, headers=None, files=None, json=None, auth=None, timeout=None):
+    def fake_post(url, headers=None, files=None, json=None, auth=None, timeout=None, allow_redirects=None):
         calls.setdefault("urls", []).append(url)
         calls["auth"] = auth
 
@@ -207,7 +213,7 @@ def test_push_wordpress_success(done_job, monkeypatch):
 
 
 def test_push_wordpress_media_failure(done_job, monkeypatch):
-    def fake_post(url, headers=None, files=None, auth=None, timeout=None, json=None):
+    def fake_post(url, headers=None, files=None, auth=None, timeout=None, json=None, allow_redirects=None):
         class R:
             status_code = 401
             text = "unauthorized"
@@ -231,7 +237,7 @@ def test_push_wordpress_media_failure(done_job, monkeypatch):
 
 
 def test_push_wordpress_without_product_id_uploads_only(done_job, monkeypatch):
-    def fake_post(url, headers=None, files=None, auth=None, timeout=None, json=None):
+    def fake_post(url, headers=None, files=None, auth=None, timeout=None, json=None, allow_redirects=None):
         class R:
             status_code = 200
 
@@ -270,3 +276,24 @@ def test_push_network_error_caught(done_job, monkeypatch):
     res = push_store(done_job, store, {})
     assert res["ok"] is False
     assert "Network request failed" in res["message"]
+
+
+def test_ssrf_http_scheme_rejected():
+    with pytest.raises(PushError, match="HTTPS"):
+        _wp_site({"shop_url": "http://example.com"})
+
+
+def test_ssrf_shopify_suffix_enforced():
+    with pytest.raises(PushError, match=r"myshopify\.com"):
+        _shopify_shop({"shop_url": "evil.com"})
+
+
+def test_ssrf_internal_ip_rejected(monkeypatch):
+    import push
+
+    def _fake_getaddrinfo(host, *args, **kwargs):
+        return [(0, 0, 0, 0, ("127.0.0.1", 0))]
+
+    monkeypatch.setattr(push.socket, "getaddrinfo", _fake_getaddrinfo)
+    with pytest.raises(PushError, match="private/reserved"):
+        push._check_host_safe("evil.com")

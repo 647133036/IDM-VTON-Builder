@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -44,8 +43,9 @@ def main() -> int:
     parser.add_argument("--cloth", type=Path, default=Path("public/examples/cloth"))
     parser.add_argument("--human", type=Path, default=Path("public/examples/human"))
     parser.add_argument("--out", type=Path, default=Path("training/dataset"))
-    parser.add_argument("--groups", nargs="*", default=("cloth", "human"),
-                        help="subsets to include, in order: cloth human")
+    parser.add_argument(
+        "--groups", nargs="*", default=("cloth", "human"), help="subsets to include, in order: cloth human"
+    )
     parser.add_argument("--force", action="store_true", help="overwrite existing normalized images and captions")
     args = parser.parse_args()
 
@@ -62,8 +62,7 @@ def main() -> int:
 
     manifest = args.out / "manifest.txt"
     manifest.write_text(
-        "\n".join(f"{relative}"
-                  for relative in sorted(p.relative_to(args.out) for p in args.out.rglob("*.txt")))
+        "\n".join(f"{relative}" for relative in sorted(p.relative_to(args.out) for p in args.out.rglob("*.txt")))
         + "\n",
         encoding="utf-8",
     )

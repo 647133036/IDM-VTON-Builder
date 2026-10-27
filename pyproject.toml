@@ -1,0 +1,12 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I", "SIM", "RUF", "C4", "BLE"]
+ignore = [
+    # FastAPI idiom: Depends/File in argument defaults
+    "B008",
+    # dict(...) is fine and often clearer than a literal here
+    "C408",
+]

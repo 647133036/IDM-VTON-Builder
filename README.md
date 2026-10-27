@@ -16,18 +16,39 @@
 - 界面中英文一键切换（登录页 / 导航栏按钮），语言偏好本地持久化
 - 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底），UI 横幅实时显示当前引擎与 GPU 状态
 
-## 安全
+ ## 安全
 
-本项目经过安全审查并修复了所有严重和高优先级问题：
+ 本项目经过两轮安全审查。当前状态如下：
 
-- **文件服务鉴权**：`/files/{path}` 需登录且仅暴露 uploads/results/bases 白名单目录，state.json 等内部文件不可访问
+### 已修复
+
+- **文件服务鉴权**：`/files/{path}` 无需登录（HTML `<img>` 需要匿名访问），但仅暴露 `uploads` / `results` / `bases` 三个白名单目录，仅允许 `.png` / `.jpg` / `.jpeg` / `.webp` 图片后缀，`state.json`、`jobs/`、锁文件等内部文件返回 404；响应带 `X-Content-Type-Options: nosniff`
 - **上传路径校验**：文件名和分类名通过正则白名单校验，拒绝 `.`、`..`、路径穿越
-- **图片内容验证**：所有上传入口使用 PIL 解码校验，拒绝非图片文件（HTML/脚本等），最大 20MB
-- **JWT 密钥**：无硬编码默认值，未设置环境变量时随机生成（每次重启失效）
-- **账号密码**：无公开默认密码，未设置环境变量时随机生成并输出到日志
-- **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看，删除/推送/设置/人种管理需 admin
-- **凭据脱敏**：`/api/stores` 不返回明文 api_key，仅返回 `has_api_key` 和掩码值
+- **图片内容验证**：所有上传入口使用 PIL 解码校验，仅接受 PNG / JPEG / WEBP 真实格式（拒绝 GIF / BMP / TIFF 等伪装成 PNG 的文件），最大 20MB
+- **JWT 密钥**：无硬编码默认值；未设置 `STORE_JWT_SECRET` 时随机生成并持久化到 `backend/data/.jwt_secret`（chmod 600），多 worker 进程共享，重启不失效
+- **账号密码**：无公开默认密码；未设置环境变量时随机生成并通过 `print()` 输出到 stdout（同时写日志）
+- **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看，删除 / 推送 / 设置 / 人种管理需 admin
+- **凭据脱敏**：`/api/stores` 的 GET / POST / PATCH 响应均不返回明文 api_key，仅返回 `has_api_key` 和掩码值
 - **文件权限**：state.json 权限 600
+- **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后拒绝私有网段 / 环回 / 链路本地 IP，全部 HTTP 调用 `allow_redirects=False`
+- **XSS 防护**：前端所有动态字段经 `escapeHtml` 转义；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验
+- **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化，4 个 worker 线程不会同时占用显存
+- **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
+- **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
+- **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
+
+### 未修复
+
+- 无
+
+### 已知限制
+
+- **文件服务仅靠白名单 + 后缀**：`/files` 匿名可访问，目录白名单是唯一的访问控制。若需要按用户隔离文件，需重新引入鉴权并为 `<img>` 标签补带 token 的机制
+- **文件名 / 分类名仅允许 ASCII**：`_safe_name` 正则不含中文字符，上传中文文件名会被拒绝。这是有意收紧，避免 locale 编码问题
+- **JWT 单密钥**：不支持密钥轮换；改了 `STORE_JWT_SECRET` 会让所有已签发 token 失效
+- **SSRF 仅覆盖 push 出口**：上传与下载路径不涉及任意 URL 请求，故无 SSRF 面
+- **测试依赖**：后端测试用 pytest，前端测试用 vitest；`ruff check` 与 `ruff format --check` 均在 `backend/` 和 `training/` 下全绿
+
 
 ## 图片规格
 
@@ -223,14 +244,19 @@ API 凭证加密存储，列表接口仅返回掩码值，编辑凭证需 admin 
 后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。前端组件测试用 vitest 覆盖 i18n 字典与人种翻译。
 
 ```bash
-# 后端测试（90 个，含安全回归测试）
+# 后端测试（99 个，含安全回归测试）
 pip3 install --break-system-packages pytest httpx
 cd backend
 python3 -m pytest tests/ -q
 
 # 前端组件测试（11 个）
 cd /workspace
+npm install
 npm test
+
+# 静态检查（ruff check + ruff format）
+python3 -m ruff check backend/ training/
+python3 -m ruff format --check backend/ training/
 ```
 
 覆盖分层：

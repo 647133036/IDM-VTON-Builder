@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-import os
+import logging
+import threading
 from pathlib import Path
 
 from PIL import Image
+
+logger = logging.getLogger("atelier.engine_sdxl")
+
+_GPU_LOCK = threading.Lock()
+_sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False}
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 SDXL_DIR = _REPO_ROOT / "models" / "sdxl"
@@ -31,7 +37,8 @@ ETHNICITY_PROMPTS = {
     "eastern_europe": "a model with a taller body, slightly broader shoulders, Eastern European body proportions",
     "west_asia": "a model with a medium height, curvy hips, Middle Eastern body proportions",
     "central_asia": "a model with a compact build, shorter legs relative to torso, Central Asian body proportions",
-    "east_asia": "a model with a slim petite frame, narrower shoulders, longer torso relative to legs, East Asian body proportions",
+    "east_asia": "a model with a slim petite frame, narrower shoulders, longer torso "
+    "relative to legs, East Asian body proportions",
     "southeast_asia": "a model with a smaller and slimmer body, narrower shoulders, Southeast Asian body proportions",
     "africa": "a model with long arms and legs, athletic build, African body proportions",
     "north_america": "a model with a larger and fuller body, wider waist, North American body proportions",
@@ -68,6 +75,7 @@ _canny_detector = None
 def _get_openpose_control(image: Image.Image) -> Image.Image:
     global _pose_detector
     from controlnet_aux import OpenposeDetector
+
     if _pose_detector is None:
         annotator_dir = SDXL_DIR / "annotators"
         if annotator_dir.exists():
@@ -80,6 +88,7 @@ def _get_openpose_control(image: Image.Image) -> Image.Image:
 def _get_canny_control(image: Image.Image) -> Image.Image:
     global _canny_detector
     from controlnet_aux import CannyDetector
+
     if _canny_detector is None:
         _canny_detector = CannyDetector()
     return _canny_detector(image, low_threshold=100, high_threshold=200, detect_resolution=1024, image_resolution=1024)
@@ -100,9 +109,61 @@ def _load_trained_lora(pipe, lora_dir: Path) -> str | None:
 def _remove_background(image: Image.Image) -> Image.Image:
     try:
         from rembg import remove
+
         return remove(image)
     except ImportError:
         return image
+
+
+def _get_sdxl_pipe(device, dtype):
+    if _sdxl_state["pipe"] is not None:
+        return _sdxl_state["pipe"], _sdxl_state["ip_adapter_loaded"]
+
+    from diffusers import (
+        ControlNetModel,
+        DDPMScheduler,
+        StableDiffusionXLControlNetPipeline,
+    )
+
+    scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
+
+    controlnet_pose = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_openpose"), torch_dtype=dtype)
+    controlnet_canny = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_canny"), torch_dtype=dtype)
+
+    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+        str(SDXL_DIR / "sdxl_base"),
+        controlnet=[controlnet_pose, controlnet_canny],
+        scheduler=scheduler,
+        torch_dtype=dtype,
+        variant="fp16",
+        use_safetensors=True,
+    )
+    pipe.to(device)
+    pipe.enable_attention_slicing()
+
+    lora_dir = SDXL_DIR / "lora"
+    try:
+        _load_trained_lora(pipe, lora_dir)
+    except Exception:
+        logger.exception("Failed to load trained LoRA; continuing without it")
+
+    ip_adapter_bin = SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin"
+    ip_adapter_loaded = False
+    if ip_adapter_bin.exists():
+        try:
+            pipe.load_ip_adapter(
+                "h94/IP-Adapter",
+                subfolder="sdxl_models",
+                weight_name=str(ip_adapter_bin.name),
+            )
+            pipe.set_ip_adapter_scale(0.8)
+            ip_adapter_loaded = True
+        except Exception:
+            logger.exception("Failed to load IP-Adapter; continuing without it")
+
+    _sdxl_state["pipe"] = pipe
+    _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
+    return pipe, ip_adapter_loaded
 
 
 def compose_tryon_sdxl(
@@ -116,16 +177,6 @@ def compose_tryon_sdxl(
 ) -> Image.Image:
     import torch
     from PIL import Image as PILImage
-
-    try:
-        from diffusers import (
-            StableDiffusionXLControlNetPipeline,
-            DDPMScheduler,
-            ControlNetModel,
-        )
-        from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
-    except ImportError as e:
-        raise RuntimeError(f"Missing dependency: {e}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32
@@ -145,45 +196,7 @@ def compose_tryon_sdxl(
         prompt = f"{prompt}, wearing {garment_suffix}"
     negative_prompt = AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE["women"])
 
-    scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
-
-    controlnet_pose = ControlNetModel.from_pretrained(
-        str(SDXL_DIR / "controlnet_openpose"), torch_dtype=dtype
-    )
-    controlnet_canny = ControlNetModel.from_pretrained(
-        str(SDXL_DIR / "controlnet_canny"), torch_dtype=dtype
-    )
-
-    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        str(SDXL_DIR / "sdxl_base"),
-        controlnet=[controlnet_pose, controlnet_canny],
-        scheduler=scheduler,
-        torch_dtype=dtype,
-        variant="fp16",
-        use_safetensors=True,
-    )
-    pipe.to(device)
-    pipe.enable_attention_slicing()
-
-    lora_dir = SDXL_DIR / "lora"
-    try:
-        _load_trained_lora(pipe, lora_dir)
-    except Exception:
-        pass
-
-    ip_adapter_bin = SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin"
-    ip_adapter_loaded = False
-    if ip_adapter_bin.exists():
-        try:
-            pipe.load_ip_adapter(
-                "h94/IP-Adapter",
-                subfolder="sdxl_models",
-                weight_name=str(ip_adapter_bin.name),
-            )
-            pipe.set_ip_adapter_scale(0.8)
-            ip_adapter_loaded = True
-        except Exception:
-            pass
+    pipe, ip_adapter_loaded = _get_sdxl_pipe(device, dtype)
 
     control_pose = _get_openpose_control(human_img)
     control_canny = _get_canny_control(cloth_img)
@@ -206,9 +219,8 @@ def compose_tryon_sdxl(
     if ip_adapter_loaded:
         pipe_kwargs["ip_adapter_image"] = cloth_img
 
-    with torch.no_grad():
-        with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
-            output = pipe(**pipe_kwargs)
+    with _GPU_LOCK, torch.no_grad(), torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
+        output = pipe(**pipe_kwargs)
 
     result = output.images[0]
 
@@ -228,11 +240,5 @@ def compose_tryon_sdxl(
     scale = long_side / max(rw, rh)
     if abs(scale - 1) > 0.01:
         result = result.resize((int(rw * scale), int(rh * scale)), PILImage.Resampling.LANCZOS)
-
-    del pipe
-    del controlnet_pose
-    del controlnet_canny
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
 
     return result

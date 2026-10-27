@@ -6,7 +6,10 @@ from pathlib import Path
 
 from lora_io import load_trained_lora, lora_weight_path
 
-PROMPT = "a full-body photo of a person wearing a simple t-shirt and jeans, studio lighting, professional fashion photography"
+PROMPT = (
+    "a full-body photo of a person wearing a simple t-shirt and jeans, "
+    "studio lighting, professional fashion photography"
+)
 NEGATIVE = "worst quality, low quality, blurry, lowres, bad anatomy, extra limbs, watermark, text"
 
 
@@ -31,6 +34,7 @@ def main() -> int:
     local = Path(base).expanduser()
     if not local.exists():
         from modelscope import snapshot_download
+
         base = snapshot_download(base)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"

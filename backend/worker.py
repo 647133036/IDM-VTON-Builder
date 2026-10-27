@@ -1,11 +1,12 @@
-import os
 import threading
 import time
 import traceback
 from pathlib import Path
 
 from engine import compose_tryon, engine_status, guess_audience, guess_garment_type
-from store import BASES, RESULTS, UPLOADS, claim_next_job, find_in_dir, patch_job, settings as load_settings
+from store import BASES, RESULTS, UPLOADS, claim_next_job, find_in_dir, patch_job
+from store import settings as load_settings
+
 
 def _default_workers() -> int:
     from os import cpu_count, getenv
@@ -43,13 +44,22 @@ def process_job(job: dict, bases: list[dict]) -> None:
     if garment_type == "auto":
         garment_type = guess_garment_type(job.get("source_name", ""))
 
-    patch_job(job["id"], {"progress": 28, "message": "Segmenting garment and estimating drape", "audience": audience, "garment_type": garment_type})
+    patch_job(
+        job["id"],
+        {
+            "progress": 28,
+            "message": "Segmenting garment and estimating drape",
+            "audience": audience,
+            "garment_type": garment_type,
+        },
+    )
     cfg = load_settings()
     long_side = int(cfg.get("output_long_side", 2048))
     background = job.get("background") or cfg.get("background", "white")
     engine_info = engine_status()
-    engine_name = engine_info["engine"]
-    engine_label = "IDM-VTON diffusion engine" if engine_info["idm_vton_available"] else "composite engine (no-GPU fallback)"
+    engine_label = (
+        "IDM-VTON diffusion engine" if engine_info["idm_vton_available"] else "composite engine (no-GPU fallback)"
+    )
     patch_job(job["id"], {"progress": 35, "message": f"Calling {engine_label}"})
     ethnicity = base.get("ethnicity") or ""
     result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
@@ -88,7 +98,7 @@ def _worker_loop() -> None:
 
             bases = load_state()["bases"]
             process_job(job, bases)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             try:
                 patch_job(
                     job["id"],
@@ -99,7 +109,7 @@ def _worker_loop() -> None:
                         "error": str(exc),
                     },
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001
                 traceback.print_exc()
 
 

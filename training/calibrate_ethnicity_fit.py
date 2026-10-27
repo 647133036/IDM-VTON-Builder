@@ -4,19 +4,21 @@ import argparse
 import sys
 from pathlib import Path
 
-import numpy as np
-
 
 def _current_multipliers() -> dict[str, dict[str, float]]:
     import importlib.util
 
-    spec = importlib.util.spec_from_file_location("engine_dash", str(Path(__file__).resolve().parent.parent / "backend" / "engine.py"))
+    spec = importlib.util.spec_from_file_location(
+        "engine_dash", str(Path(__file__).resolve().parent.parent / "backend" / "engine.py")
+    )
     engine = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(engine)
     return {k: dict(v) for k, v in engine.ETHNICITY_FIT.items()}
 
 
-def fit(existing: dict[str, dict[str, float]], measurements: dict[str, dict[str, float]]) -> dict[str, dict[str, float]]:
+def fit(
+    existing: dict[str, dict[str, float]], measurements: dict[str, dict[str, float]]
+) -> dict[str, dict[str, float]]:
     updated = {}
     for ethnicity, m in measurements.items():
         base = dict(existing.get(ethnicity, {"w": 1.0, "h": 1.0, "shoulder": 1.0}))
@@ -88,8 +90,11 @@ def main() -> int:
         print("\n".join(sanity))
 
     if args.diff:
-        changed = {k: f"w={v['w']:.3g}, h={v['h']:.3g}, shoulder={v['shoulder']:.3g}"
-                   for k, v in updated.items() if existing.get(k) != v}
+        changed = {
+            k: f"w={v['w']:.3g}, h={v['h']:.3g}, shoulder={v['shoulder']:.3g}"
+            for k, v in updated.items()
+            if existing.get(k) != v
+        }
         if not changed:
             print("no changes from measurements")
             return 0

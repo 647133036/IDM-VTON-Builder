@@ -1,15 +1,15 @@
-from pathlib import Path
-from typing import Optional
 import re
 import uuid
-
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pathlib import Path
+from typing import Literal
 
 from auth import USERS, current_user, issue_token, require_admin
 from engine import engine_status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from push import push_store
+from pydantic import BaseModel, Field
 from store import (
     BASES,
     DATA,
@@ -26,7 +26,6 @@ from store import (
     embed_url,
     find_in_dir,
     get_job,
-    get_store,
     list_bases,
     list_ethnicities,
     list_jobs,
@@ -34,7 +33,6 @@ from store import (
     patch_job,
     public_url,
     seed_bases_if_empty,
-    settings as load_settings,
     stats,
     uid,
     update_base,
@@ -42,7 +40,9 @@ from store import (
     update_settings,
     update_store,
 )
-from push import push_store
+from store import (
+    settings as load_settings,
+)
 from worker import start_worker
 
 app = FastAPI(title="Atelier Try-On", version="0.1.0")
@@ -93,11 +93,13 @@ def _safe_name(value: str) -> str:
     return name
 
 
-def _validate_image_bytes(raw: bytes, fallback_ext: str = ".png") -> tuple[bytes, str]:
+def _validate_image_bytes(raw: bytes) -> tuple[bytes, str]:
     if len(raw) > _MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="File too large (max 20MB)")
     import io
+
     from PIL import Image
+
     try:
         img = Image.open(io.BytesIO(raw))
         img.verify()
@@ -105,14 +107,16 @@ def _validate_image_bytes(raw: bytes, fallback_ext: str = ".png") -> tuple[bytes
         raise HTTPException(status_code=400, detail="Invalid image file") from exc
     fmt = (img.format or "").upper()
     ext_map = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
-    ext = ext_map.get(fmt, fallback_ext)
+    ext = ext_map.get(fmt)
+    if ext is None:
+        raise HTTPException(status_code=400, detail=f"Unsupported image format {fmt}; use PNG, JPEG, or WEBP")
     if ext not in _IMAGE_SUFFIXES:
         raise HTTPException(status_code=400, detail="Unsupported image format; use PNG, JPEG, or WEBP")
     return raw, ext
 
 
 @app.get("/files/{path:path}")
-def serve_file(path: str, _: dict = Depends(current_user)):
+def serve_file(path: str):
     target = _resolve_public_file(path)
     if target is None:
         raise HTTPException(status_code=404, detail="File not found")
@@ -123,32 +127,31 @@ def serve_file(path: str, _: dict = Depends(current_user)):
     return FileResponse(target, headers=headers)
 
 
-
 class LoginBody(BaseModel):
     username: str
     password: str
 
 
 class SettingsBody(BaseModel):
-    output_long_side: Optional[int] = None
-    background: Optional[str] = None
-    engine: Optional[str] = None
-    store_name: Optional[str] = None
-    webhook_url: Optional[str] = None
+    output_long_side: int | None = Field(default=None, ge=256, le=4096)
+    background: Literal["white", "transparent"] | None = None
+    engine: str | None = Field(default=None, max_length=64)
+    store_name: str | None = Field(default=None, max_length=120)
+    webhook_url: str | None = Field(default=None, max_length=512)
 
 
 class BasePatch(BaseModel):
-    name: Optional[str] = None
-    audience: Optional[str] = None
-    age_band: Optional[str] = None
-    ethnicity: Optional[str] = None
-    pose: Optional[str] = None
-    notes: Optional[str] = None
+    name: str | None = None
+    audience: str | None = None
+    age_band: str | None = None
+    ethnicity: str | None = None
+    pose: str | None = None
+    notes: str | None = None
 
 
 class BaseBatchPatch(BaseModel):
     ids: list[str]
-    patch: dict[str, Optional[str]] = {}
+    patch: dict[str, str | None] = {}
 
 
 class EthnicityBody(BaseModel):
@@ -157,7 +160,7 @@ class EthnicityBody(BaseModel):
 
 
 class EthnicityPatch(BaseModel):
-    label: Optional[str] = None
+    label: str | None = None
 
 
 class CategoryBody(BaseModel):
@@ -166,27 +169,27 @@ class CategoryBody(BaseModel):
 
 class StoreBody(BaseModel):
     name: str
-    platform: Optional[str] = "other"
-    shop_url: Optional[str] = ""
-    webhook_url: Optional[str] = ""
-    api_key: Optional[str] = ""
-    product_id: Optional[str] = ""
+    platform: str | None = "other"
+    shop_url: str | None = ""
+    webhook_url: str | None = ""
+    api_key: str | None = ""
+    product_id: str | None = ""
 
 
 class StorePatch(BaseModel):
-    name: Optional[str] = None
-    platform: Optional[str] = None
-    shop_url: Optional[str] = None
-    webhook_url: Optional[str] = None
-    api_key: Optional[str] = None
-    product_id: Optional[str] = None
+    name: str | None = None
+    platform: str | None = None
+    shop_url: str | None = None
+    webhook_url: str | None = None
+    api_key: str | None = None
+    product_id: str | None = None
 
 
 class PushBody(BaseModel):
-    sku: Optional[str] = ""
-    product_url: Optional[str] = ""
-    product_id: Optional[str] = ""
-    store_ids: Optional[list[str]] = []
+    sku: str | None = ""
+    product_url: str | None = ""
+    product_id: str | None = ""
+    store_ids: list[str] | None = []
 
 
 @app.post("/api/auth/login")
@@ -242,8 +245,12 @@ async def api_add_base(
 ):
     if ethnicity not in {e["value"] for e in list_ethnicities()}:
         raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {ethnicity}")
+    if audience not in _AUDIENCE_SET - {"auto"}:
+        raise HTTPException(status_code=400, detail=f"Invalid audience: {audience}")
+    if age_band not in {"adult", "kids", "baby"}:
+        raise HTTPException(status_code=400, detail=f"Invalid age_band: {age_band}")
     content = await file.read()
-    _, ext = _validate_image_bytes(content, ".png")
+    _, ext = _validate_image_bytes(content)
     base_id = uid("base")
     filename = f"{base_id}{ext}"
     dest = BASES / filename
@@ -316,8 +323,8 @@ def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="Ethnicity value and label must not be empty")
     try:
         return add_ethnicity({"value": value, "label": label})
-    except KeyError:
-        raise HTTPException(status_code=400, detail="Ethnicity tag already exists")
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail="Ethnicity tag already exists") from exc
 
 
 @app.patch("/api/ethnicities/{value}")
@@ -349,25 +356,24 @@ def _origin(request: Request) -> str:
             host = f"{host}:{forwarded_port}"
         return f"{proto}://{host}"
     base = str(request.base_url).rstrip("/")
-    if base.endswith("/api"):
-        base = base[:-4]
+    base = base.removesuffix("/api")
     return base
+
+
+def _mask_store(item: dict, origin: str) -> dict:
+    key = item.get("api_key", "")
+    item["api_key"] = ""
+    item["has_api_key"] = bool(key)
+    if key:
+        item["api_key_masked"] = key[:2] + "***" + key[-2:] if len(key) > 4 else "***"
+    item["embed_url"] = embed_url(origin, item["id"])
+    return item
 
 
 @app.get("/api/stores")
 def api_stores(request: Request, _: dict = Depends(current_user)):
     origin = _origin(request)
-    items = []
-    for s in list_stores():
-        item = dict(s)
-        key = item.get("api_key", "")
-        item["api_key"] = ""
-        item["has_api_key"] = bool(key)
-        if key:
-            item["api_key_masked"] = key[:2] + "***" + key[-2:] if len(key) > 4 else "***"
-        item["embed_url"] = embed_url(origin, s["id"])
-        items.append(item)
-    return items
+    return [_mask_store(dict(s), origin) for s in list_stores()]
 
 
 @app.post("/api/stores")
@@ -387,15 +393,14 @@ def api_add_store(body: StoreBody, request: Request, _: dict = Depends(require_a
         "active": True,
     }
     created = add_store(meta)
-    created["embed_url"] = embed_url(_origin(request), created["id"])
-    return created
+    return _mask_store(created, _origin(request))
 
 
 @app.patch("/api/stores/{store_id}")
-def api_patch_store(store_id: str, body: StorePatch, _: dict = Depends(require_admin)):
+def api_patch_store(store_id: str, body: StorePatch, request: Request, _: dict = Depends(require_admin)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
-        return update_store(store_id, patch)
+        return _mask_store(update_store(store_id, patch), _origin(request))
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Store not found") from exc
 
@@ -415,7 +420,7 @@ def api_jobs(_: dict = Depends(current_user)):
 
 
 @app.get("/api/uploads")
-def api_list_uploads(category: Optional[str] = None, _: dict = Depends(current_user)):
+def api_list_uploads(category: str | None = None, _: dict = Depends(current_user)):
     items = []
     if category:
         cat = _safe_name(category)
@@ -423,33 +428,39 @@ def api_list_uploads(category: Optional[str] = None, _: dict = Depends(current_u
         if cat_dir.exists():
             for p in sorted(cat_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
                 if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
-                    items.append({
+                    items.append(
+                        {
+                            "name": p.name,
+                            "url": public_url(p),
+                            "size": p.stat().st_size,
+                            "mtime": int(p.stat().st_mtime),
+                            "category": cat,
+                        }
+                    )
+    else:
+        for p in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
+            if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
+                items.append(
+                    {
                         "name": p.name,
                         "url": public_url(p),
                         "size": p.stat().st_size,
                         "mtime": int(p.stat().st_mtime),
-                        "category": cat,
-                    })
-    else:
-        for p in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
-                items.append({
-                    "name": p.name,
-                    "url": public_url(p),
-                    "size": p.stat().st_size,
-                    "mtime": int(p.stat().st_mtime),
-                    "category": "default",
-                })
+                        "category": "default",
+                    }
+                )
             elif p.is_dir():
                 for f in sorted(p.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
                     if f.is_file() and f.suffix.lower() in _IMAGE_SUFFIXES:
-                        items.append({
-                            "name": f.name,
-                            "url": public_url(f),
-                            "size": f.stat().st_size,
-                            "mtime": int(f.stat().st_mtime),
-                            "category": p.name,
-                        })
+                        items.append(
+                            {
+                                "name": f.name,
+                                "url": public_url(f),
+                                "size": f.stat().st_size,
+                                "mtime": int(f.stat().st_mtime),
+                                "category": p.name,
+                            }
+                        )
     return items
 
 
@@ -496,7 +507,7 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
         raise HTTPException(status_code=400, detail="Only image files can be moved here")
     category = _safe_name(body.category) if body.category else "default"
     if p.parent.name == category:
-        return {"ok": True, "filename": safe_name, "category": category}
+        return {"ok": True, "filename": p.name, "category": category}
     cat_dir = UPLOADS / category
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
@@ -505,7 +516,7 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
         dest = cat_dir / f"{Path(safe_name).stem}_{i}{Path(safe_name).suffix}"
         i += 1
     p.replace(dest)
-    return {"ok": True, "filename": safe_name, "category": category}
+    return {"ok": True, "filename": dest.name, "category": category}
 
 
 @app.post("/api/uploads/categories")
@@ -593,7 +604,7 @@ async def api_upload_to_library(
     _: dict = Depends(current_user),
 ):
     content = await file.read()
-    _, ext = _validate_image_bytes(content, ".jpg")
+    _, ext = _validate_image_bytes(content)
     safe_name = f"upload_{uuid.uuid4().hex[:8]}{ext}"
     cat = _safe_name(category) if category else "default"
     cat_dir = UPLOADS / cat
@@ -616,6 +627,23 @@ def api_job(job_id: str, _: dict = Depends(current_user)):
         raise HTTPException(status_code=404, detail="Job not found") from exc
 
 
+_AUDIENCE_SET = {"women", "men", "girls", "boys", "baby", "auto"}
+_GARMENT_SET = {"upper", "lower", "dress", "onesie", "auto"}
+_BG_SET = {"white", "transparent"}
+_FMT_SET = {"jpg", "jpeg", "png"}
+
+
+def _validate_batch_params(audience: str, garment_type: str, background: str, output_format: str) -> None:
+    if audience not in _AUDIENCE_SET:
+        raise HTTPException(status_code=400, detail=f"Invalid audience: {audience}")
+    if garment_type not in _GARMENT_SET:
+        raise HTTPException(status_code=400, detail=f"Invalid garment_type: {garment_type}")
+    if background not in _BG_SET:
+        raise HTTPException(status_code=400, detail=f"Invalid background: {background}")
+    if output_format not in _FMT_SET:
+        raise HTTPException(status_code=400, detail=f"Invalid output_format: {output_format}")
+
+
 @app.post("/api/jobs/batch")
 async def api_batch(
     files: list[UploadFile] = File(...),
@@ -626,18 +654,27 @@ async def api_batch(
     background: str = Form("white"),
     _: dict = Depends(current_user),
 ):
+    _validate_batch_params(audience, garment_type, background, output_format)
     if not files:
         raise HTTPException(status_code=400, detail="Please upload at least one garment image")
+    bases = list_bases()
+    if not any(b["id"] == base_id for b in bases):
+        raise HTTPException(status_code=400, detail="Base model not found")
     jobs = []
+    prepared = []
     for upload in files:
         raw = await upload.read()
         if not raw:
             continue
-        _, ext = _validate_image_bytes(raw, ".jpg")
+        _, ext = _validate_image_bytes(raw)
+        display_name = upload.filename or f"garment{ext}"
+        prepared.append((raw, ext, display_name))
+    if not prepared:
+        raise HTTPException(status_code=400, detail="Please upload at least one valid garment image")
+    for raw, ext, display_name in prepared:
         src_name = f"{uid('src')}{ext}"
         dest = UPLOADS / src_name
         dest.write_bytes(raw)
-        display_name = upload.filename or f"garment{ext}"
         job = create_job(
             {
                 "base_id": base_id,
@@ -729,8 +766,13 @@ def license_status():
 
 @app.get("/api/download/{job_id}")
 def download(job_id: str, _: dict = Depends(current_user)):
-    job = get_job(job_id)
+    try:
+        job = get_job(job_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
     if not job.get("result_url"):
         raise HTTPException(status_code=404, detail="Result not generated yet")
     path = RESULTS / Path(job["result_url"]).name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Result file missing")
     return FileResponse(path, filename=f"{job.get('title') or job_id}{path.suffix}")

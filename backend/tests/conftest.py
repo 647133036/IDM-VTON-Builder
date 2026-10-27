@@ -11,7 +11,7 @@ os.environ.setdefault("STORE_JWT_SECRET", "test-secret-key-for-unit-tests-only-3
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import store as store_mod  # noqa: E402
+import store as store_mod
 
 _TEST_DIR = Path(tempfile.mkdtemp(prefix="vton_test_"))
 
@@ -31,10 +31,7 @@ import worker as worker_mod  # noqa: E402
 worker_mod.start_worker = lambda *a, **k: None
 
 from fastapi.testclient import TestClient  # noqa: E402
-
 from main import app  # noqa: E402
-
-import main as main_mod  # noqa: E402
 
 
 def _reset_filesystem():

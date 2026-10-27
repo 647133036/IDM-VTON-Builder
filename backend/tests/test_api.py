@@ -1,4 +1,3 @@
-import pytest
 from PIL import Image
 
 
@@ -222,7 +221,13 @@ def create_job_via_api(client, auth_headers):
     base_id = seed[0]["id"]
     r = client.post(
         "/api/jobs/batch",
-        data={"base_id": base_id, "audience": "women", "garment_type": "upper", "output_format": "png", "background": "white"},
+        data={
+            "base_id": base_id,
+            "audience": "women",
+            "garment_type": "upper",
+            "output_format": "png",
+            "background": "white",
+        },
         files=[("files", ("ok_img.png", _png_bytes((30, 90, 150)), "image/png"))],
         headers=auth_headers,
     )
@@ -232,18 +237,43 @@ def create_job_via_api(client, auth_headers):
 def test_stores_crud(client, auth_headers):
     r = client.post(
         "/api/stores",
-        json={"name": "旗舰店", "platform": "shopify", "shop_url": "abc.myshopify.com", "api_key": "tok", "product_id": "1"},
+        json={
+            "name": "旗舰店",
+            "platform": "shopify",
+            "shop_url": "abc.myshopify.com",
+            "api_key": "tok",
+            "product_id": "1",
+        },
         headers=auth_headers,
     )
     assert r.status_code == 200
     store = r.json()
     assert store["embed_url"]
+    assert store["api_key"] == ""
+    assert store["has_api_key"] is True
 
     r = client.patch(f"/api/stores/{store['id']}", json={"name": "改名店"}, headers=auth_headers)
     assert r.status_code == 200
     assert r.json()["name"] == "改名店"
+    assert r.json()["api_key"] == ""
+
+    r = client.patch(
+        f"/api/stores/{store['id']}",
+        json={"api_key": "newtok12345"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["api_key"] == ""
+    assert r.json()["has_api_key"] is True
+    assert r.json()["api_key_masked"] == "ne***45"
+    assert "newtok12345" not in r.text
 
     assert client.delete(f"/api/stores/{store['id']}", headers=auth_headers).status_code == 200
+
+
+def test_download_missing_job(client, auth_headers):
+    r = client.get("/api/download/job_does_not_exist", headers=auth_headers)
+    assert r.status_code == 404
 
 
 def test_stores_requires_name(client, auth_headers):
@@ -263,17 +293,22 @@ def test_download_missing_result(client, auth_headers):
 
 
 def test_files_path_traversal_blocked(client):
-    r = client.get("/files/../../etc/passwd")
-    assert r.status_code in (404, 400)
+    assert client.get("/files/../../etc/passwd").status_code == 404
 
 
 def test_files_state_json_blocked(client, auth_headers):
     assert client.get("/files/state.json", headers=auth_headers).status_code == 404
-    assert client.get("/files/state.json").status_code == 401
+    assert client.get("/files/state.json").status_code == 404
 
 
-def test_files_requires_auth(client):
-    assert client.get("/files/results/dummy.png").status_code == 401
+def test_files_public_image_no_auth(client, auth_headers):
+    r = client.get("/api/bases", headers=auth_headers)
+    bases = r.json()
+    if bases:
+        url = bases[0].get("url", "")
+        if url:
+            path = url.replace("/files/", "")
+            assert client.get(f"/files/{path}").status_code == 200
 
 
 def test_upload_html_rejected(client, auth_headers):
@@ -314,7 +349,7 @@ def test_stores_api_key_masked(client, auth_headers):
     assert r.status_code == 200
     store_id = r.json()["id"]
     listing = client.get("/api/stores", headers=auth_headers)
-    found = [s for s in listing.json() if s["id"] == store_id][0]
+    found = next(s for s in listing.json() if s["id"] == store_id)
     assert found["api_key"] == ""
     assert found["has_api_key"] is True
     assert "super_secret" not in found.get("api_key_masked", "")
@@ -331,7 +366,6 @@ def test_staff_cannot_delete_base(client):
 
 
 def test_staff_cannot_push(client, auth_headers):
-    from fastapi.testclient import TestClient
     r = client.post(
         "/api/auth/login",
         json={"username": "staff", "password": "staff123"},
@@ -354,3 +388,68 @@ def test_stats(client, auth_headers):
     r = client.get("/api/stats", headers=auth_headers)
     assert r.status_code == 200
     assert "bases" in r.json()
+
+
+def _gif_bytes():
+    import io
+
+    buf = io.BytesIO()
+    Image.new("RGB", (64, 64), (10, 20, 30)).save(buf, "GIF")
+    return buf.getvalue()
+
+
+def test_upload_rejects_gif_format(client, auth_headers):
+    r = client.post(
+        "/api/uploads",
+        files={"file": ("anim.gif", _gif_bytes(), "image/gif")},
+        data={"category": "tops"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "GIF" in r.json()["detail"]
+
+
+def test_settings_output_long_side_range_enforced(client, auth_headers):
+    r = client.patch("/api/settings", json={"output_long_side": 64}, headers=auth_headers)
+    assert r.status_code == 422
+    r = client.patch("/api/settings", json={"output_long_side": 8192}, headers=auth_headers)
+    assert r.status_code == 422
+
+
+def test_settings_background_literal_enforced(client, auth_headers):
+    r = client.patch("/api/settings", json={"background": "black"}, headers=auth_headers)
+    assert r.status_code == 422
+
+
+def test_batch_invalid_audience_rejected(client, auth_headers):
+    r = client.post(
+        "/api/jobs/batch",
+        files={"files": ("garment.png", _png_bytes(), "image/png")},
+        data={
+            "base_id": "base_women_01",
+            "audience": "aliens",
+            "garment_type": "upper",
+            "output_format": "jpg",
+            "background": "white",
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "audience" in r.json()["detail"]
+
+
+def test_batch_invalid_background_rejected(client, auth_headers):
+    r = client.post(
+        "/api/jobs/batch",
+        files={"files": ("garment.png", _png_bytes(), "image/png")},
+        data={
+            "base_id": "base_women_01",
+            "audience": "women",
+            "garment_type": "upper",
+            "output_format": "jpg",
+            "background": "black",
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "background" in r.json()["detail"]

@@ -1,5 +1,4 @@
 import pytest
-
 import store as store_mod
 from store import (
     ETHNICITY_MIGRATION,
@@ -14,11 +13,13 @@ from store import (
     list_ethnicities,
     patch_job,
     seed_bases_if_empty,
-    settings as get_settings,
     stats,
     update_base,
     update_ethnicity,
     update_settings,
+)
+from store import (
+    settings as get_settings,
 )
 
 
@@ -82,7 +83,7 @@ def test_ethnicity_crud():
     add_ethnicity({"value": "scandinavia", "label": "北欧"})
     assert any(e["value"] == "scandinavia" for e in list_ethnicities())
     update_ethnicity("scandinavia", {"label": "斯堪的纳维亚"})
-    entry = [e for e in list_ethnicities() if e["value"] == "scandinavia"][0]
+    entry = next(e for e in list_ethnicities() if e["value"] == "scandinavia")
     assert entry["label"] == "斯堪的纳维亚"
     delete_ethnicity("scandinavia")
     assert all(e["value"] != "scandinavia" for e in list_ethnicities())
@@ -98,7 +99,7 @@ def test_delete_ethnicity_resets_bases_to_east_asia():
     add_ethnicity({"value": "temp_eth", "label": "临时"})
     add_base({"id": "base_t", "name": "x", "ethnicity": "temp_eth", "file": "x.png"})
     delete_ethnicity("temp_eth")
-    base = [b for b in list_bases() if b["id"] == "base_t"][0]
+    base = next(b for b in list_bases() if b["id"] == "base_t")
     assert base["ethnicity"] == "east_asia"
 
 
@@ -112,7 +113,7 @@ def test_ethnicity_migration_mapping():
 
 def test_list_bases_migrates_unknown_ethnicity():
     add_base({"id": "base_mig", "name": "x", "ethnicity": "slav", "file": "x.png"})
-    base = [b for b in list_bases() if b["id"] == "base_mig"][0]
+    base = next(b for b in list_bases() if b["id"] == "base_mig")
     assert base["ethnicity"] == "western_europe"
 
 
