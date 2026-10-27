@@ -96,6 +96,7 @@ def _build_models(base_model: str, dtype):
     vae = AutoencoderKL.from_pretrained(base, subfolder="vae", torch_dtype=dtype)
     unet = UNet2DConditionModel.from_pretrained(base, subfolder="unet", torch_dtype=dtype)
     controlnet = ControlNetModel.from_unet(unet)
+    controlnet = controlnet.to(dtype=dtype)
     noise_scheduler = DDPMScheduler.from_pretrained(base, subfolder="scheduler")
     tokenizer = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained(base, subfolder="tokenizer_2")
@@ -132,11 +133,11 @@ def train(args) -> int:
     text_encoder = components["text_encoder"]
     text_encoder_2 = components["text_encoder_2"]
 
-    vae = vae.to(device)
-    unet = unet.to(device)
-    controlnet = controlnet.to(device)
-    text_encoder.to(device)
-    text_encoder_2.to(device)
+    vae = vae.to(device=device, dtype=dtype)
+    unet = unet.to(device=device, dtype=dtype)
+    controlnet = controlnet.to(device=device, dtype=dtype)
+    text_encoder.to(device=device, dtype=dtype)
+    text_encoder_2.to(device=device, dtype=dtype)
     vae.requires_grad_(False)
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)

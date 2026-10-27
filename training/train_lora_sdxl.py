@@ -132,7 +132,10 @@ def _encode_text(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompts, 
 
 def train(args) -> int:
     import torch
-    from peft import LoraConfig, get_peft_model
+    from peft import LoraConfig
+    from peft.utils import get_peft_model_state_dict
+    from diffusers import StableDiffusionXLPipeline
+    from diffusers.utils import convert_state_dict_to_diffusers
 
     device, dtype = _make_train_state(args.dataset_dir)
     comps = _load_components(args.base_model, dtype)
@@ -156,7 +159,7 @@ def train(args) -> int:
         target_modules=["to_q", "to_k", "to_v", "to_out.0"],
         init_lora_weights="gaussian",
     )
-    unet = get_peft_model(unet, lora_config)
+    unet.add_adapter(lora_config)
     unet.train()
 
     trainable = [p for p in unet.parameters() if p.requires_grad]
@@ -213,8 +216,12 @@ def train(args) -> int:
             if global_step >= args.max_train_steps:
                 break
 
-    unet.save_pretrained(str(writer))
-    print(f"LoRA saved to {writer}", flush=True)
+    unet_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+    StableDiffusionXLPipeline.save_lora_weights(
+        str(writer),
+        unet_lora_layers=unet_lora_layers,
+    )
+    print(f"LoRA saved to {writer}/pytorch_lora_weights.safetensors", flush=True)
     return 0
 
 

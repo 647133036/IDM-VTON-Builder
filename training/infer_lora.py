@@ -4,6 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
+from lora_io import load_trained_lora, lora_weight_path
+
 PROMPT = "a full-body photo of a person wearing a simple t-shirt and jeans, studio lighting, professional fashion photography"
 NEGATIVE = "worst quality, low quality, blurry, lowres, bad anatomy, extra limbs, watermark, text"
 
@@ -18,7 +20,7 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
-    if not (args.lora_dir / "adapter_model.safetensors").exists():
+    if lora_weight_path(args.lora_dir) is None:
         print(f"no trained LoRA found at {args.lora_dir}")
         return 1
 
@@ -39,7 +41,8 @@ def main() -> int:
         torch_dtype=dtype,
         use_safetensors=True,
     )
-    pipe.load_lora_weights(str(args.lora_dir))
+    fmt = load_trained_lora(pipe, args.lora_dir)
+    print(f"loaded LoRA ({fmt}) from {args.lora_dir}", flush=True)
     pipe.to(device)
     pipe.enable_attention_slicing()
 

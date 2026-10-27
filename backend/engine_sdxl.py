@@ -8,6 +8,7 @@ from PIL import Image
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 SDXL_DIR = _REPO_ROOT / "models" / "sdxl"
 _IDM_DIR = _REPO_ROOT / "IDM-VTON"
+_TRAINING_DIR = _REPO_ROOT / "training"
 
 AUDIENCE_PROMPTS = {
     "women": "a fashion model wearing this garment, full body front view, professional fashion photography",
@@ -72,6 +73,18 @@ def _get_canny_control(image: Image.Image) -> Image.Image:
     detector = CannyDetector.from_pretrained("lllyasviel/Annotators")
     control = detector(image, resolution=1024)
     return control
+
+
+def _load_trained_lora(pipe, lora_dir: Path) -> str | None:
+    import sys
+
+    if str(_TRAINING_DIR) not in sys.path:
+        sys.path.insert(0, str(_TRAINING_DIR))
+    from lora_io import load_trained_lora, lora_weight_path
+
+    if lora_weight_path(lora_dir) is None:
+        return None
+    return load_trained_lora(pipe, lora_dir)
 
 
 def _remove_background(image: Image.Image) -> Image.Image:
@@ -143,8 +156,10 @@ def compose_tryon_sdxl(
     pipe.enable_attention_slicing()
 
     lora_dir = SDXL_DIR / "lora"
-    if (lora_dir / "adapter_model.safetensors").exists():
-        pipe.load_lora_weights(str(lora_dir))
+    try:
+        _load_trained_lora(pipe, lora_dir)
+    except Exception:
+        pass
 
     ip_adapter_path = str(SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin")
     if (SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin").exists():

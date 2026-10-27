@@ -13,6 +13,7 @@ training/
   train_lora_family.py        # 按分组 (cloth/human) 各训一个 LoRA
   prepare_controlnet_data.py  # 人像 → ControlNet 条件图 (openpose/canny)
   train_controlnet_sdxl.py    # 精简 SDXL ControlNet 微调
+  lora_io.py                  # LoRA 加载：diffusers 格式，或 PEFT adapter 内存转换
   infer_lora.py               # 用训练好的 LoRA 出图验证
   calibrate_ethnicity_fit.py  # 用实测比例拟合 ETHNICITY_FIT 乘子（无需 GPU）
   run_train.sh                # 一键：MODEL=lora|lora_family|controlnet
@@ -38,7 +39,8 @@ MODEL=controlnet CONDITION=canny bash training/run_train.sh
 ```
 
 产物：
-- LoRA：`models/sdxl/lora/`（引擎 `engine_sdxl.py` 自动加载）
+- LoRA：`models/sdxl/lora/pytorch_lora_weights.safetensors`（diffusers 格式，引擎自动加载）
+- 已有 PEFT `adapter_model.safetensors` 无需重训，推理时内存转换后加载
 - LoRA 族：`models/sdxl/lora/{cloth,human}/`（按分组子目录）
 - ControlNet：`models/sdxl/controlnet/`
 - 样图：`training/output/`
@@ -82,8 +84,10 @@ python3 training/infer_lora.py \
 
 - 现有素材仅 25 张，目的是验证全链路（下载、编码、LoRA/ControlNet、保存、回载、出图），产出质量有限
 - `train_lora_sdxl.py` / `train_controlnet_sdxl.py` 自动检测设备：CUDA 用 bf16（SDXL UNet fp16 训练会 NaN），否则退化 CPU fp32（很慢，仅验证）
+- LoRA 保存用 `unet.add_adapter` + `StableDiffusionXLPipeline.save_lora_weights`（`pytorch_lora_weights.safetensors`）。PEFT `adapter_model.safetensors` 由 `infer_lora.py` / `engine_sdxl.py` 在内存转成 unet 前缀后加载
 - transformers 5.x 下 CLIP text_encoder_2 取 `text_embeds`（无 `pooler_output` 时回退）
 - ControlNet 的 `captions.csv` 用 csv.writer 写，caption 含逗号不会列错位
+- ControlNet 从 UNet 初始化后立刻 `to(dtype)`，避免 SDXL time-embedding 分支残留 fp32
 - ControlNet 条件图默认 openpose（需联网下载 annotator），离线可用 `--condition canny`
 - caption 自动生成于 `training/dataset/*.txt`，可编辑后重训
 - 训练产物（dataset / output / models）不入库
