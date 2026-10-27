@@ -2,12 +2,15 @@ import pytest
 from engine import (
     ETHNICITY_FIT,
     TORSOS,
+    _garment_bbox,
     _silhouette_scale,
     _warp_garment,
     compose_tryon,
     engine_status,
+    fit_garment_to_body,
     guess_audience,
     guess_garment_type,
+    remove_watermark,
     torso_box,
 )
 
@@ -211,3 +214,60 @@ def test_warp_garment_noop_without_cv2_or_zero_strength():
     box = torso_box("women", "east_asia")
     out = _warp_garment(img, box, 0.0)
     assert out is img or out.size == img.size
+
+
+def test_remove_watermark_reduces_corner_highlights():
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+
+    img = Image.new("RGB", (360, 360), (90, 120, 150))
+    d = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 30)
+    except OSError:
+        font = ImageFont.load_default()
+    d.text((18, 18), "WATERMARK", fill=(245, 248, 250), font=font)
+    before = np.asarray(img).astype(np.float32)
+    after = np.asarray(remove_watermark(img)).astype(np.float32)
+    # 亮水印像素(亮度>210)在文本区域内应大幅减少。
+    region = (slice(0, 60), slice(0, 220))
+    bright_before = (before[region].mean(axis=2) > 210).sum()
+    bright_after = (after[region].mean(axis=2) > 210).sum()
+    assert bright_before >= 100
+    assert bright_after < bright_before * 0.5
+
+
+def test_remove_watermark_noop_when_no_corner_feature():
+    import numpy as np
+    from PIL import Image
+
+    img = Image.new("RGB", (300, 300), (70, 90, 110))
+    out = remove_watermark(img)
+    # 无角部特征时基本不变(允许轻微抗锯齿差异)。
+    assert np.abs(np.asarray(img).astype(np.int16) - np.asarray(out).astype(np.int16)).mean() < 2
+
+
+def test_fit_garment_to_body_maps_wide_garment_to_shoulder_width():
+    from PIL import Image, ImageDraw
+
+    box = torso_box("women", "east_asia")
+    tw, th = 400, 300
+    wide = Image.new("RGBA", (600, 300), (0, 0, 0, 0))
+    ImageDraw.Draw(wide).rectangle([0, 0, 600, 300], fill=(200, 40, 40, 255))
+    fitted = fit_garment_to_body(wide, box, tw, th)
+    bb = _garment_bbox(fitted)
+    gw = bb[2] - bb[0] + 1
+    assert abs(gw - box["shoulder"] * tw) <= 3
+    # 衣料高度不超过躯干框 1.6 倍(防止拉伸过大)。
+    gh = bb[3] - bb[1] + 1
+    assert gh <= th * 1.6 + 2
+
+
+def test_fit_garment_to_body_falls_back_when_no_alpha():
+    from PIL import Image
+
+    # 无 alpha 通道时回退到 fit_garment,仍返回 (tw,th) 尺寸。
+    box = torso_box("men", "western_europe")
+    img = Image.new("RGB", (100, 120), (10, 20, 30))
+    out = fit_garment_to_body(img, box, 200, 260)
+    assert out.size == (200, 260)

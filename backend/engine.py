@@ -244,6 +244,86 @@ def _warp_garment(garment: Image.Image, box: dict, strength: float) -> Image.Ima
     return Image.fromarray(out.astype(np.uint8), "RGBA")
 
 
+def remove_watermark(img: Image.Image) -> Image.Image:
+    """去除角部半透明白/灰水印(logo/文字)。
+
+    启发式:角部区域内,低饱和、亮薄特征(top-hat)判定为水印,
+    再用 cv2.inpaint(Telea) 填补。无法可靠检出时原样返回。
+    纯 CPU;cv2 缺失时无操作。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return img
+    rgb = img.convert("RGB")
+    arr = np.asarray(rgb)
+    h, w, _ = arr.shape
+    if h < 60 or w < 60:
+        return img
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    top_hat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    # 亮 + 低饱和 = 中性水印候选。
+    cand = ((top_hat > 26) & (sat < 60)).astype(np.uint8) * 255
+    # 顶部/底部整条带(可覆盖横贯的水印文字),避免误伤衣料主体中段。
+    band = np.zeros((h, w), np.uint8)
+    bh = int(h * 0.18)
+    band[:bh, :] = 255
+    band[h - bh :, :] = 255
+    cand = cv2.bitwise_and(cand, band)
+    n = int(cand.sum() // 255)
+    total = h * w
+    if n < 30 or n > total * 0.06:
+        return img
+    cand = cv2.dilate(cand, np.ones((5, 5), np.uint8), iterations=1)
+    inpainted = cv2.inpaint(bgr, cand, 4, cv2.INPAINT_TELEA)
+    return Image.fromarray(cv2.cvtColor(inpainted, cv2.COLOR_BGR2RGB))
+
+
+def _garment_bbox(img: Image.Image, alpha_thresh: int = 35) -> tuple[int, int, int, int] | None:
+    """衣料真实外接框:由 alpha 通道阈值得到,忽略透明背景。"""
+    a = np.asarray(img.split()[-1]) if img.mode == "RGBA" else np.asarray(garment_alpha(img))
+    ys, xs = np.where(a > alpha_thresh)
+    if len(xs) < 16:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+
+def fit_garment_to_body(garment: Image.Image, box: dict, tw: int, th: int) -> Image.Image:
+    """按衣料实测宽度等比缩放到模特肩宽,保留衣料真实长宽比。
+
+    解决「衣服宽、模特窄」:不再强行铺满躯干框,而是把衣料自身宽度
+    映射到肩宽,使其完美落在模特身上;窄衣料也不会被拉宽。
+    """
+    bbox = _garment_bbox(garment)
+    if bbox is None:
+        return fit_garment(garment, (tw, th))
+    bx0, by0, bx1, by1 = bbox
+    gw = bx1 - bx0 + 1
+    gh = by1 - by0 + 1
+    if gw < 4 or gh < 4:
+        return fit_garment(garment, (tw, th))
+    target_w = max(1.0, box["shoulder"] * tw)
+    scale = target_w / gw
+    # 防止极端比例:衣料高度保持在躯干框的 55%~1.6 倍。
+    min_scale = (th * 0.55) / gh
+    max_scale = (th * 1.6) / gh
+    scale = max(min_scale, min(max_scale, scale))
+    nw = max(1, round(gw * scale))
+    nh = max(1, round(gh * scale))
+    crop = garment.crop((bx0, by0, bx1 + 1, by1 + 1))
+    resized = crop.resize((nw, nh), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+    x = (tw - nw) // 2
+    # 顶部对齐颈线,衣料自然向下延伸。
+    y = int(th * 0.04)
+    canvas.paste(resized, (x, y), resized)
+    return canvas
+
+
 def _composite_engine(
     base_path: Path,
     garment_path: Path,
@@ -255,7 +335,8 @@ def _composite_engine(
 ) -> Image.Image:
     base = Image.open(base_path).convert("RGBA")
     w, h = base.size
-    garment = detect_garment_crop(Image.open(garment_path))
+    garment_src = remove_watermark(Image.open(garment_path))
+    garment = detect_garment_crop(garment_src)
     garment = match_color(garment)
     alpha = garment_alpha(garment)
     garment = garment.convert("RGBA")
@@ -273,7 +354,7 @@ def _composite_engine(
     tw = max(tw, 32)
     th = max(th, 32)
 
-    fitted = fit_garment(garment, (tw, th))
+    fitted = fit_garment_to_body(garment, box, tw, th)
     # 简易 2D 变形:让衣料贴合模特躯干轮廓(肩/腰/下摆)。
     fitted = _warp_garment(fitted, box, GARMENT_WARP_STRENGTH.get(garment_type, 0.4))
     body = shirt_mask(tw, th, box)
