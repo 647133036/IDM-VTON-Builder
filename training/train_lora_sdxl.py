@@ -29,7 +29,7 @@ def _make_train_state(dataset_dir: Path):
 
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
-        dtype = torch.float16
+        dtype = torch.bfloat16
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         device = torch.device("mps")
         dtype = torch.float32
@@ -124,7 +124,9 @@ def _encode_text(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompts, 
         enc = text_encoder(ids.input_ids).last_hidden_state
         out_2 = text_encoder_2(ids_2.input_ids)
     prompt_embeds = torch.cat([enc, out_2.last_hidden_state], dim=-1)
-    pooled_embeds = out_2.pooler_output
+    pooled_embeds = getattr(out_2, "text_embeds", None)
+    if pooled_embeds is None:
+        pooled_embeds = out_2.pooler_output
     return prompt_embeds, pooled_embeds
 
 

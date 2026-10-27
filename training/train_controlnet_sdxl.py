@@ -80,8 +80,10 @@ def _encode_prompts(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompt
         hidden = text_encoder(ids.input_ids).last_hidden_state
         out_2 = text_encoder_2(ids_2.input_ids)
     prompt_embeds = torch.cat([hidden, out_2.last_hidden_state], dim=-1).to(dtype)
-    pooled = out_2.pooler_output.to(dtype)
-    return prompt_embeds, pooled
+    pooled = getattr(out_2, "text_embeds", None)
+    if pooled is None:
+        pooled = out_2.pooler_output
+    return prompt_embeds, pooled.to(dtype)
 
 
 def _build_models(base_model: str, dtype):
@@ -118,7 +120,7 @@ def train(args) -> int:
     from torch.utils.data import DataLoader
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 
     components = _build_models(args.base_model, dtype)
     vae = components["vae"]

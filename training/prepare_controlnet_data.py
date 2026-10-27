@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -64,14 +65,13 @@ def main() -> int:
 
     meta = args.out / "captions.csv"
     if args.force or not meta.exists():
-        meta.write_text(
-            "image,conditioning,caption\n"
-            + "".join(
-                f"images/{i:04d}.png,conditioning/{i:04d}.png,{args.caption}\n"
-                for i in range(len(items))
-            ),
-            encoding="utf-8",
-        )
+        with meta.open("w", encoding="utf-8", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["image", "conditioning", "caption"])
+            for i in range(len(items)):
+                writer.writerow(
+                    [f"images/{i:04d}.png", f"conditioning/{i:04d}.png", args.caption]
+                )
 
     print(f"{args.condition} dataset ready: {len(items)} pairs -> {args.out}")
     return 0

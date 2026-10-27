@@ -81,7 +81,9 @@ python3 training/infer_lora.py \
 ## 说明
 
 - 现有素材仅 25 张，目的是验证全链路（下载、编码、LoRA/ControlNet、保存、回载、出图），产出质量有限
-- `train_lora_sdxl.py` / `train_controlnet_sdxl.py` 自动检测设备：CUDA 用 fp16，否则退化 CPU fp32（很慢，仅验证）
+- `train_lora_sdxl.py` / `train_controlnet_sdxl.py` 自动检测设备：CUDA 用 bf16（SDXL UNet fp16 训练会 NaN），否则退化 CPU fp32（很慢，仅验证）
+- transformers 5.x 下 CLIP text_encoder_2 取 `text_embeds`（无 `pooler_output` 时回退）
+- ControlNet 的 `captions.csv` 用 csv.writer 写，caption 含逗号不会列错位
 - ControlNet 条件图默认 openpose（需联网下载 annotator），离线可用 `--condition canny`
 - caption 自动生成于 `training/dataset/*.txt`，可编辑后重训
 - 训练产物（dataset / output / models）不入库
