@@ -51,13 +51,13 @@ def sdxl_available() -> tuple[bool, str]:
     required = ["sdxl_base", "controlnet_openpose", "controlnet_canny"]
     missing = [d for d in required if not (SDXL_DIR / d).exists()]
     if missing:
-        return False, f"缺少权重: {', '.join(missing)}"
+        return False, f"Missing weights: {', '.join(missing)}"
     try:
         import torch
     except ImportError:
-        return False, "未安装 torch"
+        return False, "torch not installed"
     if not torch.cuda.is_available():
-        return False, "无可用 GPU"
+        return False, "No GPU available"
     return True, "ok"
 
 
@@ -115,7 +115,7 @@ def compose_tryon_sdxl(
         )
         from transformers import CLIPImageProcessor, CLIPVisionModelWithProjection
     except ImportError as e:
-        raise RuntimeError(f"缺少依赖: {e}")
+        raise RuntimeError(f"Missing dependency: {e}")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.float16 if device.type == "cuda" else torch.float32

@@ -61,12 +61,12 @@ _LICENSE_MODE = os.getenv("LICENSE_MODE", "").strip().lower()
 
 def _license_allows_idm() -> tuple[bool, str]:
     if _LICENSE_MODE == "commercial":
-        return False, "LICENSE_MODE=commercial 禁用 IDM-VTON（CC BY-NC-SA 禁止商用）"
+        return False, "LICENSE_MODE=commercial disables IDM-VTON (CC BY-NC-SA forbids commercial use)"
     if _LICENSE_MODE == "research":
         return True, ""
     if _LICENSE_MODE == "":
-        return False, "未设置 LICENSE_MODE 环境变量，IDM-VTON 默认禁用"
-    return False, f"未知 LICENSE_MODE={_LICENSE_MODE}，仅支持 research 或 commercial"
+        return False, "LICENSE_MODE not set; IDM-VTON disabled by default"
+    return False, f"Unknown LICENSE_MODE={_LICENSE_MODE}; only research or commercial supported"
 
 
 def _idm_vton_available() -> tuple[bool, str]:
@@ -78,15 +78,15 @@ def _idm_vton_available() -> tuple[bool, str]:
     required = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
     missing = [d for d in required if not (ckpt / d).exists()]
     if missing:
-        return False, f"缺少权重: {', '.join(missing)}"
+        return False, f"Missing weights: {', '.join(missing)}"
     if not (ckpt / "unet" / "diffusion_pytorch_model.safetensors").exists() and not (ckpt / "unet" / "diffusion_pytorch_model.bin").exists():
-        return False, "unet 权重文件不存在"
+        return False, "unet weight file missing"
     try:
         import torch
     except ImportError:
-        return False, "未安装 torch"
+        return False, "torch not installed"
     if not torch.cuda.is_available():
-        return False, "无可用 GPU"
+        return False, "No GPU available"
     return True, "ok"
 
 
@@ -245,16 +245,16 @@ _engine_state: dict = {"pipe": None, "available": None, "reason": ""}
 
 def _get_compliance_advice(engine: str, license_mode: str, sdxl_avail: bool) -> str:
     if license_mode == "commercial" and engine == "sdxl-commercial":
-        return "商用模式：使用 SDXL 商用引擎，合规。"
+        return "Commercial mode: using SDXL commercial engine; compliant."
     if license_mode == "commercial" and engine == "no-compliant-engine":
-        return "商用模式：无可用商用引擎，请下载 SDXL 权重或切换 LICENSE_MODE=research。"
+        return "Commercial mode: no commercial engine available; download SDXL weights or switch LICENSE_MODE=research."
     if license_mode == "research" and engine == "idm-vton":
-        return "研究模式：使用 IDM-VTON，仅限非商业用途。"
+        return "Research mode: using IDM-VTON; non-commercial use only."
     if license_mode == "research" and engine == "composite-fallback":
-        return "研究模式：IDM-VTON 不可用，使用合成引擎（效果有限）。"
+        return "Research mode: IDM-VTON unavailable, using composite engine (limited results)."
     if license_mode == "":
-        return "未设置 LICENSE_MODE，使用合成引擎。请设置 research 或 commercial。"
-    return f"当前引擎: {engine}，请确认合规性。"
+        return "LICENSE_MODE not set; using composite engine. Set research or commercial."
+    return f"Current engine: {engine}; please verify compliance."
 
 
 def _load_idm_vton_pipeline():
@@ -413,9 +413,9 @@ def compose_tryon(
             sdxl_avail, sdxl_reason = sdxl_available()
             if sdxl_avail:
                 return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
-            raise RuntimeError(f"commercial 模式无可用商用引擎: {sdxl_reason}")
+            raise RuntimeError(f"commercial mode has no available commercial engine: {sdxl_reason}")
         except ImportError:
-            raise RuntimeError("commercial 模式需要 SDXL 引擎，请安装 diffusers 等依赖")
+            raise RuntimeError("commercial mode requires the SDXL engine; install diffusers and dependencies")
 
     return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
 

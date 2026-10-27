@@ -63,7 +63,7 @@ def serve_file(path: str):
     rel = Path(path)
     target = (DATA / rel).resolve()
     if DATA.resolve() not in target.parents and target != DATA.resolve():
-        raise HTTPException(status_code=404, detail="文件不存在")
+        raise HTTPException(status_code=404, detail="File not found")
     if target.is_file():
         return FileResponse(target)
     uploads_candidate = DATA / "uploads" / rel.name
@@ -73,7 +73,8 @@ def serve_file(path: str):
             return FileResponse(found)
     if uploads_candidate.is_file():
         return FileResponse(uploads_candidate)
-    raise HTTPException(status_code=404, detail="文件不存在")
+    raise HTTPException(status_code=404, detail="File not found")
+
 
 
 class LoginBody(BaseModel):
@@ -150,7 +151,7 @@ class PushBody(BaseModel):
 def login(body: LoginBody):
     user = USERS.get(body.username)
     if not user or user["password"] != body.password:
-        raise HTTPException(status_code=401, detail="账号或密码错误")
+        raise HTTPException(status_code=401, detail="Invalid username or password")
     token = issue_token(body.username)
     return {"token": token, "name": user["name"], "role": user["role"], "username": body.username}
 
@@ -198,7 +199,7 @@ async def api_add_base(
     _: dict = Depends(current_user),
 ):
     if ethnicity not in {e["value"] for e in list_ethnicities()}:
-        raise HTTPException(status_code=400, detail=f"未知人种标签: {ethnicity}")
+        raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {ethnicity}")
     ext = Path(file.filename or "base.png").suffix.lower() or ".png"
     base_id = uid("base")
     filename = f"{base_id}{ext}"
@@ -225,22 +226,22 @@ async def api_add_base(
 def api_patch_base(base_id: str, body: BasePatch, _: dict = Depends(current_user)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     if "ethnicity" in patch and patch["ethnicity"] not in {e["value"] for e in list_ethnicities()}:
-        raise HTTPException(status_code=400, detail=f"未知人种标签: {patch['ethnicity']}")
+        raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {patch['ethnicity']}")
     try:
         return update_base(base_id, patch)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="底座不存在") from exc
+        raise HTTPException(status_code=404, detail="Base model not found") from exc
 
 
 @app.post("/api/bases/batch/patch")
 def api_patch_bases_batch(body: BaseBatchPatch, _: dict = Depends(current_user)):
     patch = {k: v for k, v in body.patch.items() if v is not None}
     if not patch:
-        raise HTTPException(status_code=400, detail="无可更新的属性")
+        raise HTTPException(status_code=400, detail="No updatable fields provided")
     allowed = {"name", "audience", "age_band", "ethnicity", "pose", "notes"}
     patch = {k: v for k, v in patch.items() if k in allowed}
     if "ethnicity" in patch and patch["ethnicity"] not in {e["value"] for e in list_ethnicities()}:
-        raise HTTPException(status_code=400, detail=f"未知人种标签: {patch['ethnicity']}")
+        raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {patch['ethnicity']}")
     updated = []
     for base_id in body.ids:
         try:
@@ -255,7 +256,7 @@ def api_delete_base(base_id: str, _: dict = Depends(current_user)):
     try:
         delete_base(base_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="底座不存在") from exc
+        raise HTTPException(status_code=404, detail="Base model not found") from exc
     return {"ok": True, "id": base_id}
 
 
@@ -269,11 +270,11 @@ def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(current_user)):
     value = body.value.strip()
     label = body.label.strip()
     if not value or not label:
-        raise HTTPException(status_code=400, detail="人种 value 与 label 不能为空")
+        raise HTTPException(status_code=400, detail="Ethnicity value and label must not be empty")
     try:
         return add_ethnicity({"value": value, "label": label})
     except KeyError:
-        raise HTTPException(status_code=400, detail="人种标签已存在")
+        raise HTTPException(status_code=400, detail="Ethnicity tag already exists")
 
 
 @app.patch("/api/ethnicities/{value}")
@@ -282,7 +283,7 @@ def api_patch_ethnicity(value: str, body: EthnicityPatch, _: dict = Depends(curr
     try:
         return update_ethnicity(value, patch)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="人种标签不存在") from exc
+        raise HTTPException(status_code=404, detail="Ethnicity tag not found") from exc
 
 
 @app.delete("/api/ethnicities/{value}")
@@ -290,7 +291,7 @@ def api_delete_ethnicity(value: str, _: dict = Depends(current_user)):
     try:
         delete_ethnicity(value)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="人种标签不存在") from exc
+        raise HTTPException(status_code=404, detail="Ethnicity tag not found") from exc
     return {"ok": True, "value": value}
 
 
@@ -325,7 +326,7 @@ def api_stores(request: Request, _: dict = Depends(current_user)):
 def api_add_store(body: StoreBody, request: Request, _: dict = Depends(current_user)):
     name = body.name.strip()
     if not name:
-        raise HTTPException(status_code=400, detail="店铺名称不能为空")
+        raise HTTPException(status_code=400, detail="Store name must not be empty")
     meta = {
         "id": uid("store"),
         "name": name,
@@ -348,7 +349,7 @@ def api_patch_store(store_id: str, body: StorePatch, _: dict = Depends(current_u
     try:
         return update_store(store_id, patch)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="店铺不存在") from exc
+        raise HTTPException(status_code=404, detail="Store not found") from exc
 
 
 @app.delete("/api/stores/{store_id}")
@@ -356,7 +357,7 @@ def api_delete_store(store_id: str, _: dict = Depends(current_user)):
     try:
         delete_store(store_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="店铺不存在") from exc
+        raise HTTPException(status_code=404, detail="Store not found") from exc
     return {"ok": True, "id": store_id}
 
 
@@ -415,7 +416,7 @@ def api_delete_upload(filename: str, _: dict = Depends(current_user)):
                     p = candidate
                     break
     if not p.exists():
-        raise HTTPException(status_code=404, detail="图片不存在")
+        raise HTTPException(status_code=404, detail="Image not found")
     trash_dest = TRASH / f"upload_{p.parent.name}_{safe_name}"
     if trash_dest.exists():
         trash_dest.unlink()
@@ -439,7 +440,7 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
                     p = candidate
                     break
     if not p.exists():
-        raise HTTPException(status_code=404, detail="图片不存在")
+        raise HTTPException(status_code=404, detail="Image not found")
     category = Path(body.category).name
     if p.parent.name == category:
         return {"ok": True, "filename": safe_name, "category": category}
@@ -456,7 +457,7 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_use
 def api_add_upload_category(body: CategoryBody, _: dict = Depends(current_user)):
     name = Path(body.name).name.strip()
     if not name or name in ("default", "."):
-        raise HTTPException(status_code=400, detail="分类名称无效")
+        raise HTTPException(status_code=400, detail="Invalid category name")
     cat_dir = UPLOADS / name
     cat_dir.mkdir(parents=True, exist_ok=True)
     return {"ok": True, "category": name}
@@ -467,13 +468,13 @@ def api_rename_upload_category(category: str, body: CategoryBody, _: dict = Depe
     src_dir = UPLOADS / Path(category).name
     new_name = Path(body.name).name.strip()
     if not src_dir.is_dir():
-        raise HTTPException(status_code=404, detail="分类不存在")
+        raise HTTPException(status_code=404, detail="Category not found")
     if not new_name or new_name in ("default", "."):
-        raise HTTPException(status_code=400, detail="分类名称无效")
+        raise HTTPException(status_code=400, detail="Invalid category name")
     if new_name == src_dir.name:
         return {"ok": True, "category": new_name}
     if (UPLOADS / new_name).exists():
-        raise HTTPException(status_code=400, detail=f"分类已存在: {new_name}")
+        raise HTTPException(status_code=400, detail=f"Category already exists: {new_name}")
     src_dir.rename(UPLOADS / new_name)
     return {"ok": True, "category": new_name}
 
@@ -482,7 +483,7 @@ def api_rename_upload_category(category: str, body: CategoryBody, _: dict = Depe
 def api_delete_upload_category(category: str, _: dict = Depends(current_user)):
     cat_dir = UPLOADS / Path(category).name
     if not cat_dir.is_dir():
-        raise HTTPException(status_code=404, detail="分类不存在")
+        raise HTTPException(status_code=404, detail="Category not found")
     moved = 0
     for p in cat_dir.iterdir():
         if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
@@ -518,7 +519,7 @@ def api_get_upload(category: str, filename: str, _: dict = Depends(current_user)
     safe_name = Path(filename).name
     p = UPLOADS / safe_category / safe_name
     if not p.exists():
-        raise HTTPException(status_code=404, detail="图片不存在")
+        raise HTTPException(status_code=404, detail="Image not found")
     return {
         "name": p.name,
         "url": public_url(p),
@@ -535,7 +536,7 @@ async def api_upload_to_library(
     _: dict = Depends(current_user),
 ):
     if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="只支持图片文件")
+        raise HTTPException(status_code=400, detail="Only image files are supported")
     suffix = Path(file.filename or "upload.jpg").suffix.lower() or ".jpg"
     safe_name = f"upload_{uuid.uuid4().hex[:8]}{suffix}"
     cat = Path(category).name if category else "default"
@@ -557,7 +558,7 @@ def api_job(job_id: str, _: dict = Depends(current_user)):
     try:
         return get_job(job_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="任务不存在") from exc
+        raise HTTPException(status_code=404, detail="Job not found") from exc
 
 
 @app.post("/api/jobs/batch")
@@ -571,7 +572,7 @@ async def api_batch(
     _: dict = Depends(current_user),
 ):
     if not files:
-        raise HTTPException(status_code=400, detail="请至少上传一件服装图")
+        raise HTTPException(status_code=400, detail="Please upload at least one garment image")
     jobs = []
     for upload in files:
         raw = await upload.read()
@@ -601,9 +602,9 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(current_user)):
     try:
         job = get_job(job_id)
     except KeyError as exc:
-        raise HTTPException(status_code=404, detail="任务不存在") from exc
+        raise HTTPException(status_code=404, detail="Job not found") from exc
     if job["status"] != "done":
-        raise HTTPException(status_code=400, detail="仅已完成的成品可推送到商品页")
+        raise HTTPException(status_code=400, detail="Only completed results can be pushed to a product page")
     stores = list_stores()
     store_ids = body.store_ids or []
     if not store_ids:
@@ -611,7 +612,7 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(current_user)):
     existing = {s["id"]: s for s in stores}
     store_ids = [sid for sid in store_ids if sid in existing]
     if not store_ids:
-        raise HTTPException(status_code=400, detail="未找到可推送的店铺，请先在「店铺嵌入」页添加")
+        raise HTTPException(status_code=400, detail="No pushable store found; add one on the Store Embed page first")
 
     push_body = {
         "sku": body.sku or job.get("sku", ""),
@@ -629,13 +630,13 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(current_user)):
             pushed.append(sid)
             push_notes.append(f"{store['name']}: {res['message']}")
         else:
-            push_notes.append(f"{store['name']}: 失败 {res['message']}")
+            push_notes.append(f"{store['name']}: failed {res['message']}")
 
     prev = job.get("pushed_stores", [])
     for sid in pushed:
         if sid not in prev:
             prev.append(sid)
-    message = "; ".join(push_notes) if push_notes else "未推送任何店铺"
+    message = "; ".join(push_notes) if push_notes else "No store pushed"
     return patch_job(
         job_id,
         {
@@ -661,7 +662,7 @@ def license_status():
         "commercial_compliant": status["commercial_compliant"],
         "idm_vton_available": status["idm_vton_available"],
         "idm_vton_license": "CC BY-NC-SA 4.0",
-        "idm_vton_commercial_use": "禁止",
+        "idm_vton_commercial_use": "Forbidden",
         "sdxl_available": status["sdxl_available"],
         "gpu_available": status["gpu_available"],
         "current_engine": status["engine"],
@@ -673,6 +674,6 @@ def license_status():
 def download(job_id: str, _: dict = Depends(current_user)):
     job = get_job(job_id)
     if not job.get("result_url"):
-        raise HTTPException(status_code=404, detail="成品尚未生成")
+        raise HTTPException(status_code=404, detail="Result not generated yet")
     path = RESULTS / Path(job["result_url"]).name
     return FileResponse(path, filename=f"{job.get('title') or job_id}{path.suffix}")

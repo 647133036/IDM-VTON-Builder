@@ -102,6 +102,6 @@ def test_worker_marks_missing_source_as_failed():
                 break
         assert final is not None
         assert final["status"] == "failed"
-        assert "原图不存在" in final.get("error", "")
+        assert "Garment source image missing" in final.get("error", "")
     finally:
         pool.join()

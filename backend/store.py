@@ -23,16 +23,16 @@ for p in (JOBS_DIR, UPLOADS, RESULTS, BASES, TRASH):
 _lock = threading.Lock()
 
 ETHNICITY_DEFAULTS = [
-    {"value": "western_europe", "label": "西欧"},
-    {"value": "eastern_europe", "label": "东欧"},
-    {"value": "west_asia", "label": "西亚"},
-    {"value": "central_asia", "label": "中亚"},
-    {"value": "east_asia", "label": "东亚"},
-    {"value": "southeast_asia", "label": "东南亚"},
-    {"value": "africa", "label": "非洲"},
-    {"value": "north_america", "label": "北美"},
-    {"value": "south_america", "label": "南美"},
-    {"value": "oceania", "label": "澳洲"},
+    {"value": "western_europe", "label": "Western Europe"},
+    {"value": "eastern_europe", "label": "Eastern Europe"},
+    {"value": "west_asia", "label": "West Asia"},
+    {"value": "central_asia", "label": "Central Asia"},
+    {"value": "east_asia", "label": "East Asia"},
+    {"value": "southeast_asia", "label": "Southeast Asia"},
+    {"value": "africa", "label": "Africa"},
+    {"value": "north_america", "label": "North America"},
+    {"value": "south_america", "label": "South America"},
+    {"value": "oceania", "label": "Oceania"},
 ]
 
 DEFAULT_STATE = {
@@ -128,53 +128,53 @@ def seed_bases_if_empty() -> None:
             catalog = [
                 {
                     "id": "base_women_01",
-                    "name": "女装 · 前视模特 A",
+                    "name": "Women · Front-view Model A",
                     "audience": "women",
                     "age_band": "adult",
                     "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "women_01.png",
-                    "notes": "正面站姿，手臂微张，适合上衣/连衣裙",
+                    "notes": "Front standing pose, arms slightly spread; suits tops/dresses",
                 },
                 {
                     "id": "base_men_01",
-                    "name": "男装 · 前视模特 A",
+                    "name": "Men · Front-view Model A",
                     "audience": "men",
                     "age_band": "adult",
                     "ethnicity": "western_europe",
                     "pose": "front",
                     "file": "men_01.png",
-                    "notes": "正面站姿，适合 T 恤/衬衫/针织",
+                    "notes": "Front standing pose; suits t-shirts/shirts/knitwear",
                 },
                 {
                     "id": "base_girl_01",
-                    "name": "女童 · 前视模特",
+                    "name": "Girls · Front-view Model",
                     "audience": "girls",
                     "age_band": "kids",
                     "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "girl_01.png",
-                    "notes": "约 7 岁女童，适合童装上衣/裙子",
+                    "notes": "Girl about 7 years old; suits kids tops/skirts",
                 },
                 {
                     "id": "base_boy_01",
-                    "name": "男童 · 前视模特",
+                    "name": "Boys · Front-view Model",
                     "audience": "boys",
                     "age_band": "kids",
                     "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "boy_01.png",
-                    "notes": "约 7 岁男童，适合童装 T 恤/短裤",
+                    "notes": "Boy about 7 years old; suits kids t-shirts/shorts",
                 },
                 {
                     "id": "base_baby_01",
-                    "name": "婴幼儿 · 前视模特",
+                    "name": "Baby · Front-view Model",
                     "audience": "baby",
                     "age_band": "baby",
                     "ethnicity": "east_asia",
                     "pose": "front",
                     "file": "baby_01.png",
-                    "notes": "约 2 岁婴幼儿，适合连体衣/哈衣",
+                    "notes": "Baby about 2 years old; suits onesies/rompers",
                 },
             ]
             now = _now()
@@ -283,7 +283,7 @@ def create_job(payload: dict) -> dict:
             "result_url": "",
             "preview_url": "",
             "progress": 0,
-            "message": "已进入队列",
+            "message": "Queued",
             "error": "",
         }
         state["jobs"].insert(0, job)
@@ -321,7 +321,7 @@ def claim_next_job() -> Optional[dict]:
             if item["status"] == "queued":
                 item["status"] = "running"
                 item["progress"] = 5
-                item["message"] = "worker 已领取，开始处理"
+                item["message"] = "Worker claimed, processing started"
                 item["updated_at"] = _now()
                 return copy.deepcopy(item)
         return None

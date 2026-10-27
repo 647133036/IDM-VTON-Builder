@@ -44,7 +44,7 @@ def test_push_store_unknown_platform_only_labels():
     store = {"platform": "taobao", "name": "淘宝店"}
     res = push_store(job, store, {})
     assert res["ok"] is True
-    assert "仅打标" in res["message"]
+    assert "tagged only" in res["message"]
 
 
 def test_push_store_missing_result_returns_failure():
@@ -151,7 +151,7 @@ def test_push_shopify_lookup_by_sku_when_no_product_id(done_job, monkeypatch):
     }
     res = push_store(done_job, store, {})
     assert res["ok"] is True
-    assert "商品 #111" in res["message"]
+    assert "product #111" in res["message"]
 
 
 def test_push_shopify_not_found_by_sku_returns_failure(done_job, monkeypatch):
@@ -174,7 +174,7 @@ def test_push_shopify_not_found_by_sku_returns_failure(done_job, monkeypatch):
     }
     res = push_store(done_job, store, {})
     assert res["ok"] is False
-    assert "未找到商品" in res["message"]
+    assert "no product found" in res["message"]
 
 
 def test_push_wordpress_success(done_job, monkeypatch):
@@ -202,7 +202,7 @@ def test_push_wordpress_success(done_job, monkeypatch):
     }
     res = push_store(done_job, store, {})
     assert res["ok"] is True
-    assert "关联 WooCommerce 商品 #77" in res["message"]
+    assert "linked WooCommerce product #77" in res["message"]
     assert calls["auth"] == ("user", "app")
 
 
@@ -250,7 +250,7 @@ def test_push_wordpress_without_product_id_uploads_only(done_job, monkeypatch):
     }
     res = push_store(done_job, store, {"sku": "SKU-001"})
     assert res["ok"] is True
-    assert "未关联商品" in res["message"]
+    assert "no product linked" in res["message"]
 
 
 def test_push_network_error_caught(done_job, monkeypatch):
@@ -269,4 +269,4 @@ def test_push_network_error_caught(done_job, monkeypatch):
     }
     res = push_store(done_job, store, {})
     assert res["ok"] is False
-    assert "网络请求失败" in res["message"]
+    assert "Network request failed" in res["message"]

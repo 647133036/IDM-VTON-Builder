@@ -41,10 +41,10 @@ def decode_token(token: str) -> dict:
     try:
         return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except jwt.PyJWTError as exc:
-        raise HTTPException(status_code=401, detail="登录已过期，请重新登录") from exc
+        raise HTTPException(status_code=401, detail="Session expired, please log in again") from exc
 
 
 def current_user(creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer)) -> dict:
     if creds is None:
-        raise HTTPException(status_code=401, detail="需要登录")
+        raise HTTPException(status_code=401, detail="Login required")
     return decode_token(creds.credentials)

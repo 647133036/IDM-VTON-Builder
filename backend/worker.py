@@ -20,10 +20,10 @@ def _base_file(base: dict) -> Path:
 
 
 def process_job(job: dict, bases: list[dict]) -> None:
-    patch_job(job["id"], {"progress": 8, "message": "读取底图与服装"})
+    patch_job(job["id"], {"progress": 8, "message": "Reading base and garment"})
     base = next((b for b in bases if b["id"] == job["base_id"]), None)
     if not base:
-        raise RuntimeError("未找到指定模特底座")
+        raise RuntimeError("Base model not found")
     src = UPLOADS / Path(job["source_url"]).name if job.get("source_url") else None
     if not (src and src.exists()):
         src = UPLOADS / job["source_name"] if job.get("source_name") else None
@@ -31,10 +31,10 @@ def process_job(job: dict, bases: list[dict]) -> None:
         name = Path(job.get("source_url") or job.get("source_name", "")).name
         src = find_in_dir(UPLOADS, name)
     if not (src and src.exists()):
-        raise RuntimeError("服装原图不存在")
+        raise RuntimeError("Garment source image missing")
     base_path = _base_file(base)
     if not base_path.exists():
-        raise RuntimeError("模特底图文件缺失，请先上传底座")
+        raise RuntimeError("Base model image missing; upload a base first")
 
     audience = job.get("audience") or "auto"
     if audience == "auto":
@@ -43,17 +43,17 @@ def process_job(job: dict, bases: list[dict]) -> None:
     if garment_type == "auto":
         garment_type = guess_garment_type(job.get("source_name", ""))
 
-    patch_job(job["id"], {"progress": 28, "message": "分割服装并估计垂感", "audience": audience, "garment_type": garment_type})
+    patch_job(job["id"], {"progress": 28, "message": "Segmenting garment and estimating drape", "audience": audience, "garment_type": garment_type})
     cfg = load_settings()
     long_side = int(cfg.get("output_long_side", 2048))
     background = job.get("background") or cfg.get("background", "white")
     engine_info = engine_status()
     engine_name = engine_info["engine"]
-    engine_label = "IDM-VTON 扩散模型" if engine_info["idm_vton_available"] else "合成引擎（无GPU回退）"
-    patch_job(job["id"], {"progress": 35, "message": f"调用 {engine_label}"})
+    engine_label = "IDM-VTON diffusion engine" if engine_info["idm_vton_available"] else "composite engine (no-GPU fallback)"
+    patch_job(job["id"], {"progress": 35, "message": f"Calling {engine_label}"})
     ethnicity = base.get("ethnicity") or ""
     result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
-    patch_job(job["id"], {"progress": 78, "message": "输出成品图"})
+    patch_job(job["id"], {"progress": 78, "message": "Rendering final image"})
 
     ext = "png" if job.get("output_format") == "png" or background == "transparent" else "jpg"
     out_path = RESULTS / f"{job['id']}.{ext}"
@@ -70,7 +70,7 @@ def process_job(job: dict, bases: list[dict]) -> None:
         {
             "status": "done",
             "progress": 100,
-            "message": "已完成，可下载或推送到商品页",
+            "message": "Done; download or push to product page",
             "result_url": f"/files/results/{out_path.name}",
             "preview_url": f"/files/results/{preview.name}",
         },
@@ -95,7 +95,7 @@ def _worker_loop() -> None:
                     {
                         "status": "failed",
                         "progress": 100,
-                        "message": "生成失败",
+                        "message": "Generation failed",
                         "error": str(exc),
                     },
                 )

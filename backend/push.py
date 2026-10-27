@@ -1,10 +1,11 @@
-"""实物成品图推送适配器。
+"""Final image push adapters.
 
-按店铺 platform 分发到 Shopify Admin API / WordPress REST API，
-把任务成品图上传到平台并关联到指定商品。凭证字段：
-  - api_key   Shopify: Admin Access Token；WordPress: "用户名:应用密码"
-  - shop_url  Shopify: {shop}.myshopify.com（可带协议）；WordPress: 站点根地址
-  - product_id 可选；未提供时按任务 SKU 在平台回查商品
+Dispatch by store platform to Shopify Admin API / WordPress REST API:
+upload the job result image to the platform and link it to the target product.
+Credentials:
+  - api_key   Shopify: Admin Access Token; WordPress: "username:app-password"
+  - shop_url  Shopify: {shop}.myshopify.com (protocol optional); WordPress: site root URL
+  - product_id optional; if absent, look up the product by job SKU on the platform
 """
 
 import base64
@@ -23,18 +24,18 @@ class PushError(RuntimeError):
 
 def _result_path(job: dict) -> Path:
     if not job.get("result_url"):
-        raise PushError("成品尚未生成")
+        raise PushError("Result not generated yet")
     fname = Path(job["result_url"]).name
     path = RESULTS / fname
     if not path.exists():
-        raise PushError(f"成品文件缺失: {fname}")
+        raise PushError(f"Result file missing: {fname}")
     return path
 
 
 def _shopify_shop(store: dict) -> str:
     shop = (store.get("shop_url") or "").strip()
     if not shop:
-        raise PushError("店铺缺少 Shopify 域名（shop_url）")
+        raise PushError("Store missing Shopify domain (shop_url)")
     if not shop.startswith("http"):
         shop = f"https://{shop}"
     return shop.rstrip("/")
@@ -43,14 +44,14 @@ def _shopify_shop(store: dict) -> str:
 def _shopify_token(store: dict) -> str:
     token = (store.get("api_key") or "").strip()
     if not token:
-        raise PushError("店铺缺少 Shopify Admin Access Token 或 API Key（api_key）")
+        raise PushError("Store missing Shopify Admin Access Token or API key (api_key)")
     return token
 
 
 def _wp_site(store: dict) -> str:
     site = (store.get("shop_url") or "").strip()
     if not site:
-        raise PushError("店铺缺少 WordPress 站点地址（shop_url）")
+        raise PushError("Store missing WordPress site URL (shop_url)")
     if not site.startswith("http"):
         site = f"https://{site}"
     return site.rstrip("/")
@@ -59,10 +60,10 @@ def _wp_site(store: dict) -> str:
 def _wp_auth(store: dict) -> tuple[str, str]:
     cred = (store.get("api_key") or "").strip()
     if ":" not in cred:
-        raise PushError("WordPress 店铺的 api_key 需为「用户名:应用密码」格式")
+        raise PushError("WordPress store api_key must be in 'username:app-password' format")
     user, _, password = cred.partition(":")
     if not user or not password:
-        raise PushError("WordPress 店铺的 api_key 需为「用户名:应用密码」格式")
+        raise PushError("WordPress store api_key must be in 'username:app-password' format")
     return user, password
 
 
@@ -70,11 +71,11 @@ def _resolve_shopify_product_id(job: dict, store: dict, body: dict, fix: str, to
     pid = str((body.get("product_id") or store.get("product_id") or "")).strip()
     if pid:
         if not pid.isdigit():
-            raise PushError(f"product_id 应为数字（Shopify 商品 ID），收到: {pid}")
+            raise PushError(f"product_id must be numeric (Shopify product ID), got: {pid}")
         return pid
     sku = (job.get("sku") or body.get("sku") or "").strip()
     if not sku:
-        raise PushError("未提供 product_id，且任务无 SKU 可用于回查商品")
+        raise PushError("No product_id provided and job has no SKU to look up")
     r = requests.get(
         f"{fix}/admin/api/{SHOPIFY_API_VERSION}/products.json",
         params={"title": sku},
@@ -82,10 +83,10 @@ def _resolve_shopify_product_id(job: dict, store: dict, body: dict, fix: str, to
         timeout=30,
     )
     if r.status_code >= 400:
-        raise PushError(f"Shopify 查询商品失败 ({r.status_code}): {r.text[:200]}")
+        raise PushError(f"Shopify product lookup failed ({r.status_code}): {r.text[:200]}")
     products = r.json().get("products", [])
     if not products:
-        raise PushError(f"Shopify 按 SKU/标题未找到商品: {sku}")
+        raise PushError(f"Shopify: no product found by SKU/title: {sku}")
     return str(products[0]["id"])
 
 
@@ -93,11 +94,11 @@ def _resolve_wp_product_id(job: dict, store: dict, body: dict) -> str:
     pid = str((body.get("product_id") or store.get("product_id") or "")).strip()
     if pid:
         if not pid.isdigit():
-            raise PushError(f"product_id 应为数字（WooCommerce 商品 ID），收到: {pid}")
+            raise PushError(f"product_id must be numeric (WooCommerce product ID), got: {pid}")
         return pid
     sku = (job.get("sku") or body.get("sku") or "").strip()
     if not sku:
-        raise PushError("未提供 product_id，且任务无 SKU 可用于回查商品")
+        raise PushError("No product_id provided and job has no SKU to look up")
     return f"sku:{sku}"
 
 
@@ -127,11 +128,11 @@ def push_shopify(job: dict, store: dict, body: dict) -> dict[str, Any]:
         data = {}
     if r.status_code >= 400:
         msg = data.get("errors") or data or r.text
-        raise PushError(f"Shopify 上传图片失败 ({r.status_code}): {msg}")
+        raise PushError(f"Shopify image upload failed ({r.status_code}): {msg}")
     src = data.get("image", {}).get("src", "")
     if not src:
-        raise PushError(f"Shopify 未返回图片地址: {data}")
-    return {"ok": True, "url": src, "message": f"已上传并关联 Shopify 商品 #{product_id}"}
+        raise PushError(f"Shopify did not return image URL: {data}")
+    return {"ok": True, "url": src, "message": f"Uploaded and linked Shopify product #{product_id}"}
 
 
 def push_wordpress(job: dict, store: dict, body: dict) -> dict[str, Any]:
@@ -154,11 +155,11 @@ def push_wordpress(job: dict, store: dict, body: dict) -> dict[str, Any]:
         data = {}
     if r.status_code >= 400:
         msg = data.get("message") if isinstance(data, dict) else data
-        raise PushError(f"WordPress 上传媒体失败 ({r.status_code}): {msg or r.text[:200]}")
+        raise PushError(f"WordPress media upload failed ({r.status_code}): {msg or r.text[:200]}")
     media_id = data.get("id")
     url = data.get("source_url") or (data.get("guid") or {}).get("rendered", "")
     if not media_id:
-        raise PushError(f"WordPress 未返回媒体 ID: {data}")
+        raise PushError(f"WordPress did not return media ID: {data}")
     if product_ref.isdigit():
         up = requests.post(
             f"{site}/wp-json/wc/v3/products/{product_ref}",
@@ -172,9 +173,9 @@ def push_wordpress(job: dict, store: dict, body: dict) -> dict[str, Any]:
             up_data = {}
         if up.status_code >= 400:
             msg = up_data.get("message") if isinstance(up_data, dict) else up_data
-            raise PushError(f"WooCommerce 关联商品失败 ({up.status_code}): {msg or up.text[:200]}")
-        return {"ok": True, "url": url, "message": f"已上传媒体并关联 WooCommerce 商品 #{product_ref}"}
-    return {"ok": True, "url": url, "message": f"已上传媒体（SKU {product_ref.split(':')[1] or ''}，未关联商品）"}
+            raise PushError(f"WooCommerce product link failed ({up.status_code}): {msg or up.text[:200]}")
+        return {"ok": True, "url": url, "message": f"Uploaded media and linked WooCommerce product #{product_ref}"}
+    return {"ok": True, "url": url, "message": f"Uploaded media (SKU {product_ref.split(':')[1] or ''}, no product linked)"}
 
 
 PUSHERS = {
@@ -187,12 +188,12 @@ def push_store(job: dict, store: dict, body: dict) -> dict[str, Any]:
     platform = (store.get("platform") or "other").lower()
     fn = PUSHERS.get(platform)
     if fn is None:
-        return {"ok": True, "url": "", "message": "平台未配置适配器，仅打标推送"}
+        return {"ok": True, "url": "", "message": "No adapter configured for platform; push tagged only"}
     try:
         return fn(job, store, body)
     except PushError as exc:
         return {"ok": False, "url": "", "message": str(exc)}
     except requests.RequestException as exc:
-        return {"ok": False, "url": "", "message": f"网络请求失败: {exc}"}
+        return {"ok": False, "url": "", "message": f"Network request failed: {exc}"}
     except Exception as exc:
-        return {"ok": False, "url": "", "message": f"推送失败: {exc}"}
+        return {"ok": False, "url": "", "message": f"Push failed: {exc}"}
