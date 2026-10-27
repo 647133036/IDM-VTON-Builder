@@ -1,8 +1,13 @@
+import os
 import sys
 import tempfile
 from pathlib import Path
 
 import pytest
+
+os.environ.setdefault("STORE_ADMIN_PASSWORD", "admin123")
+os.environ.setdefault("STORE_STAFF_PASSWORD", "staff123")
+os.environ.setdefault("STORE_JWT_SECRET", "test-secret-key-for-unit-tests-only-32bytes!")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 

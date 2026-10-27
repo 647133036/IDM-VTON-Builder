@@ -267,6 +267,83 @@ def test_files_path_traversal_blocked(client):
     assert r.status_code in (404, 400)
 
 
+def test_files_state_json_blocked(client, auth_headers):
+    assert client.get("/files/state.json", headers=auth_headers).status_code == 404
+    assert client.get("/files/state.json").status_code == 401
+
+
+def test_files_requires_auth(client):
+    assert client.get("/files/results/dummy.png").status_code == 401
+
+
+def test_upload_html_rejected(client, auth_headers):
+    r = client.post(
+        "/api/uploads",
+        files=[("file", ("evil.html", b"<script>alert(1)</script>", "image/png"))],
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+
+
+def test_upload_category_traversal_blocked(client, auth_headers):
+    r = client.post(
+        "/api/uploads/categories",
+        json={"name": ".."},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    r2 = client.post(
+        "/api/uploads/categories",
+        json={"name": "."},
+        headers=auth_headers,
+    )
+    assert r2.status_code == 400
+
+
+def test_delete_upload_dot_blocked(client, auth_headers):
+    r = client.delete("/api/uploads/%2E", headers=auth_headers)
+    assert r.status_code == 400
+
+
+def test_stores_api_key_masked(client, auth_headers):
+    r = client.post(
+        "/api/stores",
+        json={"name": "Test Store", "platform": "shopify", "api_key": "shpat_super_secret_token_12345"},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    store_id = r.json()["id"]
+    listing = client.get("/api/stores", headers=auth_headers)
+    found = [s for s in listing.json() if s["id"] == store_id][0]
+    assert found["api_key"] == ""
+    assert found["has_api_key"] is True
+    assert "super_secret" not in found.get("api_key_masked", "")
+
+
+def test_staff_cannot_delete_base(client):
+    r = client.post(
+        "/api/auth/login",
+        json={"username": "staff", "password": "staff123"},
+    )
+    assert r.status_code == 200
+    staff_headers = {"Authorization": f"Bearer {r.json()['token']}"}
+    assert client.delete("/api/bases/base_women_01", headers=staff_headers).status_code == 403
+
+
+def test_staff_cannot_push(client, auth_headers):
+    from fastapi.testclient import TestClient
+    r = client.post(
+        "/api/auth/login",
+        json={"username": "staff", "password": "staff123"},
+    )
+    staff_headers = {"Authorization": f"Bearer {r.json()['token']}"}
+    assert client.post(
+        "/api/jobs/base_women_01/push",
+        json={"sku": "test"},
+        headers=staff_headers,
+    ).status_code in (403, 404)
+
+
 def test_update_settings(client, auth_headers):
     r = client.patch("/api/settings", json={"store_name": "MannequinForge Test"}, headers=auth_headers)
     assert r.status_code == 200

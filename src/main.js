@@ -92,8 +92,8 @@ function loginView() {
       <div class="login-card">
         <h1>MannequinForge</h1>
         <p>${t('login.subtitle')}</p>
-        <label>${t('login.acc')}<input id="u" value="admin" /></label>
-        <label>${t('login.pwd')}<input id="p" type="password" value="admin123" /></label>
+        <label>${t('login.acc')}<input id="u" /></label>
+        <label>${t('login.pwd')}<input id="p" type="password" /></label>
         <button class="btn gold" id="login">${t('login.btn')}</button>
         <button class="btn ghost" id="login-lang" style="width:100%;margin-top:10px">${getLang() === 'zh' ? 'Switch to English' : '切换到中文'}</button>
         <p class="err" id="login-err"></p>

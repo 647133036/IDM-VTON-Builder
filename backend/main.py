@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Optional
-import shutil
+import re
 import uuid
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -8,8 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from auth import USERS, current_user, issue_token
-from engine import engine_status, guess_audience, guess_garment_type
+from auth import USERS, current_user, issue_token, require_admin
+from engine import engine_status
 from store import (
     BASES,
     DATA,
@@ -49,7 +49,7 @@ app = FastAPI(title="Atelier Try-On", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -57,23 +57,70 @@ app.add_middleware(
 seed_bases_if_empty()
 start_worker()
 
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp"}
+_MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+_PUBLIC_DIRS = {"uploads", "results", "bases"}
+
+
+def _resolve_public_file(path: str) -> Path | None:
+    rel = Path(path)
+    parts = rel.parts
+    if not parts:
+        return None
+    top = parts[0]
+    if top not in _PUBLIC_DIRS:
+        return None
+    target = (DATA / rel).resolve()
+    data_root = DATA.resolve()
+    if target != data_root / top and data_root / top not in target.parents:
+        return None
+    if not target.is_file():
+        if top == "uploads":
+            found = find_in_dir(UPLOADS, rel.name)
+            if found:
+                return found
+        return None
+    return target
+
+
+def _safe_name(value: str) -> str:
+    name = value.strip()
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid name")
+    if not _SAFE_NAME_RE.match(name):
+        raise HTTPException(status_code=400, detail="Invalid name: use letters, digits, dot, dash, underscore only")
+    return name
+
+
+def _validate_image_bytes(raw: bytes, fallback_ext: str = ".png") -> tuple[bytes, str]:
+    if len(raw) > _MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 20MB)")
+    import io
+    from PIL import Image
+    try:
+        img = Image.open(io.BytesIO(raw))
+        img.verify()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid image file") from exc
+    fmt = (img.format or "").upper()
+    ext_map = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp"}
+    ext = ext_map.get(fmt, fallback_ext)
+    if ext not in _IMAGE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Unsupported image format; use PNG, JPEG, or WEBP")
+    return raw, ext
+
 
 @app.get("/files/{path:path}")
-def serve_file(path: str):
-    rel = Path(path)
-    target = (DATA / rel).resolve()
-    if DATA.resolve() not in target.parents and target != DATA.resolve():
+def serve_file(path: str, _: dict = Depends(current_user)):
+    target = _resolve_public_file(path)
+    if target is None:
         raise HTTPException(status_code=404, detail="File not found")
-    if target.is_file():
-        return FileResponse(target)
-    uploads_candidate = DATA / "uploads" / rel.name
-    if str(rel).startswith("uploads"):
-        found = find_in_dir(UPLOADS, rel.name)
-        if found:
-            return FileResponse(found)
-    if uploads_candidate.is_file():
-        return FileResponse(uploads_candidate)
-    raise HTTPException(status_code=404, detail="File not found")
+    suffix = target.suffix.lower()
+    if suffix not in _IMAGE_SUFFIXES:
+        raise HTTPException(status_code=404, detail="File not found")
+    headers = {"X-Content-Type-Options": "nosniff"}
+    return FileResponse(target, headers=headers)
 
 
 
@@ -135,11 +182,6 @@ class StorePatch(BaseModel):
     product_id: Optional[str] = None
 
 
-class MoveBody(BaseModel):
-    category: str = "default"
-    active: Optional[bool] = None
-
-
 class PushBody(BaseModel):
     sku: Optional[str] = ""
     product_url: Optional[str] = ""
@@ -172,7 +214,7 @@ def api_settings(_: dict = Depends(current_user)):
 
 
 @app.patch("/api/settings")
-def api_update_settings(body: SettingsBody, _: dict = Depends(current_user)):
+def api_update_settings(body: SettingsBody, _: dict = Depends(require_admin)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     return update_settings(patch)
 
@@ -200,11 +242,12 @@ async def api_add_base(
 ):
     if ethnicity not in {e["value"] for e in list_ethnicities()}:
         raise HTTPException(status_code=400, detail=f"Unknown ethnicity tag: {ethnicity}")
-    ext = Path(file.filename or "base.png").suffix.lower() or ".png"
+    content = await file.read()
+    _, ext = _validate_image_bytes(content, ".png")
     base_id = uid("base")
     filename = f"{base_id}{ext}"
     dest = BASES / filename
-    dest.write_bytes(await file.read())
+    dest.write_bytes(content)
     meta = {
         "id": base_id,
         "name": name,
@@ -252,7 +295,7 @@ def api_patch_bases_batch(body: BaseBatchPatch, _: dict = Depends(current_user))
 
 
 @app.delete("/api/bases/{base_id}")
-def api_delete_base(base_id: str, _: dict = Depends(current_user)):
+def api_delete_base(base_id: str, _: dict = Depends(require_admin)):
     try:
         delete_base(base_id)
     except KeyError as exc:
@@ -266,7 +309,7 @@ def api_ethnicities(_: dict = Depends(current_user)):
 
 
 @app.post("/api/ethnicities")
-def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(current_user)):
+def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(require_admin)):
     value = body.value.strip()
     label = body.label.strip()
     if not value or not label:
@@ -278,7 +321,7 @@ def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(current_user)):
 
 
 @app.patch("/api/ethnicities/{value}")
-def api_patch_ethnicity(value: str, body: EthnicityPatch, _: dict = Depends(current_user)):
+def api_patch_ethnicity(value: str, body: EthnicityPatch, _: dict = Depends(require_admin)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
         return update_ethnicity(value, patch)
@@ -287,7 +330,7 @@ def api_patch_ethnicity(value: str, body: EthnicityPatch, _: dict = Depends(curr
 
 
 @app.delete("/api/ethnicities/{value}")
-def api_delete_ethnicity(value: str, _: dict = Depends(current_user)):
+def api_delete_ethnicity(value: str, _: dict = Depends(require_admin)):
     try:
         delete_ethnicity(value)
     except KeyError as exc:
@@ -317,13 +360,18 @@ def api_stores(request: Request, _: dict = Depends(current_user)):
     items = []
     for s in list_stores():
         item = dict(s)
+        key = item.get("api_key", "")
+        item["api_key"] = ""
+        item["has_api_key"] = bool(key)
+        if key:
+            item["api_key_masked"] = key[:2] + "***" + key[-2:] if len(key) > 4 else "***"
         item["embed_url"] = embed_url(origin, s["id"])
         items.append(item)
     return items
 
 
 @app.post("/api/stores")
-def api_add_store(body: StoreBody, request: Request, _: dict = Depends(current_user)):
+def api_add_store(body: StoreBody, request: Request, _: dict = Depends(require_admin)):
     name = body.name.strip()
     if not name:
         raise HTTPException(status_code=400, detail="Store name must not be empty")
@@ -344,7 +392,7 @@ def api_add_store(body: StoreBody, request: Request, _: dict = Depends(current_u
 
 
 @app.patch("/api/stores/{store_id}")
-def api_patch_store(store_id: str, body: StorePatch, _: dict = Depends(current_user)):
+def api_patch_store(store_id: str, body: StorePatch, _: dict = Depends(require_admin)):
     patch = {k: v for k, v in body.model_dump().items() if v is not None}
     try:
         return update_store(store_id, patch)
@@ -353,7 +401,7 @@ def api_patch_store(store_id: str, body: StorePatch, _: dict = Depends(current_u
 
 
 @app.delete("/api/stores/{store_id}")
-def api_delete_store(store_id: str, _: dict = Depends(current_user)):
+def api_delete_store(store_id: str, _: dict = Depends(require_admin)):
     try:
         delete_store(store_id)
     except KeyError as exc:
@@ -370,20 +418,21 @@ def api_jobs(_: dict = Depends(current_user)):
 def api_list_uploads(category: Optional[str] = None, _: dict = Depends(current_user)):
     items = []
     if category:
-        cat_dir = UPLOADS / Path(category).name
+        cat = _safe_name(category)
+        cat_dir = UPLOADS / cat
         if cat_dir.exists():
             for p in sorted(cat_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-                if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
                     items.append({
                         "name": p.name,
                         "url": public_url(p),
                         "size": p.stat().st_size,
                         "mtime": int(p.stat().st_mtime),
-                        "category": Path(category).name,
+                        "category": cat,
                     })
     else:
         for p in sorted(UPLOADS.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-            if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+            if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
                 items.append({
                     "name": p.name,
                     "url": public_url(p),
@@ -393,7 +442,7 @@ def api_list_uploads(category: Optional[str] = None, _: dict = Depends(current_u
                 })
             elif p.is_dir():
                 for f in sorted(p.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
-                    if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+                    if f.is_file() and f.suffix.lower() in _IMAGE_SUFFIXES:
                         items.append({
                             "name": f.name,
                             "url": public_url(f),
@@ -405,18 +454,20 @@ def api_list_uploads(category: Optional[str] = None, _: dict = Depends(current_u
 
 
 @app.delete("/api/uploads/{filename}")
-def api_delete_upload(filename: str, _: dict = Depends(current_user)):
-    safe_name = Path(filename).name
+def api_delete_upload(filename: str, _: dict = Depends(require_admin)):
+    safe_name = _safe_name(filename)
     p = UPLOADS / safe_name
-    if not p.exists():
+    if not p.is_file():
         for d in UPLOADS.iterdir():
             if d.is_dir():
                 candidate = d / safe_name
-                if candidate.exists():
+                if candidate.is_file():
                     p = candidate
                     break
-    if not p.exists():
+    if not p.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
+    if p.suffix.lower() not in _IMAGE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Only image files can be deleted here")
     trash_dest = TRASH / f"upload_{p.parent.name}_{safe_name}"
     if trash_dest.exists():
         trash_dest.unlink()
@@ -430,47 +481,51 @@ class MoveBody(BaseModel):
 
 @app.post("/api/uploads/{filename}/move")
 def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(current_user)):
-    safe_name = Path(filename).name
+    safe_name = _safe_name(filename)
     p = UPLOADS / safe_name
-    if not p.exists():
+    if not p.is_file():
         for d in UPLOADS.iterdir():
             if d.is_dir():
                 candidate = d / safe_name
-                if candidate.exists():
+                if candidate.is_file():
                     p = candidate
                     break
-    if not p.exists():
+    if not p.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
-    category = Path(body.category).name
+    if p.suffix.lower() not in _IMAGE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="Only image files can be moved here")
+    category = _safe_name(body.category) if body.category else "default"
     if p.parent.name == category:
         return {"ok": True, "filename": safe_name, "category": category}
     cat_dir = UPLOADS / category
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
-    if dest.exists():
-        dest.unlink()
+    i = 1
+    while dest.exists():
+        dest = cat_dir / f"{Path(safe_name).stem}_{i}{Path(safe_name).suffix}"
+        i += 1
     p.replace(dest)
     return {"ok": True, "filename": safe_name, "category": category}
 
 
 @app.post("/api/uploads/categories")
 def api_add_upload_category(body: CategoryBody, _: dict = Depends(current_user)):
-    name = Path(body.name).name.strip()
-    if not name or name in ("default", "."):
-        raise HTTPException(status_code=400, detail="Invalid category name")
+    name = _safe_name(body.name)
+    if name == "default":
+        raise HTTPException(status_code=400, detail="Category 'default' is reserved")
     cat_dir = UPLOADS / name
     cat_dir.mkdir(parents=True, exist_ok=True)
     return {"ok": True, "category": name}
 
 
 @app.patch("/api/uploads/categories/{category}")
-def api_rename_upload_category(category: str, body: CategoryBody, _: dict = Depends(current_user)):
-    src_dir = UPLOADS / Path(category).name
-    new_name = Path(body.name).name.strip()
+def api_rename_upload_category(category: str, body: CategoryBody, _: dict = Depends(require_admin)):
+    src_dir = UPLOADS / _safe_name(category)
+    new_name = _safe_name(body.name)
+    if new_name == "default":
+        raise HTTPException(status_code=400, detail="Category 'default' is reserved")
     if not src_dir.is_dir():
         raise HTTPException(status_code=404, detail="Category not found")
-    if not new_name or new_name in ("default", "."):
-        raise HTTPException(status_code=400, detail="Invalid category name")
     if new_name == src_dir.name:
         return {"ok": True, "category": new_name}
     if (UPLOADS / new_name).exists():
@@ -480,13 +535,13 @@ def api_rename_upload_category(category: str, body: CategoryBody, _: dict = Depe
 
 
 @app.delete("/api/uploads/categories/{category}")
-def api_delete_upload_category(category: str, _: dict = Depends(current_user)):
-    cat_dir = UPLOADS / Path(category).name
+def api_delete_upload_category(category: str, _: dict = Depends(require_admin)):
+    cat_dir = UPLOADS / _safe_name(category)
     if not cat_dir.is_dir():
         raise HTTPException(status_code=404, detail="Category not found")
     moved = 0
     for p in cat_dir.iterdir():
-        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+        if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
             dest = UPLOADS / p.name
             i = 1
             while dest.exists():
@@ -505,20 +560,22 @@ def api_delete_upload_category(category: str, _: dict = Depends(current_user)):
 def api_upload_categories(_: dict = Depends(current_user)):
     categories = {"default": 0}
     for p in UPLOADS.iterdir():
-        if p.is_file() and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"):
+        if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
             categories["default"] += 1
         elif p.is_dir():
-            count = sum(1 for f in p.iterdir() if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp"))
+            count = sum(1 for f in p.iterdir() if f.is_file() and f.suffix.lower() in _IMAGE_SUFFIXES)
             categories[p.name] = count
     return categories
 
 
 @app.get("/api/uploads/{category}/{filename}")
 def api_get_upload(category: str, filename: str, _: dict = Depends(current_user)):
-    safe_category = Path(category).name
-    safe_name = Path(filename).name
+    safe_category = _safe_name(category)
+    safe_name = _safe_name(filename)
     p = UPLOADS / safe_category / safe_name
-    if not p.exists():
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    if p.suffix.lower() not in _IMAGE_SUFFIXES:
         raise HTTPException(status_code=404, detail="Image not found")
     return {
         "name": p.name,
@@ -535,15 +592,13 @@ async def api_upload_to_library(
     category: str = Form(""),
     _: dict = Depends(current_user),
 ):
-    if not file.content_type or not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Only image files are supported")
-    suffix = Path(file.filename or "upload.jpg").suffix.lower() or ".jpg"
-    safe_name = f"upload_{uuid.uuid4().hex[:8]}{suffix}"
-    cat = Path(category).name if category else "default"
+    content = await file.read()
+    _, ext = _validate_image_bytes(content, ".jpg")
+    safe_name = f"upload_{uuid.uuid4().hex[:8]}{ext}"
+    cat = _safe_name(category) if category else "default"
     cat_dir = UPLOADS / cat
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
-    content = await file.read()
     dest.write_bytes(content)
     return {
         "name": safe_name,
@@ -578,9 +633,11 @@ async def api_batch(
         raw = await upload.read()
         if not raw:
             continue
-        name = upload.filename or f"garment_{uid('g')}.jpg"
-        dest = UPLOADS / f"{uid('src')}_{Path(name).name}"
+        _, ext = _validate_image_bytes(raw, ".jpg")
+        src_name = f"{uid('src')}{ext}"
+        dest = UPLOADS / src_name
         dest.write_bytes(raw)
+        display_name = upload.filename or f"garment{ext}"
         job = create_job(
             {
                 "base_id": base_id,
@@ -588,9 +645,9 @@ async def api_batch(
                 "garment_type": garment_type,
                 "output_format": output_format,
                 "background": background,
-                "source_name": name,
+                "source_name": display_name,
                 "source_url": public_url(dest),
-                "title": Path(name).stem,
+                "title": Path(display_name).stem,
             }
         )
         jobs.append(job)
@@ -598,7 +655,7 @@ async def api_batch(
 
 
 @app.post("/api/jobs/{job_id}/push")
-def api_push(job_id: str, body: PushBody, _: dict = Depends(current_user)):
+def api_push(job_id: str, body: PushBody, _: dict = Depends(require_admin)):
     try:
         job = get_job(job_id)
     except KeyError as exc:

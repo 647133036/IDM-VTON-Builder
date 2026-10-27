@@ -5,6 +5,7 @@ pillow==11.1.0
 numpy==2.2.4
 pyjwt==2.10.1
 aiofiles==24.1.0
+requests==2.32.3
 
 # IDM-VTON GPU 推理依赖（需要 CUDA GPU）
 # torch>=2.1.0

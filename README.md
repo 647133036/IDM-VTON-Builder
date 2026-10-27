@@ -70,7 +70,7 @@ npm run dev
 
 前端把 `/api` 和 `/files` 反代到 `8000`。
 
-演示账号：`admin / admin123`，`staff / staff123`。
+首次启动时，后端会为 `admin` 和 `staff` 账号生成随机密码并输出到进程日志。生产部署请通过环境变量 `STORE_ADMIN_PASSWORD`、`STORE_STAFF_PASSWORD`、`STORE_JWT_SECRET`（至少 32 字节）注入凭据，缺失时使用随机值。
 
 ## GPU 部署（商用模式）
 

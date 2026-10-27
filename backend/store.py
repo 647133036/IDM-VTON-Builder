@@ -84,7 +84,12 @@ def save_state(state: dict) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
         f.flush()
         os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     tmp.replace(STATE_FILE)
+    try:
+        os.chmod(STATE_FILE, 0o600)
+    except OSError:
+        pass
 
 
 def with_state(fn):

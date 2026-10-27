@@ -61,18 +61,28 @@ def sdxl_available() -> tuple[bool, str]:
     return True, "ok"
 
 
+_pose_detector = None
+_canny_detector = None
+
+
 def _get_openpose_control(image: Image.Image) -> Image.Image:
-    from controlnet_aux import OpenPoseDetector
-    detector = OpenPoseDetector.from_pretrained("lllyasviel/Annotators")
-    control = detector(image)
-    return control
+    global _pose_detector
+    from controlnet_aux import OpenposeDetector
+    if _pose_detector is None:
+        annotator_dir = SDXL_DIR / "annotators"
+        if annotator_dir.exists():
+            _pose_detector = OpenposeDetector.from_pretrained(str(annotator_dir))
+        else:
+            _pose_detector = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
+    return _pose_detector(image)
 
 
 def _get_canny_control(image: Image.Image) -> Image.Image:
+    global _canny_detector
     from controlnet_aux import CannyDetector
-    detector = CannyDetector.from_pretrained("lllyasviel/Annotators")
-    control = detector(image, resolution=1024)
-    return control
+    if _canny_detector is None:
+        _canny_detector = CannyDetector()
+    return _canny_detector(image, low_threshold=100, high_threshold=200, detect_resolution=1024, image_resolution=1024)
 
 
 def _load_trained_lora(pipe, lora_dir: Path) -> str | None:
@@ -161,10 +171,17 @@ def compose_tryon_sdxl(
     except Exception:
         pass
 
-    ip_adapter_path = str(SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin")
-    if (SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin").exists():
+    ip_adapter_bin = SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin"
+    ip_adapter_loaded = False
+    if ip_adapter_bin.exists():
         try:
-            pipe.load_image_embedding(ip_adapter_path)
+            pipe.load_ip_adapter(
+                "h94/IP-Adapter",
+                subfolder="sdxl_models",
+                weight_name=str(ip_adapter_bin.name),
+            )
+            pipe.set_ip_adapter_scale(0.8)
+            ip_adapter_loaded = True
         except Exception:
             pass
 
@@ -176,7 +193,7 @@ def compose_tryon_sdxl(
     pipe_kwargs = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
-        "control_image": [control_pose, control_canny],
+        "image": [control_pose, control_canny],
         "controlnet_conditioning_scale": [0.8, 0.6],
         "width": target_w,
         "height": target_h,
@@ -186,8 +203,8 @@ def compose_tryon_sdxl(
         "output_type": "pil",
     }
 
-    if (SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin").exists():
-        pipe_kwargs["image"] = cloth_img
+    if ip_adapter_loaded:
+        pipe_kwargs["ip_adapter_image"] = cloth_img
 
     with torch.no_grad():
         with torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
@@ -203,8 +220,9 @@ def compose_tryon_sdxl(
             bg.paste(result, mask=result.split()[-1])
             result = bg
         else:
-            result = PILImage.new("RGB", result.size, (255, 255, 255))
-            result.paste(result.convert("RGB"))
+            bg = PILImage.new("RGB", result.size, (255, 255, 255))
+            bg.paste(result.convert("RGB"), (0, 0))
+            result = bg
 
     rw, rh = result.size
     scale = long_side / max(rw, rh)

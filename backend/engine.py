@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
+
+logger = logging.getLogger("atelier.engine")
 
 TORSOS = {
     "women": dict(x=0.21, y=0.178, w=0.58, h=0.39, shoulder=0.96, hem=0.62, neck=0.22, sleeve=0.22),
@@ -413,9 +416,9 @@ def compose_tryon(
             sdxl_avail, sdxl_reason = sdxl_available()
             if sdxl_avail:
                 return compose_tryon_sdxl(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
-            raise RuntimeError(f"commercial mode has no available commercial engine: {sdxl_reason}")
         except ImportError:
-            raise RuntimeError("commercial mode requires the SDXL engine; install diffusers and dependencies")
+            sdxl_reason = "diffusers not installed"
+        logger.warning("commercial SDXL engine unavailable (%s); falling back to composite engine", sdxl_reason)
 
     return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
 
