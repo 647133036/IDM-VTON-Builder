@@ -30,12 +30,12 @@
 - **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看，删除 / 推送 / 设置 / 人种管理需 admin
 - **凭据脱敏**：`/api/stores` 的 GET / POST / PATCH 响应均不返回明文 api_key，仅返回 `has_api_key` 和掩码值
 - **文件权限**：state.json 权限 600
- - **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后仅允许全局可路由单播（拒绝内网 / 环回 / 链路本地 / 保留 / CGNAT / 组播 / 未指定），全部 HTTP 调用 `allow_redirects=False`
- - **XSS 防护**：前端动态字段经 `escapeHtml` 转义（含人种下拉 `value` 属性）；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验，`ethnicity.value` 限小写 slug（禁引号/尖括号/空格）
- - **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化；SDXL / IDM-VTON 管线与 ControlNet 检测器首次加载均有独立单飞锁（double-checked），避免并发构建撑爆显存
- - **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
- - **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
- - **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
+- **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后仅允许全局可路由单播（拒绝内网 / 环回 / 链路本地 / 保留 / CGNAT / 组播 / 未指定），全部 HTTP 调用 `allow_redirects=False`
+- **XSS 防护**：前端动态字段经 `escapeHtml` 转义（含人种下拉 `value` 属性）；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验，`ethnicity.value` 限小写 slug（禁引号/尖括号/空格）
+- **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化；SDXL / IDM-VTON 管线与 ControlNet 检测器首次加载均有独立单飞锁（double-checked），避免并发构建撑爆显存
+- **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
+- **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
+- **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
 
 ### 未修复
 
@@ -49,7 +49,7 @@
 - **文件名 / 分类名仅允许 ASCII**：`_safe_name` 正则不含中文字符，上传中文文件名会被拒绝。这是有意收紧，避免 locale 编码问题
 - **JWT 单密钥**：不支持密钥轮换；改了 `STORE_JWT_SECRET` 会让所有已签发 token 失效
 - **SSRF 仅覆盖 push 出口**：上传与下载路径不涉及任意 URL 请求，故无 SSRF 面
-- **测试依赖**：后端测试用 pytest，前端测试用 vitest；`ruff check` 与 `ruff format --check` 均在 `backend/` 和 `training/` 下全绿
+- **测试依赖**：后端测试用 pytest，前端测试用 vitest；`ruff check` 与 `ruff format --check` 在 `backend/` 和 `training/` 下运行（项目 `pyproject.toml` 固定行宽 120）
 
 
 ## 图片规格
