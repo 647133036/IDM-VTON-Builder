@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps
 logger = logging.getLogger("atelier.engine")
 
 _GPU_LOCK = threading.Lock()
+_PIPE_LOCK = threading.Lock()
 
 TORSOS = {
     "women": dict(x=0.21, y=0.178, w=0.58, h=0.39, shoulder=0.96, hem=0.62, neck=0.22, sleeve=0.22),
@@ -436,68 +437,75 @@ def _load_idm_vton_pipeline():
     if _engine_state["pipe"] is not None:
         return _engine_state["pipe"]
 
-    avail, reason = _idm_vton_available()
-    if not avail:
-        _engine_state["available"] = False
-        _engine_state["reason"] = reason
-        return None
+    # 首载必须单飞(NEW-H3 残留):并发请求同时见 pipe=None 会重复构建管线撑爆显存。
+    with _PIPE_LOCK:
+        if _engine_state["available"] is False:
+            return None
+        if _engine_state["pipe"] is not None:
+            return _engine_state["pipe"]
 
-    _engine_state["available"] = True
-    _engine_state["reason"] = ""
+        avail, reason = _idm_vton_available()
+        if not avail:
+            _engine_state["available"] = False
+            _engine_state["reason"] = reason
+            return None
 
-    sys_path = str(_IDM_DIR)
-    if sys_path not in os.environ.get("PYTHONPATH", ""):
-        os.environ["PYTHONPATH"] = sys_path + os.pathsep + os.environ.get("PYTHONPATH", "")
+        _engine_state["available"] = True
+        _engine_state["reason"] = ""
 
-    import sys
+        sys_path = str(_IDM_DIR)
+        if sys_path not in os.environ.get("PYTHONPATH", ""):
+            os.environ["PYTHONPATH"] = sys_path + os.pathsep + os.environ.get("PYTHONPATH", "")
 
-    if sys_path not in sys.path:
-        sys.path.insert(0, sys_path)
+        import sys
 
-    import torch
-    from diffusers import AutoencoderKL, DDPMScheduler
-    from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
-    from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
-    from src.unet_hacked_tryon import UNet2DConditionModel
-    from transformers import (
-        AutoTokenizer,
-        CLIPTextModel,
-        CLIPTextModelWithProjection,
-    )
+        if sys_path not in sys.path:
+            sys.path.insert(0, sys_path)
 
-    ckpt_path = str(WEIGHTS_DIR)
-    device = torch.device("cuda:0")
+        import torch
+        from diffusers import AutoencoderKL, DDPMScheduler
+        from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
+        from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
+        from src.unet_hacked_tryon import UNet2DConditionModel
+        from transformers import (
+            AutoTokenizer,
+            CLIPTextModel,
+            CLIPTextModelWithProjection,
+        )
 
-    unet = UNet2DConditionModel.from_pretrained(ckpt_path, subfolder="unet", torch_dtype=torch.float16)
-    unet_encoder = UNet2DConditionModel_ref.from_pretrained(
-        ckpt_path, subfolder="unet_encoder", torch_dtype=torch.float16
-    )
-    vae = AutoencoderKL.from_pretrained(ckpt_path, subfolder="vae", torch_dtype=torch.float16)
-    scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder="scheduler")
+        ckpt_path = str(WEIGHTS_DIR)
+        device = torch.device("cuda:0")
 
-    text_encoder = CLIPTextModel.from_pretrained(ckpt_path, subfolder="text_encoder", torch_dtype=torch.float16)
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer")
-    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
-        ckpt_path, subfolder="text_encoder_2", torch_dtype=torch.float16
-    )
-    tokenizer_2 = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer_2")
+        unet = UNet2DConditionModel.from_pretrained(ckpt_path, subfolder="unet", torch_dtype=torch.float16)
+        unet_encoder = UNet2DConditionModel_ref.from_pretrained(
+            ckpt_path, subfolder="unet_encoder", torch_dtype=torch.float16
+        )
+        vae = AutoencoderKL.from_pretrained(ckpt_path, subfolder="vae", torch_dtype=torch.float16)
+        scheduler = DDPMScheduler.from_pretrained(ckpt_path, subfolder="scheduler")
 
-    pipe = TryonPipeline(
-        vae=vae,
-        text_encoder=text_encoder,
-        text_encoder_2=text_encoder_2,
-        tokenizer=tokenizer,
-        tokenizer_2=tokenizer_2,
-        unet=unet,
-        unet_encoder=unet_encoder,
-        scheduler=scheduler,
-    )
-    pipe.to(device)
-    pipe.enable_vae_slicing()
-    pipe.enable_attention_slicing()
+        text_encoder = CLIPTextModel.from_pretrained(ckpt_path, subfolder="text_encoder", torch_dtype=torch.float16)
+        tokenizer = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer")
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+            ckpt_path, subfolder="text_encoder_2", torch_dtype=torch.float16
+        )
+        tokenizer_2 = AutoTokenizer.from_pretrained(ckpt_path, subfolder="tokenizer_2")
 
-    _engine_state["pipe"] = pipe
-    return pipe
+        pipe = TryonPipeline(
+            vae=vae,
+            text_encoder=text_encoder,
+            text_encoder_2=text_encoder_2,
+            tokenizer=tokenizer,
+            tokenizer_2=tokenizer_2,
+            unet=unet,
+            unet_encoder=unet_encoder,
+            scheduler=scheduler,
+        )
+        pipe.to(device)
+        pipe.enable_vae_slicing()
+        pipe.enable_attention_slicing()
+
+        _engine_state["pipe"] = pipe
+        return pipe
 
 
 def _idm_vton_engine(
@@ -613,8 +621,9 @@ def compose_tryon(
                     )
                     engine_name = "sdxl-commercial"
                     img.info["engine"] = engine_name
-                    img.info["engine_degraded"] = False
-                    img.info["degraded_reason"] = ""
+                    # SDXL 内部若已标记降级(如 IP-Adapter 加载失败 N4-L6),保留其信息。
+                    img.info.setdefault("engine_degraded", False)
+                    img.info.setdefault("degraded_reason", "")
                     return img
                 except Exception:
                     logger.exception("SDXL engine failed at runtime; falling back to composite engine")

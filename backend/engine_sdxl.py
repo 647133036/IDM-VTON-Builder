@@ -11,7 +11,7 @@ logger = logging.getLogger("atelier.engine_sdxl")
 
 _GPU_LOCK = threading.Lock()
 _PIPE_LOCK = threading.Lock()
-_sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False}
+_sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False, "ip_adapter_reason": ""}
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 SDXL_DIR = _REPO_ROOT / "models" / "sdxl"
@@ -94,11 +94,14 @@ def _get_openpose_control(image: Image.Image) -> Image.Image:
     from controlnet_aux import OpenposeDetector
 
     if _pose_detector is None:
-        annotator_dir = SDXL_DIR / "annotators"
-        if annotator_dir.exists():
-            _pose_detector = OpenposeDetector.from_pretrained(str(annotator_dir))
-        else:
-            _pose_detector = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
+        # 懒加载加锁(NEW-H3 残留):并发首载会重复构建检测器,用 _PIPE_LOCK 单飞。
+        with _PIPE_LOCK:
+            if _pose_detector is None:
+                annotator_dir = SDXL_DIR / "annotators"
+                if annotator_dir.exists():
+                    _pose_detector = OpenposeDetector.from_pretrained(str(annotator_dir))
+                else:
+                    _pose_detector = OpenposeDetector.from_pretrained("lllyasviel/Annotators")
     return _pose_detector(image)
 
 
@@ -107,7 +110,10 @@ def _get_canny_control(image: Image.Image) -> Image.Image:
     from controlnet_aux import CannyDetector
 
     if _canny_detector is None:
-        _canny_detector = CannyDetector()
+        # 懒加载加锁(NEW-H3 残留):并发首载会重复构建检测器,用 _PIPE_LOCK 单飞。
+        with _PIPE_LOCK:
+            if _canny_detector is None:
+                _canny_detector = CannyDetector()
     return _canny_detector(image, low_threshold=100, high_threshold=200, detect_resolution=1024, image_resolution=1024)
 
 
@@ -136,7 +142,7 @@ def _get_sdxl_pipe(device, dtype):
     # 首次加载必须单飞(NEW-H3):并发请求同时见 pipe=None 会重复构建管线撑爆显存。
     with _PIPE_LOCK:
         if _sdxl_state["pipe"] is not None:
-            return _sdxl_state["pipe"], _sdxl_state["ip_adapter_loaded"]
+            return _sdxl_state["pipe"], _sdxl_state["ip_adapter_loaded"], _sdxl_state["ip_adapter_reason"]
 
         from diffusers import (
             ControlNetModel,
@@ -175,6 +181,7 @@ def _get_sdxl_pipe(device, dtype):
             ]
             ip_adapter_bin = next((p for p in ip_adapter_candidates if p.exists()), None)
             ip_adapter_loaded = False
+            ip_adapter_reason = ""
             if ip_adapter_bin is not None:
                 try:
                     # 以本地目录为 pretrained_model_name_or_path 并显式 subfolder="",
@@ -188,7 +195,9 @@ def _get_sdxl_pipe(device, dtype):
                     pipe.set_ip_adapter_scale(0.8)
                     ip_adapter_loaded = True
                 except Exception as exc:
+                    # 权重存在但加载失败:标记降级(N4-L6),与「未安装权重」区分。
                     logger.exception("Failed to load IP-Adapter (%s); continuing without it", exc)
+                    ip_adapter_reason = f"IP-Adapter weight present ({ip_adapter_bin.name}) but failed to load: {exc}"
             else:
                 logger.warning(
                     "No IP-Adapter weight file found in %s; SDXL runs without image prompt", SDXL_DIR / "ip_adapter"
@@ -196,7 +205,8 @@ def _get_sdxl_pipe(device, dtype):
 
             _sdxl_state["pipe"] = pipe
             _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
-            return pipe, ip_adapter_loaded
+            _sdxl_state["ip_adapter_reason"] = ip_adapter_reason
+            return pipe, ip_adapter_loaded, ip_adapter_reason
         except Exception:
             # 加载失败必须释放已占显存,否则残留半成品会持续占用 VRAM(NEW-H3)。
             logger.exception("Failed to build SDXL pipeline; releasing GPU memory")
@@ -205,6 +215,7 @@ def _get_sdxl_pipe(device, dtype):
                     pipe.to("cpu")
                 _sdxl_state["pipe"] = None
                 _sdxl_state["ip_adapter_loaded"] = False
+                _sdxl_state["ip_adapter_reason"] = ""
             try:
                 import gc
 
@@ -248,7 +259,7 @@ def compose_tryon_sdxl(
         prompt = f"{prompt}, wearing {garment_suffix}"
     negative_prompt = AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE["women"])
 
-    pipe, ip_adapter_loaded = _get_sdxl_pipe(device, dtype)
+    pipe, ip_adapter_loaded, ip_adapter_reason = _get_sdxl_pipe(device, dtype)
 
     control_pose = _get_openpose_control(human_img)
     control_canny = _get_canny_control(cloth_img)
@@ -293,4 +304,7 @@ def compose_tryon_sdxl(
     if abs(scale - 1) > 0.01:
         result = result.resize((int(rw * scale), int(rh * scale)), PILImage.Resampling.LANCZOS)
 
+    # IP-Adapter 权重存在但加载失败时标记降级(N4-L6);「未安装」不视为降级。
+    result.info["engine_degraded"] = bool(ip_adapter_reason)
+    result.info["degraded_reason"] = ip_adapter_reason
     return result

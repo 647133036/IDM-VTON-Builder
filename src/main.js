@@ -345,19 +345,7 @@ function basesView() {
                 <option value="">${t('base.keep')}</option>
                 ${(state.ethnicities || []).map((e) => `<option value="${escapeHtml(e.value)}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
               </select>
-              <label>${t('eth.label')}</label>
-              <input id="eth-label" value="${escapeHtml(state.ethnicityLabel || '')}" placeholder="${escapeHtml(t('eth.labelPh'))}" />
-              <div class="row">
-                <button class="btn primary" id="eth-add">${t('eth.add')}</button>
-                <button class="btn ghost" id="eth-reset">${t('eth.reset')}</button>
-              </div>
-            </div>
-          </div>
-          <div class="panel">
-            <h3>${t('eth.manage')}</h3>
-            <div class="eth-list">
-              ${(state.ethnicities || []).map((e) => `<div class="eth-row"><span>${escapeHtml(fmtEthnicity(e.value, e.label))}</span><div><button class="btn ghost small eth-rename" data-value="${escapeHtml(e.value)}" data-label="${escapeHtml(e.label)}">${t('eth.rename')}</button><button class="btn ghost small eth-del" data-value="${escapeHtml(e.value)}">${t('eth.del')}</button></div></div>`).join('')}
-            </div>
+            </label>
           </div>
           <button class="btn gold small" id="base-batch-apply">${t('base.apply')}</button>
         </div>

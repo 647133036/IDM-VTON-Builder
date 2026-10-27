@@ -246,12 +246,12 @@ API 凭证在本地 `state.json` 中以明文存储（文件权限 `0600`，不�
 后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。前端组件测试用 vitest 覆盖 i18n 字典与人种翻译。
 
 ```bash
-# 后端测试（99 个，含安全回归测试）
+# 后端测试（139 个，含安全回归测试）
 pip3 install --break-system-packages pytest httpx
 cd backend
 python3 -m pytest tests/ -q
 
-# 前端组件测试（11 个）
+# 前端组件测试（14 个）
 cd /workspace
 npm install
 npm test
@@ -266,8 +266,8 @@ python3 -m ruff format --check backend/ training/
 
 覆盖分层：
 
-- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py` / `test_lora_io.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT 密钥随机化、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支、LoRA 加载格式转换
-- **组件测试**（`src/i18n.test.js`）：中英文切换、占位符插值、10 地域人种翻译、自定义人种回退原文
+- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py` / `test_lora_io.py` / `test_engine_concurrency.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT 密钥随机化、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支、LoRA 加载格式转换、管线/检测器并发首载单飞
+- **组件测试**（`src/i18n.test.js` / `src/render.test.js`）：中英文切换、占位符插值、10 地域人种翻译、自定义人种回退原文、`basesView` DOM 标签平衡与批次面板结构
 - **集成测试**（`backend/tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、state.json 访问拦截、HTML 上传拦截、store 凭据脱敏、staff 权限隔离、健康与许可接口
 - **系统测试**（`backend/tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
 

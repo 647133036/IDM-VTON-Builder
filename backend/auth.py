@@ -49,7 +49,6 @@ def _load_or_create_jwt_secret() -> str:
         _SECRET_FILE,
     )
     return val
-    return val
 
 
 JWT_SECRET = _load_or_create_jwt_secret()

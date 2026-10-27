@@ -35,8 +35,10 @@ def _check_host_safe(host: str) -> None:
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         # 仅允许全局可路由单播:一并拒绝内网/回环/链路本地/保留/CGNAT(100.64/10)/
-        # 组播(224/4)/未指定,避免 SSRF 与 DNS 重绑定指向内网(H-03)。
+        # 组播(224/4)/未指定,拦截绝大多数 SSRF 与指向内网的重绑定解析(H-03)。
         # 注意:IPv4 组播 is_global 在 CPython 返回 True,需显式判 is_multicast。
+        # 局限:此检查仅校验校验时刻的解析结果;后续 HTTP 请求会再次解析,
+        # 若攻击者在此窗口内把主机名改解析到内网地址,本检查无法拦截(TOCTOU)。
         if not ip.is_global or ip.is_multicast:
             raise PushError("Store URL resolves to a non-global IP address")
 
