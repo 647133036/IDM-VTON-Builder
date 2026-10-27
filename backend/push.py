@@ -30,10 +30,15 @@ def _check_host_safe(host: str) -> None:
         infos = socket.getaddrinfo(host, None)
     except socket.gaierror as exc:
         raise PushError(f"Cannot resolve store hostname: {exc}") from exc
+    if not infos:
+        raise PushError("Store hostname resolved to no addresses")
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-            raise PushError("Store URL resolves to a private/reserved IP address")
+        # 仅允许全局可路由单播:一并拒绝内网/回环/链路本地/保留/CGNAT(100.64/10)/
+        # 组播(224/4)/未指定,避免 SSRF 与 DNS 重绑定指向内网(H-03)。
+        # 注意:IPv4 组播 is_global 在 CPython 返回 True,需显式判 is_multicast。
+        if not ip.is_global or ip.is_multicast:
+            raise PushError("Store URL resolves to a non-global IP address")
 
 
 def _validate_shop_url(raw: str, require_suffix: str | None = None) -> str:

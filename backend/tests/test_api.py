@@ -42,6 +42,9 @@ def test_license_no_auth(client):
     r = client.get("/api/license")
     assert r.status_code == 200
     assert r.json()["idm_vton_license"] == "CC BY-NC-SA 4.0"
+    # 前端按 ip_adapter_available 决定是否宣称 IP-Adapter,必须返回该字段。
+    assert "ip_adapter_available" in r.json()
+    assert isinstance(r.json()["ip_adapter_available"], bool)
 
 
 def test_ethnicities_list(client, auth_headers):
@@ -68,6 +71,17 @@ def test_add_and_delete_ethnicity(client, auth_headers):
     r = client.post("/api/ethnicities", json={"value": "scandinavia", "label": "重复"}, headers=auth_headers)
     assert r.status_code == 400
     r = client.delete("/api/ethnicities/scandinavia", headers=auth_headers)
+    assert r.status_code == 200
+
+
+def test_add_ethnicity_rejects_xss_value(client, auth_headers):
+    # NEW-M2:value 渲染进 HTML 属性,必须拒绝引号/尖括号/空格等注入字符。
+    bad = 'x" onmouseover="alert(1)'
+    r = client.post("/api/ethnicities", json={"value": bad, "label": "Bad"}, headers=auth_headers)
+    assert r.status_code == 400
+    r = client.post("/api/ethnicities", json={"value": "upper Case", "label": "Bad"}, headers=auth_headers)
+    assert r.status_code == 400
+    r = client.post("/api/ethnicities", json={"value": "ok_value_2", "label": "OK"}, headers=auth_headers)
     assert r.status_code == 200
 
 
@@ -142,6 +156,34 @@ def test_upload_library_and_move(client, auth_headers):
     cats = client.get("/api/uploads/categories", headers=auth_headers)
     assert cats.status_code == 200
     assert "testcat" in cats.json()
+
+
+def test_default_category_list_get_move_unified(client, auth_headers):
+    # P2-5:default 分类必须与根目录统一,list/get/move 三处行为一致。
+    r = client.post(
+        "/api/uploads",
+        data={"category": ""},
+        files={"file": ("rootfile.png", _png_bytes((9, 8, 7)), "image/png")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    name = r.json()["name"]
+    assert r.json()["category"] == "default"
+
+    listed = client.get("/api/uploads?category=default", headers=auth_headers)
+    assert listed.status_code == 200
+    assert any(item["name"] == name for item in listed.json())
+
+    got = client.get(f"/api/uploads/default/{name}", headers=auth_headers)
+    assert got.status_code == 200
+    assert got.json()["category"] == "default"
+
+    moved = client.post(f"/api/uploads/{name}/move", json={"category": "default"}, headers=auth_headers)
+    assert moved.status_code == 200
+    # 移到 default 是同一目录,文件名必须保持不变(P2-5 曾改名为 upload_xxx_1)。
+    assert moved.json()["filename"] == name
+    still = client.get(f"/api/uploads/default/{name}", headers=auth_headers)
+    assert still.status_code == 200
 
 
 def test_upload_library_rejects_non_image(client, auth_headers):
@@ -269,12 +311,18 @@ def test_stores_crud(client, auth_headers):
     assert r.json()["api_key_masked"] == "shp***345"
     assert "shpat_newtok_12345" not in r.text
 
-    # 短 key(<=8 位)整体隐藏,避免掩码泄露过半字符。
+    # 短 key(<12 位)整体隐藏,避免掩码泄露过半字符(NEW-L4)。
     client.patch(f"/api/stores/{store['id']}", json={"api_key": "newtok1"}, headers=auth_headers)
     assert r.status_code == 200
     r = client.get("/api/stores", headers=auth_headers)
     short = next(s for s in r.json() if s["id"] == store["id"])
     assert short["api_key_masked"] == "***"
+
+    # 9~11 位 key 也必须整体隐藏(曾暴露 3+3=6 位,泄露 2/3)。
+    client.patch(f"/api/stores/{store['id']}", json={"api_key": "ninebitskey"}, headers=auth_headers)
+    r = client.get("/api/stores", headers=auth_headers)
+    nine = next(s for s in r.json() if s["id"] == store["id"])
+    assert nine["api_key_masked"] == "***"
 
     assert client.delete(f"/api/stores/{store['id']}", headers=auth_headers).status_code == 200
 
@@ -310,13 +358,26 @@ def test_files_state_json_blocked(client, auth_headers):
 
 
 def test_files_public_image_no_auth(client, auth_headers):
-    r = client.get("/api/bases", headers=auth_headers)
-    bases = r.json()
-    if bases:
-        url = bases[0].get("url", "")
-        if url:
-            path = url.replace("/files/", "")
-            assert client.get(f"/files/{path}").status_code == 200
+    # 必须真的发起 /files 请求并断言 200,否则条件嵌套会让测试空转(假覆盖)。
+    up = client.post(
+        "/api/uploads",
+        data={"category": ""},
+        files={"file": ("pub.png", _png_bytes((11, 22, 33)), "image/png")},
+        headers=auth_headers,
+    )
+    assert up.status_code == 200
+    url = up.json()["url"]
+    assert url.startswith("/files/")
+    r = client.get(url)
+    assert r.status_code == 200
+    assert r.headers.get("x-content-type-options") == "nosniff"
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_files_state_json_404(client, auth_headers):
+    # 状态文件必须不可公开访问(H-12):不泄露用户/店铺信息。
+    r = client.get("/files/state.json")
+    assert r.status_code == 404
 
 
 def test_upload_html_rejected(client, auth_headers):

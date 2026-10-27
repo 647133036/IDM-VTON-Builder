@@ -103,9 +103,9 @@ npm run dev
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `IDM_WEIGHTS_DIR` | `IDM-VTON/ckpt` | 权重目录路径 |
-| `STORE_JWT_SECRET` | `idm-vton-store-demo-secret` | JWT 密钥（生产环境必须修改） |
-| `STORE_ADMIN_PASSWORD` | `admin123` | 管理员密码 |
-| `STORE_STAFF_PASSWORD` | `staff123` | 员工密码 |
+| `STORE_JWT_SECRET` | 无（未设置时随机生成并持久化到 `backend/data/.jwt_secret`，chmod 600） | JWT 密钥（生产环境请显式设置 ≥32 字节随机值） |
+| `STORE_ADMIN_PASSWORD` | 无（未设置时随机生成并打印到启动日志） | 管理员密码 |
+| `STORE_STAFF_PASSWORD` | 无（未设置时随机生成并打印到启动日志） | 员工密码 |
 
 ## 性能参考
 

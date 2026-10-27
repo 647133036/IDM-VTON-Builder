@@ -11,11 +11,23 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 logger = logging.getLogger("atelier.auth")
 
 _SECRET_FILE = Path(__file__).resolve().parent / "data" / ".jwt_secret"
+_PASSWORD_FILES = {
+    "admin": Path(__file__).resolve().parent / "data" / ".admin_password",
+    "staff": Path(__file__).resolve().parent / "data" / ".staff_password",
+}
 
 
 def _load_or_create_jwt_secret() -> str:
     env_val = os.getenv("STORE_JWT_SECRET")
-    if env_val and len(env_val) >= 32:
+    if env_val:
+        # 短密钥直接 fail closed:弱 HMAC 密钥可被暴力猜测,而不是静默降级使用。
+        if len(env_val) < 32:
+            raise RuntimeError(
+                f"STORE_JWT_SECRET is only {len(env_val)} bytes; refusing to start. "
+                "Set a >=32-byte random value, e.g. "
+                "STORE_JWT_SECRET=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))') "
+                "— or unset it to auto-generate a persisted secret."
+            )
         return env_val
     _SECRET_FILE.parent.mkdir(parents=True, exist_ok=True)
     if _SECRET_FILE.exists():
@@ -31,14 +43,12 @@ def _load_or_create_jwt_secret() -> str:
         os.chmod(_SECRET_FILE, 0o600)
     except OSError as exc:
         logger.warning("Failed to persist JWT secret to %s: %s", _SECRET_FILE, exc)
-    if not env_val:
-        logger.warning(
-            "STORE_JWT_SECRET not set; generated and persisted a random secret to %s. "
-            "Set STORE_JWT_SECRET (>=32 bytes) for production.",
-            _SECRET_FILE,
-        )
-    else:
-        logger.warning("STORE_JWT_SECRET is shorter than 32 bytes; generated and persisted a random secret instead.")
+    logger.warning(
+        "STORE_JWT_SECRET not set; generated and persisted a random secret to %s. "
+        "Set STORE_JWT_SECRET (>=32 bytes) for production.",
+        _SECRET_FILE,
+    )
+    return val
     return val
 
 
@@ -51,7 +61,23 @@ def _resolve_password(env_var: str, username: str) -> str:
     val = os.getenv(env_var)
     if val:
         return val
+    # 未设置 env 时:生成一次并落盘 0600 共享文件,所有 worker 读到同一密码,
+    # 避免多 worker 各自随机导致登录随机失败(NEW-H2/P1-1a)。
+    f = _PASSWORD_FILES[username]
+    f.parent.mkdir(parents=True, exist_ok=True)
+    if f.exists():
+        try:
+            stored = f.read_text(encoding="utf-8").strip()
+            if stored:
+                return stored
+        except OSError:
+            pass
     generated = secrets.token_urlsafe(12)
+    try:
+        f.write_text(generated, encoding="utf-8")
+        os.chmod(f, 0o600)
+    except OSError as exc:
+        logger.warning("Failed to persist generated password for '%s' to %s: %s", username, f, exc)
     print(
         f"[atelier] {env_var} not set; generated random password for '{username}': {generated}",
         flush=True,

@@ -30,16 +30,18 @@
 - **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看，删除 / 推送 / 设置 / 人种管理需 admin
 - **凭据脱敏**：`/api/stores` 的 GET / POST / PATCH 响应均不返回明文 api_key，仅返回 `has_api_key` 和掩码值
 - **文件权限**：state.json 权限 600
-- **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后拒绝私有网段 / 环回 / 链路本地 IP，全部 HTTP 调用 `allow_redirects=False`
-- **XSS 防护**：前端所有动态字段经 `escapeHtml` 转义；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验
-- **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化，4 个 worker 线程不会同时占用显存
-- **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
-- **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
-- **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
+ - **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后仅允许全局可路由单播（拒绝内网 / 环回 / 链路本地 / 保留 / CGNAT / 组播 / 未指定），全部 HTTP 调用 `allow_redirects=False`
+ - **XSS 防护**：前端动态字段经 `escapeHtml` 转义（含人种下拉 `value` 属性）；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验，`ethnicity.value` 限小写 slug（禁引号/尖括号/空格）
+ - **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化；SDXL 管线首次加载有独立单飞锁，避免并发构建撑爆显存
+ - **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
+ - **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
+ - **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
 
 ### 未修复
 
-- 无
+- DNS 重绑定（TOCTOU）未完全消除：`/api/push` 在解析域名后、发起连接前，域名仍可能被重新绑定到内网地址；彻底解决需按已校验 IP 直连（网络层固定目标）。已拒绝解析结果为非全局地址的情形
+- 无 GPU 环境下合成引擎为启发式近似，效果有限；IDM-VTON / SDXL 扩散推理需 GPU 与权重
+- 去水印为浅色角部/上下带 logo 文字的 best-effort，深色或满铺水印不在覆盖范围
 
 ### 已知限制
 

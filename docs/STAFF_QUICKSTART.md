@@ -4,10 +4,12 @@
 
 ## 登录
 
-打开店铺后台「试衣工作台」。账号找运营领取。演示环境：
+打开店铺后台「试衣工作台」。账号口令由环境变量设置：
 
-- 管理员 `admin` / `admin123`
-- 理货 `staff` / `staff123`
+- 管理员 `STORE_ADMIN_PASSWORD`
+- 理货 `STORE_STAFF_PASSWORD`
+
+未设置时服务端随机生成并打印到启动日志（多 worker 下各 worker 共享同一口令）。
 
 ## 四步出图
 

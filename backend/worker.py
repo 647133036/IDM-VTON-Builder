@@ -63,7 +63,19 @@ def process_job(job: dict, bases: list[dict]) -> None:
     patch_job(job["id"], {"progress": 35, "message": f"Calling {engine_label}"})
     ethnicity = base.get("ethnicity") or ""
     result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
-    patch_job(job["id"], {"progress": 78, "message": "Rendering final image"})
+    engine_used = result.info.get("engine") or engine_info["engine"]
+    degraded = bool(result.info.get("engine_degraded", False))
+    degraded_reason = result.info.get("degraded_reason") or ""
+    patch_job(
+        job["id"],
+        {
+            "progress": 78,
+            "message": "Rendering final image",
+            "engine": engine_used,
+            "engine_degraded": degraded,
+            "degraded_reason": degraded_reason,
+        },
+    )
 
     ext = "png" if job.get("output_format") == "png" or background == "transparent" else "jpg"
     out_path = RESULTS / f"{job['id']}.{ext}"

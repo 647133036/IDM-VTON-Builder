@@ -271,3 +271,56 @@ def test_fit_garment_to_body_falls_back_when_no_alpha():
     img = Image.new("RGB", (100, 120), (10, 20, 30))
     out = fit_garment_to_body(img, box, 200, 260)
     assert out.size == (200, 260)
+
+
+def test_engine_status_includes_ip_adapter_flag():
+    st = engine_status()
+    assert "ip_adapter_available" in st
+    assert isinstance(st["ip_adapter_available"], bool)
+
+
+def test_sdxl_available_checks_key_files(monkeypatch, tmp_path):
+    # 目录存在但缺 model_index.json 时必须判为不可用(NEW-M4)。
+    import engine_sdxl
+
+    for d in ("sdxl_base", "controlnet_openpose", "controlnet_canny"):
+        (tmp_path / d).mkdir(parents=True, exist_ok=True)
+    (tmp_path / "sdxl_base" / "unet").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(engine_sdxl, "SDXL_DIR", tmp_path)
+    monkeypatch.setattr(engine_sdxl, "_IDM_DIR", tmp_path)
+    monkeypatch.setattr(engine_sdxl, "_TRAINING_DIR", tmp_path)
+    avail, reason = engine_sdxl.sdxl_available()
+    assert avail is False
+    assert "model_index.json" in reason
+
+
+def test_compose_tryon_sdxl_failure_falls_back(monkeypatch, base_image, garment_image):
+    # SDXL 运行时抛异常必须回退合成引擎并在图上标注降级(NEW-H4)。
+    import engine as eng
+    import engine_sdxl
+
+    monkeypatch.setattr(eng, "_LICENSE_MODE", "commercial")
+
+    def _no_gpu():
+        return False, "No GPU available"
+
+    monkeypatch.setattr(engine_sdxl, "sdxl_available", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        engine_sdxl,
+        "compose_tryon_sdxl",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    result = eng.compose_tryon(base_image, garment_image, "women", "upper", 512, "white", "western_europe")
+    assert result.size[0] > 0
+    assert result.info.get("engine") == "composite-fallback"
+    assert result.info.get("engine_degraded") is True
+    assert "SDXL" in result.info.get("degraded_reason", "")
+
+
+def test_compose_tryon_marks_engine_when_composite(base_image, garment_image):
+    # 无 GPU 环境:合成引擎正常返回且 engine 标记为 composite-fallback。
+    import engine as eng
+
+    result = eng.compose_tryon(base_image, garment_image, "women", "upper", 512, "white", "western_europe")
+    assert result.info.get("engine") == "composite-fallback"
+    assert result.info.get("engine_degraded") is False

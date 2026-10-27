@@ -29,7 +29,7 @@ STORE_ADMIN_PASSWORD=replace-me
 STORE_STAFF_PASSWORD=replace-me
 ```
 
-默认演示账号：`admin / admin123`，`staff / staff123`。
+默认账号口令由环境变量 `STORE_ADMIN_PASSWORD` / `STORE_STAFF_PASSWORD` 设置；未设置时服务端随机生成并打印到启动日志。
 
 ## 云上部署（AWS / GCP / Azure）
 

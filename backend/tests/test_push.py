@@ -295,5 +295,18 @@ def test_ssrf_internal_ip_rejected(monkeypatch):
         return [(0, 0, 0, 0, ("127.0.0.1", 0))]
 
     monkeypatch.setattr(push.socket, "getaddrinfo", _fake_getaddrinfo)
-    with pytest.raises(PushError, match="private/reserved"):
+    with pytest.raises(PushError, match="non-global"):
+        push._check_host_safe("evil.com")
+
+
+@pytest.mark.parametrize("ip", ["100.64.0.1", "224.0.0.1", "10.0.0.5", "169.254.1.1", "0.0.0.0"])
+def test_ssrf_non_global_ips_rejected(monkeypatch, ip):
+    # CGNAT(100.64/10)、组播(224/4)、内网、链路本地、未指定都必须拒绝(H-03)。
+    import push
+
+    def _fake_getaddrinfo(host, *args, **kwargs):
+        return [(0, 0, 0, 0, (ip, 0))]
+
+    monkeypatch.setattr(push.socket, "getaddrinfo", _fake_getaddrinfo)
+    with pytest.raises(PushError, match="non-global"):
         push._check_host_safe("evil.com")

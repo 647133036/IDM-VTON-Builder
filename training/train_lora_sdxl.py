@@ -25,7 +25,8 @@ def _make_train_state(dataset_dir: Path):
 
     if torch.cuda.is_available():
         device = torch.device("cuda:0")
-        dtype = torch.bfloat16
+        # bf16 仅当 GPU 支持时使用;不支持则回退 fp32(fp16 在此训练中会产生 NaN loss)。
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float32
     elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         device = torch.device("mps")
         dtype = torch.float32

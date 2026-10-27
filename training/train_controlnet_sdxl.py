@@ -117,7 +117,8 @@ def train(args) -> int:
     from torch.utils.data import DataLoader
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    # bf16 仅当 GPU 支持时使用;不支持则回退 fp32(fp16 在此训练中会产生 NaN loss)。
+    dtype = torch.bfloat16 if device.type == "cuda" and torch.cuda.is_bf16_supported() else torch.float32
 
     components = _build_models(args.base_model, dtype)
     vae = components["vae"]

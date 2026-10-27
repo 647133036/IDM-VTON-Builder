@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from pathlib import Path
@@ -9,6 +10,7 @@ from PIL import Image
 logger = logging.getLogger("atelier.engine_sdxl")
 
 _GPU_LOCK = threading.Lock()
+_PIPE_LOCK = threading.Lock()
 _sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False}
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -55,10 +57,17 @@ GARMENT_PROMPT_SUFFIX = {
 
 
 def sdxl_available() -> tuple[bool, str]:
-    required = ["sdxl_base", "controlnet_openpose", "controlnet_canny"]
-    missing = [d for d in required if not (SDXL_DIR / d).exists()]
-    if missing:
-        return False, f"Missing weights: {', '.join(missing)}"
+    # 目录存在还不够:校验关键模型文件,避免"看似可用实则加载即炸"。
+    required = [
+        ("sdxl_base", "model_index.json"),
+        ("controlnet_openpose", "config.json"),
+        ("controlnet_canny", "config.json"),
+    ]
+    for d, f in required:
+        if not (SDXL_DIR / d).exists():
+            return False, f"Missing weights: {d}"
+        if not (SDXL_DIR / d / f).exists():
+            return False, f"Missing {f} in {d}"
     try:
         import torch
     except ImportError:
@@ -66,6 +75,14 @@ def sdxl_available() -> tuple[bool, str]:
     if not torch.cuda.is_available():
         return False, "No GPU available"
     return True, "ok"
+
+
+def ip_adapter_available() -> bool:
+    """是否存在 IP-Adapter 权重文件(不构建管线,纯文件检查)。"""
+    for name in ("ip-adapter-plus_sdxl_vit-h.safetensors", "ip-adapter-plus_sdxl_vit-h.bin"):
+        if (SDXL_DIR / "ip_adapter" / name).is_file():
+            return True
+    return False
 
 
 _pose_detector = None
@@ -116,55 +133,89 @@ def _remove_background(image: Image.Image) -> Image.Image:
 
 
 def _get_sdxl_pipe(device, dtype):
-    if _sdxl_state["pipe"] is not None:
-        return _sdxl_state["pipe"], _sdxl_state["ip_adapter_loaded"]
+    # 首次加载必须单飞(NEW-H3):并发请求同时见 pipe=None 会重复构建管线撑爆显存。
+    with _PIPE_LOCK:
+        if _sdxl_state["pipe"] is not None:
+            return _sdxl_state["pipe"], _sdxl_state["ip_adapter_loaded"]
 
-    from diffusers import (
-        ControlNetModel,
-        DDPMScheduler,
-        StableDiffusionXLControlNetPipeline,
-    )
+        from diffusers import (
+            ControlNetModel,
+            DDPMScheduler,
+            StableDiffusionXLControlNetPipeline,
+        )
 
-    scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
+        scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
 
-    controlnet_pose = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_openpose"), torch_dtype=dtype)
-    controlnet_canny = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_canny"), torch_dtype=dtype)
+        controlnet_pose = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_openpose"), torch_dtype=dtype)
+        controlnet_canny = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_canny"), torch_dtype=dtype)
 
-    pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-        str(SDXL_DIR / "sdxl_base"),
-        controlnet=[controlnet_pose, controlnet_canny],
-        scheduler=scheduler,
-        torch_dtype=dtype,
-        variant="fp16",
-        use_safetensors=True,
-    )
-    pipe.to(device)
-    pipe.enable_attention_slicing()
-
-    lora_dir = SDXL_DIR / "lora"
-    try:
-        _load_trained_lora(pipe, lora_dir)
-    except Exception:
-        logger.exception("Failed to load trained LoRA; continuing without it")
-
-    ip_adapter_bin = SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin"
-    ip_adapter_loaded = False
-    if ip_adapter_bin.exists():
+        pipe = None
         try:
-            # 直接以本地目录作为 pretrained_model_name_or_path,避免回连 HF(H-05)。
-            pipe.load_ip_adapter(
-                str(ip_adapter_bin.parent),
-                weight_name=str(ip_adapter_bin.name),
-                download_kwargs={"local_files_only": True},
+            pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+                str(SDXL_DIR / "sdxl_base"),
+                controlnet=[controlnet_pose, controlnet_canny],
+                scheduler=scheduler,
+                torch_dtype=dtype,
+                variant="fp16",
+                use_safetensors=True,
             )
-            pipe.set_ip_adapter_scale(0.8)
-            ip_adapter_loaded = True
-        except Exception:
-            logger.exception("Failed to load IP-Adapter; continuing without it")
+            pipe.to(device)
+            pipe.enable_attention_slicing()
 
-    _sdxl_state["pipe"] = pipe
-    _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
-    return pipe, ip_adapter_loaded
+            lora_dir = SDXL_DIR / "lora"
+            try:
+                _load_trained_lora(pipe, lora_dir)
+            except Exception:
+                logger.exception("Failed to load trained LoRA; continuing without it")
+
+            # 兼容 .safetensors / .bin 两种常见权重文件(H-05)。
+            ip_adapter_candidates = [
+                SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.safetensors",
+                SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin",
+            ]
+            ip_adapter_bin = next((p for p in ip_adapter_candidates if p.exists()), None)
+            ip_adapter_loaded = False
+            if ip_adapter_bin is not None:
+                try:
+                    # 以本地目录为 pretrained_model_name_or_path 并显式 subfolder="",
+                    # 避免回连 HF,也避免缺省 subfolder 触发 TypeError(H-05)。
+                    pipe.load_ip_adapter(
+                        str(ip_adapter_bin.parent),
+                        subfolder="",
+                        weight_name=str(ip_adapter_bin.name),
+                        download_kwargs={"local_files_only": True},
+                    )
+                    pipe.set_ip_adapter_scale(0.8)
+                    ip_adapter_loaded = True
+                except Exception as exc:
+                    logger.exception("Failed to load IP-Adapter (%s); continuing without it", exc)
+            else:
+                logger.warning(
+                    "No IP-Adapter weight file found in %s; SDXL runs without image prompt", SDXL_DIR / "ip_adapter"
+                )
+
+            _sdxl_state["pipe"] = pipe
+            _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
+            return pipe, ip_adapter_loaded
+        except Exception:
+            # 加载失败必须释放已占显存,否则残留半成品会持续占用 VRAM(NEW-H3)。
+            logger.exception("Failed to build SDXL pipeline; releasing GPU memory")
+            if pipe is not None:
+                with contextlib.suppress(Exception):
+                    pipe.to("cpu")
+                _sdxl_state["pipe"] = None
+                _sdxl_state["ip_adapter_loaded"] = False
+            try:
+                import gc
+
+                import torch
+
+                del controlnet_pose, controlnet_canny
+                gc.collect()
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                logger.warning("Failed to release GPU memory after pipeline error")
+            raise
 
 
 def compose_tryon_sdxl(

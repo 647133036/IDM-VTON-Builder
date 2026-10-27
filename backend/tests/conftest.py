@@ -54,7 +54,8 @@ def _reset_filesystem():
         tmp = store_mod.STATE_FILE.with_suffix(".test.tmp")
         tmp.write_text(__import__("json").dumps(state, ensure_ascii=False), encoding="utf-8")
         tmp.replace(store_mod.STATE_FILE)
-        for d in (store_mod.UPLOADS, store_mod.RESULTS):
+        # 清理 BASES/TRASH 消除测试间顺序依赖(NEW-L5)。
+        for d in (store_mod.UPLOADS, store_mod.RESULTS, store_mod.BASES, store_mod.TRASH):
             for f in d.glob("*"):
                 if f.is_file():
                     f.unlink()

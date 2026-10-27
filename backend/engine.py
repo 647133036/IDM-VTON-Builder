@@ -89,7 +89,18 @@ def _idm_vton_available() -> tuple[bool, str]:
         return False, reason
 
     ckpt = WEIGHTS_DIR
-    required = ["unet", "vae", "text_encoder", "text_encoder_2", "tokenizer", "tokenizer_2"]
+    # 必须校验 unet_encoder(cross-attention encoder)与 scheduler,
+    # 否则目录齐了也会在推理时报 KeyError(NEW-M4)。
+    required = [
+        "unet",
+        "unet_encoder",
+        "vae",
+        "text_encoder",
+        "text_encoder_2",
+        "tokenizer",
+        "tokenizer_2",
+        "scheduler",
+    ]
     missing = [d for d in required if not (ckpt / d).exists()]
     if missing:
         return False, f"Missing weights: {', '.join(missing)}"
@@ -567,16 +578,27 @@ def compose_tryon(
     background: str = "white",
     ethnicity: str = "western_europe",
 ) -> Image.Image:
+    # 实际采用的引擎与降级原因挂在 result.info 上,由 worker 落库(NEW-H4)。
+    engine_name = "composite-fallback"
+    degraded = False
+    degraded_reason = ""
     license_allowed, _ = _license_allows_idm()
     if license_allowed:
         avail, _ = _idm_vton_available()
         if avail:
             try:
-                return _idm_vton_engine(
+                img = _idm_vton_engine(
                     base_path, garment_path, audience, garment_type, long_side, background, ethnicity
                 )
+                engine_name = "idm-vton"
+                img.info["engine"] = engine_name
+                img.info["engine_degraded"] = False
+                img.info["degraded_reason"] = ""
+                return img
             except Exception:
                 logger.exception("IDM-VTON engine failed; falling back to composite engine")
+                degraded = True
+                degraded_reason = "IDM-VTON engine failed at runtime; fell back to composite"
 
     if _LICENSE_MODE == "commercial":
         sdxl_reason = ""
@@ -585,14 +607,29 @@ def compose_tryon(
 
             sdxl_avail, sdxl_reason = sdxl_available()
             if sdxl_avail:
-                return compose_tryon_sdxl(
-                    base_path, garment_path, audience, garment_type, long_side, background, ethnicity
-                )
+                try:
+                    img = compose_tryon_sdxl(
+                        base_path, garment_path, audience, garment_type, long_side, background, ethnicity
+                    )
+                    engine_name = "sdxl-commercial"
+                    img.info["engine"] = engine_name
+                    img.info["engine_degraded"] = False
+                    img.info["degraded_reason"] = ""
+                    return img
+                except Exception:
+                    logger.exception("SDXL engine failed at runtime; falling back to composite engine")
+                    degraded = True
+                    degraded_reason = "SDXL engine failed at runtime; fell back to composite"
         except ImportError:
             sdxl_reason = "diffusers not installed"
-        logger.warning("commercial SDXL weights unavailable (%s); using in-repo composite engine", sdxl_reason)
+        if sdxl_reason and not degraded:
+            logger.warning("commercial SDXL weights unavailable (%s); using in-repo composite engine", sdxl_reason)
 
-    return _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
+    img = _composite_engine(base_path, garment_path, audience, garment_type, long_side, background, ethnicity)
+    img.info["engine"] = engine_name
+    img.info["engine_degraded"] = degraded
+    img.info["degraded_reason"] = degraded_reason
+    return img
 
 
 def engine_status() -> dict:
@@ -601,10 +638,12 @@ def engine_status() -> dict:
 
     sdxl_avail = False
     sdxl_reason = ""
+    ip_adapter_avail = False
     try:
-        from engine_sdxl import sdxl_available
+        from engine_sdxl import ip_adapter_available, sdxl_available
 
         sdxl_avail, sdxl_reason = sdxl_available()
+        ip_adapter_avail = ip_adapter_available()
     except Exception as e:  # noqa: BLE001
         sdxl_reason = str(e)
 
@@ -634,6 +673,7 @@ def engine_status() -> dict:
         "idm_vton_reason": reason if not avail else "",
         "sdxl_available": sdxl_avail,
         "sdxl_reason": sdxl_reason if not sdxl_avail else "",
+        "ip_adapter_available": ip_adapter_avail,
         "gpu_available": gpu_available,
         "engine": engine,
         "license_mode": _LICENSE_MODE or "unset",

@@ -141,7 +141,7 @@ function dashboardView() {
 
 function activeEngineLabel(l) {
   if (!l.gpu_available) return t('engine.noGpu')
-  if (l.sdxl_available) return t('engine.sdxlOk')
+  if (l.sdxl_available) return l.ip_adapter_available ? t('engine.sdxlOk') : t('engine.sdxlNoIp')
   return t('engine.sdxlNo')
 }
 
@@ -242,7 +242,7 @@ function batchView() {
           <label>${t('eth.filter')}
             <select id="eth-filter">
               <option value="">${t('eth.all')}</option>
-              ${(state.ethnicities || []).map((e) => `<option value="${e.value}" ${state.ethnicity === e.value ? 'selected' : ''}>${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
+              ${(state.ethnicities || []).map((e) => `<option value="${escapeHtml(e.value)}" ${state.ethnicity === e.value ? 'selected' : ''}>${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
             </select>
           </label>
         </div>
@@ -343,9 +343,21 @@ function basesView() {
             <label>${t('form.ethnicity')}
               <select id="bbeth">
                 <option value="">${t('base.keep')}</option>
-                ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
+                ${(state.ethnicities || []).map((e) => `<option value="${escapeHtml(e.value)}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
               </select>
-            </label>
+              <label>${t('eth.label')}</label>
+              <input id="eth-label" value="${escapeHtml(state.ethnicityLabel || '')}" placeholder="${escapeHtml(t('eth.labelPh'))}" />
+              <div class="row">
+                <button class="btn primary" id="eth-add">${t('eth.add')}</button>
+                <button class="btn ghost" id="eth-reset">${t('eth.reset')}</button>
+              </div>
+            </div>
+          </div>
+          <div class="panel">
+            <h3>${t('eth.manage')}</h3>
+            <div class="eth-list">
+              ${(state.ethnicities || []).map((e) => `<div class="eth-row"><span>${escapeHtml(fmtEthnicity(e.value, e.label))}</span><div><button class="btn ghost small eth-rename" data-value="${escapeHtml(e.value)}" data-label="${escapeHtml(e.label)}">${t('eth.rename')}</button><button class="btn ghost small eth-del" data-value="${escapeHtml(e.value)}">${t('eth.del')}</button></div></div>`).join('')}
+            </div>
           </div>
           <button class="btn gold small" id="base-batch-apply">${t('base.apply')}</button>
         </div>
@@ -382,7 +394,7 @@ function basesView() {
           </label>
           <label>${t('form.ethnicity')}
             <select id="beth">
-              ${(state.ethnicities || []).map((e) => `<option value="${e.value}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
+              ${(state.ethnicities || []).map((e) => `<option value="${escapeHtml(e.value)}">${escapeHtml(fmtEthnicity(e.value, e.label))}</option>`).join('')}
             </select>
           </label>
         </div>
@@ -399,8 +411,8 @@ function basesView() {
                 <span>${escapeHtml(fmtEthnicity(e.value, e.label))}</span>
                 <code>${escapeHtml(e.value)}</code>
                 <div class="row" style="flex:none">
-                  <button class="btn ghost small eth-rename" data-value="${e.value}" data-label="${escapeHtml(e.label)}">${t('eth.rename')}</button>
-                  <button class="btn ghost small eth-del" data-value="${e.value}">${t('eth.del')}</button>
+                  <button class="btn ghost small eth-rename" data-value="${escapeHtml(e.value)}" data-label="${escapeHtml(e.label)}">${t('eth.rename')}</button>
+                  <button class="btn ghost small eth-del" data-value="${escapeHtml(e.value)}">${t('eth.del')}</button>
                 </div>
               </div>`).join('')}
           </div>
@@ -562,7 +574,7 @@ function jobCards(jobs) {
       <img class="${j.status === 'done' ? 'zoomable' : ''}" src="${escapeHtml(j.preview_url || j.source_url)}" alt="" data-preview="${escapeHtml(j.status === 'done' ? j.id : '')}" />
       <div class="meta">
         <b>${escapeHtml(j.title || j.source_name)}</b>
-        <small>${escapeHtml(fmtAudience(j.audience) || j.audience)} · ${escapeHtml(j.message)}</small>
+        <small>${escapeHtml(fmtAudience(j.audience) || j.audience)} · ${escapeHtml(j.message)}${j.engine_degraded ? ` · ${escapeHtml(j.degraded_reason || t('job.degraded'))}` : ''}</small>
         <div class="bar"><i style="width:${j.progress || 0}%"></i></div>
       </div>
       <div>

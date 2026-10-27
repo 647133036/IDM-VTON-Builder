@@ -13,9 +13,12 @@ backend/data/state.json
 backend/data/state.tmp
 backend/data/state.lock
 backend/data/.jwt_secret
+backend/data/.admin_password
+backend/data/.staff_password
 
 dist/
 .monkeycode-tmp-files/
+public/tryon_preview/
 
 models/
 training/dataset/

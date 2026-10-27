@@ -173,5 +173,30 @@ def test_delete_all_bases_does_not_reseed(client=None):
     for b in list_bases():
         delete_base(b["id"])
     assert list_bases() == []
-    # 二次确认仍为空。
-    assert list_bases() == []
+
+
+def test_delete_base_uses_metadata_file(client=None):
+    """NEW-L2: delete_base 按元数据 file 删除内置底座文件(women_01.png)。"""
+    import store as s
+
+    s.seed_bases_if_empty()
+    seed_file = s.BASES / "women_01.png"
+    seed_file.write_bytes(b"fakeimg")
+    assert seed_file.exists()
+    delete_base("base_women_01")
+    assert not seed_file.exists()
+    # 文件应进 TRASH 而非彻底消失。
+    assert list(s.TRASH.glob("women_01.png"))
+
+
+def test_delete_ethnicity_repoints_to_existing(client=None):
+    """NEW-L3: 删除 east_asia 时底座回退到仍存在的 ethnicity。"""
+    import store as s
+
+    s.seed_bases_if_empty()
+    # 给底座标注 east_asia(种子数据已含)。
+    delete_ethnicity("east_asia")
+    remaining = [e["value"] for e in list_ethnicities()]
+    assert "east_asia" not in remaining
+    for b in list_bases():
+        assert b["ethnicity"] in remaining

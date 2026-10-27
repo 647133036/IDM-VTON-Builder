@@ -347,6 +347,12 @@ def api_add_ethnicity(body: EthnicityBody, _: dict = Depends(require_admin)):
     label = body.label.strip()
     if not value or not label:
         raise HTTPException(status_code=400, detail="Ethnicity value and label must not be empty")
+    # value 会渲染进 HTML 属性(NEW-M2),必须限定为安全的小写 slug,禁止引号/尖括号/空格。
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", value):
+        raise HTTPException(
+            status_code=400,
+            detail="Ethnicity value must be a lowercase slug: letters, digits, underscore, max 32 chars",
+        )
     try:
         return add_ethnicity({"value": value, "label": label})
     except KeyError as exc:
@@ -391,8 +397,8 @@ def _mask_store(item: dict, origin: str) -> dict:
     item["api_key"] = ""
     item["has_api_key"] = bool(key)
     if key:
-        # 短 key 整体隐藏;长 key 仅暴露首尾各 3 位。
-        item["api_key_masked"] = key[:3] + "***" + key[-3:] if len(key) > 8 else "***"
+        # 短 key 整体隐藏;≥12 位才暴露首尾各 3 位(NEW-L4,避免 9 位 key 泄露 2/3)。
+        item["api_key_masked"] = key[:3] + "***" + key[-3:] if len(key) >= 12 else "***"
     item["embed_url"] = embed_url(origin, item["id"])
     return item
 
@@ -450,8 +456,10 @@ def api_jobs(_: dict = Depends(current_user)):
 def api_list_uploads(category: str | None = None, _: dict = Depends(current_user)):
     items = []
     if category:
-        cat = _safe_name(category)
-        cat_dir = UPLOADS / cat
+        # 统一用 _category_dir:default 映射到 UPLOADS 根目录(P2-5),
+        # 否则 GET /api/uploads?category=default 永远返回 []。
+        cat_dir = _category_dir(category)
+        cat = "default" if category == "default" else _safe_category(category)
         if cat_dir.exists():
             for p in sorted(cat_dir.iterdir(), key=lambda x: x.stat().st_mtime, reverse=True):
                 if p.is_file() and p.suffix.lower() in _IMAGE_SUFFIXES:
@@ -533,9 +541,10 @@ def api_move_upload(filename: str, body: MoveBody, _: dict = Depends(require_adm
     if p.suffix.lower() not in _IMAGE_SUFFIXES:
         raise HTTPException(status_code=400, detail="Only image files can be moved here")
     category = body.category or "default"
-    if p.parent.name == category:
-        return {"ok": True, "filename": p.name, "category": category}
     cat_dir = _category_dir(category)
+    # 目标目录就是源目录时为无操作;否则会把根目录文件改名成 upload_xxx_1(P2-5)。
+    if cat_dir.resolve() == p.parent.resolve():
+        return {"ok": True, "filename": p.name, "category": "default" if category == "default" else category}
     cat_dir.mkdir(parents=True, exist_ok=True)
     dest = cat_dir / safe_name
     i = 1
@@ -610,7 +619,8 @@ def api_upload_categories(_: dict = Depends(current_user)):
 def api_get_upload(category: str, filename: str, _: dict = Depends(current_user)):
     safe_category = _safe_name(category)
     safe_name = _safe_name(filename)
-    p = UPLOADS / safe_category / safe_name
+    # 与 list/move 统一:default 映射到 UPLOADS 根目录(P2-5)。
+    p = _category_dir(safe_category) / safe_name
     if not p.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     if p.suffix.lower() not in _IMAGE_SUFFIXES:
@@ -799,6 +809,7 @@ def license_status():
         "idm_vton_license": "CC BY-NC-SA 4.0",
         "idm_vton_commercial_use": "Forbidden",
         "sdxl_available": status["sdxl_available"],
+        "ip_adapter_available": status["ip_adapter_available"],
         "gpu_available": status["gpu_available"],
         "current_engine": status["engine"],
         "compliance_advice": status["compliance_advice"],

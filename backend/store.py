@@ -254,25 +254,41 @@ def update_base(base_id: str, patch: dict) -> dict:
 
 
 def delete_base(base_id: str) -> None:
+    meta_file = None
+
     def _del(state: dict):
-        remaining = [b for b in state["bases"] if b["id"] != base_id]
-        if len(remaining) == len(state["bases"]):
+        nonlocal meta_file
+        for b in state["bases"]:
+            if b["id"] == base_id:
+                meta_file = b.get("file")
+                break
+        else:
             raise KeyError(base_id)
-        state["bases"] = remaining
+        state["bases"] = [b for b in state["bases"] if b["id"] != base_id]
 
     with_state(_del)
-    # 仅按精确文件名删除,避免 startswith 误删(base_1 不应匹配 base_10.png)。
-    for p in sorted(BASES.iterdir()):
-        if not p.is_file():
-            continue
-        if p.stem != base_id:
-            continue
+
+    def _trash(p: Path) -> None:
         dest = TRASH / p.name
         i = 1
         while dest.exists():
             dest = TRASH / f"{p.stem}_{i}{p.suffix}"
             i += 1
         p.replace(dest)
+
+    # 优先按元数据 file 删除内置底座(women_01.png 而非 base_women_01.png, NEW-L2);
+    # 无元数据时回退到 <base_id>.* 精确名匹配。
+    if meta_file:
+        target = BASES / Path(meta_file).name
+        if target.is_file():
+            _trash(target)
+            return
+    for p in sorted(BASES.iterdir()):
+        if not p.is_file():
+            continue
+        if p.stem != base_id:
+            continue
+        _trash(p)
         break
 
 
@@ -396,9 +412,15 @@ def delete_ethnicity(value: str) -> None:
         if len(remaining) == len(state["ethnicities"]):
             raise KeyError(value)
         state["ethnicities"] = remaining
+        # 被删的 ethnic 从底座上摘掉;回退目标必须仍然存在(NEW-L3)。
+        fallback = (
+            "east_asia"
+            if any(e["value"] == "east_asia" for e in remaining)
+            else (remaining[0]["value"] if remaining else "")
+        )
         for b in state["bases"]:
             if b.get("ethnicity") == value:
-                b["ethnicity"] = "east_asia"
+                b["ethnicity"] = fallback or ""
 
     with_state(_del)
 
