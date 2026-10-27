@@ -32,7 +32,7 @@
 - **文件权限**：state.json 权限 600
  - **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后仅允许全局可路由单播（拒绝内网 / 环回 / 链路本地 / 保留 / CGNAT / 组播 / 未指定），全部 HTTP 调用 `allow_redirects=False`
  - **XSS 防护**：前端动态字段经 `escapeHtml` 转义（含人种下拉 `value` 属性）；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验，`ethnicity.value` 限小写 slug（禁引号/尖括号/空格）
- - **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化；SDXL 管线首次加载有独立单飞锁，避免并发构建撑爆显存
+ - **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化；SDXL / IDM-VTON 管线与 ControlNet 检测器首次加载均有独立单飞锁（double-checked），避免并发构建撑爆显存
  - **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
  - **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
  - **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
