@@ -78,11 +78,16 @@ def sdxl_available() -> tuple[bool, str]:
 
 
 def ip_adapter_available() -> bool:
-    """是否存在 IP-Adapter 权重文件(不构建管线,纯文件检查)。"""
-    for name in ("ip-adapter-plus_sdxl_vit-h.safetensors", "ip-adapter-plus_sdxl_vit-h.bin"):
-        if (SDXL_DIR / "ip_adapter" / name).is_file():
-            return True
-    return False
+    """IP-Adapter 能否真正加载:权重文件与 image_encoder(CLIP vision)均须存在。"""
+    weight_ok = any(
+        (SDXL_DIR / "ip_adapter" / name).is_file()
+        for name in ("ip-adapter-plus_sdxl_vit-h.safetensors", "ip-adapter-plus_sdxl_vit-h.bin")
+    )
+    image_encoder_dir = SDXL_DIR / "ip_adapter" / "image_encoder"
+    enc_ok = (image_encoder_dir / "config.json").is_file() and (
+        (image_encoder_dir / "model.safetensors").is_file() or (image_encoder_dir / "pytorch_model.bin").is_file()
+    )
+    return weight_ok and enc_ok
 
 
 _pose_detector = None
@@ -144,16 +149,35 @@ def _get_sdxl_pipe(device, dtype):
         if _sdxl_state["pipe"] is not None:
             return _sdxl_state["pipe"], _sdxl_state["ip_adapter_loaded"], _sdxl_state["ip_adapter_reason"]
 
+        import torch
         from diffusers import (
             ControlNetModel,
             DDPMScheduler,
             StableDiffusionXLControlNetPipeline,
         )
 
-        scheduler = DDPMScheduler.from_pretrained(str(SDXL_DIR / "sdxl_base"), subfolder="scheduler")
+        scheduler = DDPMScheduler.from_pretrained(
+            str(SDXL_DIR / "sdxl_base"), subfolder="scheduler", local_files_only=True
+        )
 
-        controlnet_pose = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_openpose"), torch_dtype=dtype)
-        controlnet_canny = ControlNetModel.from_pretrained(str(SDXL_DIR / "controlnet_canny"), torch_dtype=dtype)
+        # thibaud/controlnet-openpose-sdxl-1.0 ships the weights as a single-file
+        # checkpoint (OpenPoseXL2.safetensors) rather than a diffusers subfolder layout.
+        openpose_ckpt = SDXL_DIR / "controlnet_openpose"
+        openpose_single = openpose_ckpt / "OpenPoseXL2.safetensors"
+        if openpose_single.exists():
+            controlnet_pose = ControlNetModel.from_single_file(str(openpose_single), torch_dtype=dtype)
+        else:
+            controlnet_pose = ControlNetModel.from_pretrained(
+                str(openpose_ckpt), torch_dtype=dtype, use_safetensors=True, local_files_only=True
+            )
+        # diffusers/controlnet-canny-sdxl-1.0 uses a diffusers layout with an fp16 variant.
+        controlnet_canny = ControlNetModel.from_pretrained(
+            str(SDXL_DIR / "controlnet_canny"),
+            torch_dtype=dtype,
+            variant="fp16",
+            use_safetensors=True,
+            local_files_only=True,
+        )
 
         pipe = None
         try:
@@ -164,9 +188,11 @@ def _get_sdxl_pipe(device, dtype):
                 torch_dtype=dtype,
                 variant="fp16",
                 use_safetensors=True,
+                local_files_only=True,
             )
             pipe.to(device)
-            pipe.enable_attention_slicing()
+            # SDXL base VAE 需以 fp32 解码,否则 fp16 下解码溢出产生 NaN/黑图。
+            pipe.vae = pipe.vae.to(torch.float32)
 
             lora_dir = SDXL_DIR / "lora"
             try:
@@ -203,6 +229,10 @@ def _get_sdxl_pipe(device, dtype):
                     "No IP-Adapter weight file found in %s; SDXL runs without image prompt", SDXL_DIR / "ip_adapter"
                 )
 
+            # attention slicing 必须在 load_ip_adapter 之后启用,否则
+            # IP-Adapter 转换时 SlicedAttnProcessor 缺 slice_size 参数报错。
+            pipe.enable_attention_slicing()
+
             _sdxl_state["pipe"] = pipe
             _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
             _sdxl_state["ip_adapter_reason"] = ip_adapter_reason
@@ -218,8 +248,6 @@ def _get_sdxl_pipe(device, dtype):
                 _sdxl_state["ip_adapter_reason"] = ""
             try:
                 import gc
-
-                import torch
 
                 del controlnet_pose, controlnet_canny
                 gc.collect()
@@ -282,10 +310,13 @@ def compose_tryon_sdxl(
     if ip_adapter_loaded:
         pipe_kwargs["ip_adapter_image"] = cloth_img
 
+    # 采样(含 denoise)在 autocast 下跑;VAE 解码移出 autocast 并以 fp32 执行,
+    # 否则 SDXL fp16 VAE 解码溢出产生 NaN/黑图。
     with _GPU_LOCK, torch.no_grad(), torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
-        output = pipe(**pipe_kwargs)
-
-    result = output.images[0]
+        latents = pipe(**{**pipe_kwargs, "output_type": "latent"}).images
+    with torch.no_grad():
+        decoded = pipe.vae.decode(latents.to(torch.float32) / pipe.vae.config.scaling_factor, return_dict=False)[0]
+    result = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
 
     if background == "transparent":
         result = _remove_background(result)

@@ -1,6 +1,8 @@
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+# 上游 vendored 代码(IDM-VTON,CC BY-NC-SA 4.0)与前端产物不属于本项目代码,不参与 lint。
+extend-exclude = ["IDM-VTON", "node_modules", "dist"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "B", "UP", "I", "SIM", "RUF", "C4", "BLE"]

@@ -151,7 +151,7 @@ ControlNet 权重需要调整：
 ```python
 # OpenPose 权重高，保持身体结构
 # Canny 权重低，只保留服装边缘
-controlnet_conditioning_scale=[0.8, 0.6]
+controlnet_conditioning_scale = [0.8, 0.6]
 ```
 
 如果衣服"飘"在空中，提高 Canny 权重到 0.8。
@@ -161,8 +161,8 @@ controlnet_conditioning_scale=[0.8, 0.6]
 ### 5. 生成参数
 
 ```python
-num_inference_steps=30  # 质量优先
-guidance_scale=7.5      # 适中
+num_inference_steps = 30  # 质量优先
+guidance_scale = 7.5  # 适中
 ```
 
 速度优先可降到 20 步。

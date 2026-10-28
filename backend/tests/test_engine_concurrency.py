@@ -23,11 +23,19 @@ def _install_fake_diffusers(monkeypatch, pipe, load_raises=False):
     )
     monkeypatch.setitem(sys.modules, "diffusers", diffusers)
 
+    torch = types.ModuleType("torch")
+    torch.float32 = "float32"
+    torch.cuda = types.SimpleNamespace(empty_cache=staticmethod(lambda: None))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
 
 def _make_sdxl_pipe(monkeypatch, ip_raises):
     calls = {"load_ip_adapter": 0, "load_ip_adapter_args": None, "load_ip_adapter_kwargs": None}
 
     class FakePipe:
+        def __init__(self):
+            self.vae = types.SimpleNamespace(to=staticmethod(lambda self, *a, **k: self))
+
         def to(self, *a, **k):
             return self
 
