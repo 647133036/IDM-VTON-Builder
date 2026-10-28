@@ -66,7 +66,7 @@ def test_sdxl_ip_adapter_load_failure_marks_degraded(monkeypatch, tmp_path):
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
     ipdir = tmp_path / "ip_adapter"
     ipdir.mkdir()
-    (ipdir / "ip-adapter-plus_sdxl_vit-h.safetensors").write_bytes(b"x")
+    (ipdir / "ip-adapter_sdxl_vit-h.safetensors").write_bytes(b"x")
 
     monkeypatch.setattr(engine_sdxl, "SDXL_DIR", tmp_path)
     monkeypatch.setattr(engine_sdxl, "_IDM_DIR", tmp_path)
@@ -81,11 +81,11 @@ def test_sdxl_ip_adapter_load_failure_marks_degraded(monkeypatch, tmp_path):
     assert got_pipe is pipe
     assert loaded is False
     assert "failed to load" in reason
-    assert "ip-adapter-plus_sdxl_vit-h.safetensors" in reason
+    assert "ip-adapter_sdxl_vit-h.safetensors" in reason
     assert calls["load_ip_adapter"] == 1
     # NEW-H1:必须显式传 subfolder="" + weight_name + local_files_only,防 0.34 签名回归。
     assert calls["load_ip_adapter_kwargs"]["subfolder"] == ""
-    assert calls["load_ip_adapter_kwargs"]["weight_name"] == "ip-adapter-plus_sdxl_vit-h.safetensors"
+    assert calls["load_ip_adapter_kwargs"]["weight_name"] == "ip-adapter_sdxl_vit-h.safetensors"
     assert calls["load_ip_adapter_kwargs"]["download_kwargs"] == {"local_files_only": True}
 
 

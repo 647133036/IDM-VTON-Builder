@@ -81,7 +81,7 @@ def ip_adapter_available() -> bool:
     """IP-Adapter 能否真正加载:权重文件与 image_encoder(CLIP vision)均须存在。"""
     weight_ok = any(
         (SDXL_DIR / "ip_adapter" / name).is_file()
-        for name in ("ip-adapter-plus_sdxl_vit-h.safetensors", "ip-adapter-plus_sdxl_vit-h.bin")
+        for name in ("ip-adapter_sdxl_vit-h.safetensors", "ip-adapter_sdxl_vit-h.bin")
     )
     image_encoder_dir = SDXL_DIR / "ip_adapter" / "image_encoder"
     enc_ok = (image_encoder_dir / "config.json").is_file() and (
@@ -202,8 +202,8 @@ def _get_sdxl_pipe(device, dtype):
 
             # 兼容 .safetensors / .bin 两种常见权重文件(H-05)。
             ip_adapter_candidates = [
-                SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.safetensors",
-                SDXL_DIR / "ip_adapter" / "ip-adapter-plus_sdxl_vit-h.bin",
+                SDXL_DIR / "ip_adapter" / "ip-adapter_sdxl_vit-h.safetensors",
+                SDXL_DIR / "ip_adapter" / "ip-adapter_sdxl_vit-h.bin",
             ]
             ip_adapter_bin = next((p for p in ip_adapter_candidates if p.exists()), None)
             ip_adapter_loaded = False
@@ -229,9 +229,11 @@ def _get_sdxl_pipe(device, dtype):
                     "No IP-Adapter weight file found in %s; SDXL runs without image prompt", SDXL_DIR / "ip_adapter"
                 )
 
-            # attention slicing 必须在 load_ip_adapter 之后启用,否则
-            # IP-Adapter 转换时 SlicedAttnProcessor 缺 slice_size 参数报错。
-            pipe.enable_attention_slicing()
+            # IP-Adapter 激活时不启用 attention slicing:SlicedAttnProcessor 会
+            # 覆盖 IPAdapter 处理器,而后者需要 unet 传入的 (text, image) 元组。
+            # 无 IP-Adapter 时 slicing 仍是纯内存优化,可安全启用。
+            if not ip_adapter_loaded:
+                pipe.enable_attention_slicing()
 
             _sdxl_state["pipe"] = pipe
             _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
