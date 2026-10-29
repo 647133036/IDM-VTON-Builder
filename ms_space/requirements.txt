@@ -1,0 +1,11 @@
+# 换衣 Demo 依赖(torch/torchvision 由创空间 Gradio base_image 预装)。
+gradio>=4.20
+diffusers==0.42.0
+transformers>=4.40,<5
+controlnet-aux>=0.1.4
+accelerate>=0.30
+safetensors>=0.4.3
+huggingface-hub>=0.24
+modelscope>=1.40
+Pillow>=10.0
+numpy>=1.24
