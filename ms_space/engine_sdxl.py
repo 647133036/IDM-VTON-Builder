@@ -22,6 +22,16 @@ _sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False, "ip_adapter_reaso
 
 SDXL_DIR = Path(os.environ.get("MODELS_DIR", "/mnt/workspace/models/sdxl"))
 
+# 质量调优参数(环境变量可覆盖,便于创空间配置与离线实验):
+#   MS_CLOTH_CANNY=1   加衣服边缘(第3 controlnet)约束衣服结构,避免严重变形;
+#   MS_IP_MODEL_REF=1  将模特图纳入 IP-Adapter 参考,保留模特身份(脸/肤色/体型);
+#   MS_IP_SCALE / MS_CFG / MS_STEPS 控制 IP-Adapter 强度、引导系数与步数。
+CLOTH_CANNY = os.environ.get("MS_CLOTH_CANNY", "1") == "1"
+IP_MODEL_REF = os.environ.get("MS_IP_MODEL_REF", "1") == "1"
+IP_SCALE = float(os.environ.get("MS_IP_SCALE", "0.8"))
+CFG = float(os.environ.get("MS_CFG", "7.5"))
+STEPS = int(os.environ.get("MS_STEPS", "32"))
+
 AUDIENCE_PROMPTS = {
     "women": "a fashion model wearing this garment, full body front view, professional fashion photography",
     "men": "a male fashion model wearing this garment, full body front view, professional fashion photography",
@@ -193,24 +203,27 @@ def _get_sdxl_pipe(device, dtype):
         # 故不默认全加载;depth 缺失或失败时退回 pose+canny。
         depth_dir = SDXL_DIR / "controlnet_depth"
         depth_loaded = False
+        controlnets = [controlnet_pose]
         if (depth_dir / "config.json").exists():
             try:
-                controlnets = [
-                    controlnet_pose,
+                controlnets.append(
                     ControlNetModel.from_pretrained(
                         str(depth_dir),
                         torch_dtype=dtype,
                         variant="fp16",
                         use_safetensors=True,
                         local_files_only=True,
-                    ),
-                ]
+                    )
+                )
                 depth_loaded = True
             except Exception:
                 logger.exception("Failed to load depth ControlNet; falling back to canny")
-                controlnets = [controlnet_pose, _load_canny()]
+                controlnets.append(_load_canny())
         else:
-            controlnets = [controlnet_pose, _load_canny()]
+            controlnets.append(_load_canny())
+        # 衣服边缘结构(第3 controlnet):约束衣服形状,避免衣服严重变形。
+        if CLOTH_CANNY:
+            controlnets.append(_load_canny())
 
         pipe = None
         try:
@@ -242,7 +255,7 @@ def _get_sdxl_pipe(device, dtype):
                         weight_name=str(ip_adapter_bin.name),
                         download_kwargs={"local_files_only": True},
                     )
-                    pipe.set_ip_adapter_scale(0.8)
+                    pipe.set_ip_adapter_scale(IP_SCALE)
                     ip_adapter_loaded = True
                 except Exception as exc:
                     logger.exception("Failed to load IP-Adapter (%s); continuing without it", exc)
@@ -336,6 +349,10 @@ def compose_tryon_sdxl(
     else:
         control_images.append(_get_canny_control(cloth_img))
         control_scales.append(0.55)
+    # 衣服边缘结构:与第3 controlnet 对应,约束衣服形状避免严重变形。
+    if CLOTH_CANNY:
+        control_images.append(_get_canny_control(cloth_img))
+        control_scales.append(0.55)
 
     generator = torch.Generator(device=device).manual_seed(42)
 
@@ -346,14 +363,23 @@ def compose_tryon_sdxl(
         "controlnet_conditioning_scale": control_scales,
         "width": target_w,
         "height": target_h,
-        "num_inference_steps": 32,
-        "guidance_scale": 7.5,
+        "num_inference_steps": STEPS,
+        "guidance_scale": CFG,
         "generator": generator,
         "output_type": "pil",
     }
 
     if ip_adapter_loaded:
-        pipe_kwargs["ip_adapter_image"] = cloth_img
+        if IP_MODEL_REF:
+            # 保留模特身份:把原模特图与衣服图水平拼接为单张 IP-Adapter 参考
+            # (脸/肤色/发型/体型 + 衣服外观)。不用多图 list:diffusers 0.42 的
+            # h94 非 plus 多图路径会挂死,拼接走单图路径避免该 bug。
+            combined = PILImage.new("RGB", (target_w * 2, target_h))
+            combined.paste(human_img, (0, 0))
+            combined.paste(cloth_img, (target_w, 0))
+            pipe_kwargs["ip_adapter_image"] = combined
+        else:
+            pipe_kwargs["ip_adapter_image"] = cloth_img
 
     with _GPU_LOCK, torch.no_grad(), torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
         latents = pipe(**{**pipe_kwargs, "output_type": "latent"}).images
