@@ -42,6 +42,15 @@ def _make_sdxl_pipe(monkeypatch, ip_raises):
         def enable_attention_slicing(self, *a, **k):
             return None
 
+        def enable_model_cpu_offload(self, *a, **k):
+            return None
+
+        def enable_vae_slicing(self, *a, **k):
+            return None
+
+        def enable_vae_tiling(self, *a, **k):
+            return None
+
         def set_ip_adapter_scale(self, *a, **k):
             return None
 

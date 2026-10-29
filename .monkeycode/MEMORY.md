@@ -50,3 +50,23 @@ Entries discovered by the Agent during task execution should follow this format:
     explicit path arguments from the repo root; `training/` does not exist under `backend/`.
   - Security fixes must ship with a regression test that fails before the fix is applied
     (requestor requirement); add it to `backend/tests/test_api.py` unless the layer differs.
+
+[Project Knowledge Summary]
+- Date: 2026-10-28
+- Context: Discovered by Agent while debugging IP-Adapter on the RTX 4090 (diffusers 0.42.0, SDXL ControlNet pipeline)
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - IP-Adapter Plus (`ip-adapter-plus_sdxl_vit-h`) is incompatible with diffusers 0.42:
+    the plus `image_proj` returns a tuple the attention processor cannot consume, and
+    plus needs last_hidden (patch) features while the pipeline's `encode_image` uses
+    pooled embeddings. Use the NON-plus `ip-adapter_sdxl_vit-h` instead; its `image_proj`
+    is a simple MLP (`image_proj.norm`+`image_proj.proj`), works with the h94 `models/
+    image_encoder` (hidden 1280, proj 1024).
+  - `enable_attention_slicing()` MUST NOT be called when IP-Adapter is loaded:
+    `SlicedAttnProcessor` replaces the IPAdapter processors and crashes with
+    `AttributeError: 'tuple' object has no attribute 'shape'` because `unet_2d_condition`
+    (ip_image_proj branch) passes `encoder_hidden_states` as a `(text, image)` tuple.
+  - `run_test.sh`/`run_app.sh` need `export HF_ENDPOINT=https://hf-mirror.com` first, and
+    all local component loads use `local_files_only=True` to avoid HF network hangs.
+  - The IP-Adapter weight dir is `app/models/sdxl/ip_adapter/`: weight file plus an
+    `image_encoder/` (config.json + model.safetensors) must both exist for it to load.

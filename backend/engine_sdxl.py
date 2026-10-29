@@ -11,7 +11,7 @@ logger = logging.getLogger("atelier.engine_sdxl")
 
 _GPU_LOCK = threading.Lock()
 _PIPE_LOCK = threading.Lock()
-_sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False, "ip_adapter_reason": ""}
+_sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False, "ip_adapter_reason": "", "depth_loaded": False}
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 SDXL_DIR = _REPO_ROOT / "models" / "sdxl"
@@ -55,6 +55,13 @@ GARMENT_PROMPT_SUFFIX = {
     "onesie": "onesie, romper, baby body",
 }
 
+# 换衣贴合度:强调合身、布料褶皱与立体垂坠,避免"平面贴纸"感。
+FIT_PROMPT = (
+    "the garment fits the model's body perfectly, snug and form-fitting, "
+    "realistic 3D fabric folds and creases, cloth draping naturally over the "
+    "body contour with realistic volume and soft shadows, tailored fit"
+)
+
 
 def sdxl_available() -> tuple[bool, str]:
     # 目录存在还不够:校验关键模型文件,避免"看似可用实则加载即炸"。
@@ -92,6 +99,7 @@ def ip_adapter_available() -> bool:
 
 _pose_detector = None
 _canny_detector = None
+_depth_detector = None
 
 
 def _get_openpose_control(image: Image.Image) -> Image.Image:
@@ -120,6 +128,23 @@ def _get_canny_control(image: Image.Image) -> Image.Image:
             if _canny_detector is None:
                 _canny_detector = CannyDetector()
     return _canny_detector(image, low_threshold=100, high_threshold=200, detect_resolution=1024, image_resolution=1024)
+
+
+def _get_depth_control(image: Image.Image) -> Image.Image:
+    """人体深度图:换衣贴合体型、产生布料褶皱与立体感的关键条件(贴合改进)。"""
+    global _depth_detector
+    from controlnet_aux import MidasDetector
+
+    if _depth_detector is None:
+        # 懒加载加锁:并发首载会重复构建检测器,用 _PIPE_LOCK 单飞。
+        with _PIPE_LOCK:
+            if _depth_detector is None:
+                annotator_dir = SDXL_DIR / "annotators"
+                if annotator_dir.exists():
+                    _depth_detector = MidasDetector.from_pretrained(str(annotator_dir))
+                else:
+                    _depth_detector = MidasDetector.from_pretrained("lllyasviel/Annotators")
+    return _depth_detector(image)
 
 
 def _load_trained_lora(pipe, lora_dir: Path) -> str | None:
@@ -170,28 +195,53 @@ def _get_sdxl_pipe(device, dtype):
             controlnet_pose = ControlNetModel.from_pretrained(
                 str(openpose_ckpt), torch_dtype=dtype, use_safetensors=True, local_files_only=True
             )
+
         # diffusers/controlnet-canny-sdxl-1.0 uses a diffusers layout with an fp16 variant.
-        controlnet_canny = ControlNetModel.from_pretrained(
-            str(SDXL_DIR / "controlnet_canny"),
-            torch_dtype=dtype,
-            variant="fp16",
-            use_safetensors=True,
-            local_files_only=True,
-        )
+        def _load_canny():
+            return ControlNetModel.from_pretrained(
+                str(SDXL_DIR / "controlnet_canny"),
+                torch_dtype=dtype,
+                variant="fp16",
+                use_safetensors=True,
+                local_files_only=True,
+            )
+
+        # 贴合改进:默认只加载 pose+depth(2 个 controlnet)。3 个 controlnet 常驻
+        # 会超出 24GB 显存,故不默认全加载;depth 缺失或失败时退回 pose+canny。
+        depth_dir = SDXL_DIR / "controlnet_depth"
+        depth_loaded = False
+        if (depth_dir / "config.json").exists():
+            try:
+                controlnets = [
+                    controlnet_pose,
+                    ControlNetModel.from_pretrained(
+                        str(depth_dir),
+                        torch_dtype=dtype,
+                        variant="fp16",
+                        use_safetensors=True,
+                        local_files_only=True,
+                    ),
+                ]
+                depth_loaded = True
+            except Exception:
+                logger.exception("Failed to load depth ControlNet; falling back to canny")
+                controlnets = [controlnet_pose, _load_canny()]
+        else:
+            controlnets = [controlnet_pose, _load_canny()]
 
         pipe = None
         try:
             pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
                 str(SDXL_DIR / "sdxl_base"),
-                controlnet=[controlnet_pose, controlnet_canny],
+                controlnet=controlnets,
                 scheduler=scheduler,
                 torch_dtype=dtype,
                 variant="fp16",
                 use_safetensors=True,
                 local_files_only=True,
             )
-            pipe.to(device)
             # SDXL base VAE 需以 fp32 解码,否则 fp16 下解码溢出产生 NaN/黑图。
+            # 此刻组件在 CPU 上,直接改 dtype 即可。
             pipe.vae = pipe.vae.to(torch.float32)
 
             lora_dir = SDXL_DIR / "lora"
@@ -235,9 +285,20 @@ def _get_sdxl_pipe(device, dtype):
             if not ip_adapter_loaded:
                 pipe.enable_attention_slicing()
 
+            # 多 controlnet(pose+canny+depth)+IP-Adapter 超出 24GB 显存:
+            # offload text_encoder/VAE/IP-Adapter image_encoder 到 CPU,只留
+            # unet+controlnet 在 GPU,显著降低峰值显存(贴合改进引入 depth 后)。
+            pipe.enable_model_cpu_offload(device=device)
+            # VAE tiling/slicing 进一步压低解码峰值显存(多 controlnet 场景);
+            # 该管线在部分 diffusers 版本无此方法,缺失时静默跳过。
+            for _m in ("enable_vae_slicing", "enable_vae_tiling"):
+                if hasattr(pipe, _m):
+                    getattr(pipe, _m)()
+
             _sdxl_state["pipe"] = pipe
             _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
             _sdxl_state["ip_adapter_reason"] = ip_adapter_reason
+            _sdxl_state["depth_loaded"] = depth_loaded
             return pipe, ip_adapter_loaded, ip_adapter_reason
         except Exception:
             # 加载失败必须释放已占显存,否则残留半成品会持续占用 VRAM(NEW-H3)。
@@ -248,10 +309,11 @@ def _get_sdxl_pipe(device, dtype):
                 _sdxl_state["pipe"] = None
                 _sdxl_state["ip_adapter_loaded"] = False
                 _sdxl_state["ip_adapter_reason"] = ""
+                _sdxl_state["depth_loaded"] = False
             try:
                 import gc
 
-                del controlnet_pose, controlnet_canny
+                del controlnets
                 gc.collect()
                 torch.cuda.empty_cache()
             except Exception:  # noqa: BLE001
@@ -287,23 +349,41 @@ def compose_tryon_sdxl(
     garment_suffix = GARMENT_PROMPT_SUFFIX.get(garment_type, "")
     if garment_suffix:
         prompt = f"{prompt}, wearing {garment_suffix}"
+    prompt = f"{prompt}, {FIT_PROMPT}"
     negative_prompt = AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE["women"])
 
     pipe, ip_adapter_loaded, ip_adapter_reason = _get_sdxl_pipe(device, dtype)
 
     control_pose = _get_openpose_control(human_img)
-    control_canny = _get_canny_control(cloth_img)
+
+    # 贴合改进:depth 存在时用 pose+depth(深度图约束衣服包裹体型、产生立体
+    # 褶皱);depth 不可用(depth_loaded=False)时退回 pose+canny。两者都保证
+    # images 数量与已加载的 controlnet 数量一致。
+    control_images = [control_pose]
+    control_scales = [0.8]
+    if _sdxl_state.get("depth_loaded"):
+        try:
+            control_images.append(_get_depth_control(human_img))
+            control_scales.append(0.95)
+        except Exception:
+            logger.exception("Depth control failed; continuing without it")
+            # 保底:中性灰占位图,保证与 controlnet 数量一致,避免 check_inputs 报错。
+            control_images.append(PILImage.new("RGB", (target_w, target_h), (128, 128, 128)))
+            control_scales.append(0.0)
+    else:
+        control_images.append(_get_canny_control(cloth_img))
+        control_scales.append(0.55)
 
     generator = torch.Generator(device=device).manual_seed(42)
 
     pipe_kwargs = {
         "prompt": prompt,
         "negative_prompt": negative_prompt,
-        "image": [control_pose, control_canny],
-        "controlnet_conditioning_scale": [0.8, 0.6],
+        "image": control_images,
+        "controlnet_conditioning_scale": control_scales,
         "width": target_w,
         "height": target_h,
-        "num_inference_steps": 30,
+        "num_inference_steps": 32,
         "guidance_scale": 7.5,
         "generator": generator,
         "output_type": "pil",
