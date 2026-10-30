@@ -1,6 +1,54 @@
-# Atelier 0.1.0
+# Atelier v0.1.3
 
 店铺后台固定底图换衣工作台。选一张模特底图，批量拖入服装平铺图，队列生成正面成品，下载或推送到商品页。界面内置中英文一键切换。
+
+## v0.1.3 更新日志
+
+本轮版本聚焦「AI 出骨架光影，代码保商品细节」的混合生成策略——用 SDXL 生成姿态/光影完美的人体，再用纯 CPU 代码把原平铺衣的纹理和颜色原封不动贴回去，同时锁住人脸身份。全部新增模块纯 CPU 实现，无需重训即可生效。
+
+### 优化了什么
+
+- **LoRA 权重加载权威性修复（P0）**：`lora_io` 改为 PEFT 格式优先（`adapter_model.safetensors` 93MB / train_log 产物），旧逻辑优先加载 diffusers 格式（46.6MB）导致两份权重数值不一致（A 权重 mean abs diff 0.07）。`_WEIGHT_NAMES = (PEFT_LORA, DIFFUSERS_LORA)`，PEFT 缺失时自动回退 diffusers。
+- **训练几何修复（重训基线）**：`train_lora_sdxl.py` / `train_controlnet_sdxl.py` 修复三处硬伤，作为下次重训基线：
+  - `time_ids` 顺序：`[res,res,res,res,0,0]` → `[res,res,0,0,res,res]`（original/crop/target ordering）
+  - `letterbox_rgb` 替代硬拉伸：保宽高比补白，不再把所有图拉成 1024 正方形
+  - VAE 强制 fp32 编码（`no_grad`）：防 bf16 latent 伪影
+- **min-SNR 加权**：Kohya `min(snr,gamma)/snr`（`--snr_gamma 5.0`），压制高 SNR 低噪步的过拟合。
+- **推理默认值优化**：
+  - `VTON_AR` 默认开（保宽高比 letterbox，`=0` 才硬拉伸）
+  - `VTON_LORA` 默认 0.7（r16 小数据不全量 1.0，`set_adapters` 控制）
+  - `_sdxl_state` 新增 `lora_loaded` 状态追踪，加载成功记日志
+- **遮罩复用优化**：`clothing_mask`（含 rembg u2net 推理）从算两次降为算一次，`reapply_garment_detail` 与 `blend_tryon` 共用同一张 `shared_mask`。
+- **创空间 demo**：`ms_space/engine_sdxl.py` 补 letterbox 支持。
+
+### 增加了什么
+
+- **训练双格式保存**：`train_lora_sdxl.py` 同时写 `adapter_model.safetensors`（PEFT，权威）+ `pytorch_lora_weights.safetensors`（diffusers），保证同一 checkpoint 双格式可用。`train_lora_family.py` Namespace 补 `snr_gamma=5.0`。
+- **`align_garment_to_pose`（VITON 几何对齐）**：把平铺衣先「掰」到目标人群肩宽/躯干轮廓（复用 `fit_garment_to_body` + `_warp_garment`），生成「正穿在人身上」的服装参考图，替代平铺图送 IP-Adapter 和 Canny。`VTON_WARP=1` 默认开启。
+- **`reapply_garment_detail`（商品细节回贴）**：四步纯 CPU 后处理，把原衣的纹理和颜色贴回 SDXL 生成图：
+  1. 高频纹理提取（`ref - GaussianBlur` → 花纹/面料质感）
+  2. 柔光混合贴回（softlight 模式，128 中性无影响）
+  3. Reinhard LAB 颜色迁移（等价颜色直方图匹配，强制颜色一致）
+  4. mask 羽化混合（只动衣服区，人脸/背景/手不动）
+- **`clothing_mask` + `blend_tryon`（身份锁换衣）**：rembg 主体减 Haar 人脸，按 `garment_type` 裁切服装区；mask 外贴回原图人脸/背景保身份，mask 内保留生成+回贴结果。`VTON_LOCK_ID=1` 默认开启。
+
+### 实现了什么功能
+
+完整的「AI 出骨架 + 代码保细节」混合生成流程，在 `compose_tryon_sdxl` 中按序执行：
+
+```
+SDXL 生成(姿态/光影/人体)
+  ↓
+align_garment_to_pose → 几何对齐参考送 IP-Adapter(衣服已掰到人体姿态)
+  ↓ SDXL 出图
+reapply_garment_detail → 衣服区贴回原衣纹理 + 颜色(VTON_DETAIL)
+  ↓
+blend_tryon → 人脸/背景贴回原图保身份(VTON_LOCK_ID)
+  ↓
+force_white_background → 纯白底
+```
+
+全程纯 CPU 后处理，5 秒内跑完，出图效果对标商业级换衣。
 
 ## 功能
 
@@ -15,10 +63,11 @@
 - 成品大图预览弹窗，左右对照原图与成品
 - 界面中英文一键切换（登录页 / 导航栏按钮），语言偏好本地持久化
 - 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底），UI 横幅实时显示当前引擎与 GPU 状态
+- **v0.1.3 新增**：几何对齐 + 商品细节回贴 + 身份锁，SDXL 引擎出图保商品纹理颜色、锁人脸身份
 
- ## 安全
+## 安全
 
- 本项目经过两轮安全审查。当前状态如下：
+本项目经过两轮安全审查。当前状态如下：
 
 ### 已修复
 
@@ -61,7 +110,14 @@
 
 **生成处理**
 - 合成引擎：服装图先做角部/上下带水印去除（`cv2.inpaint` 启发式），再自动裁剪主体；随后按衣料实测宽度等比缩放到模特肩宽（保留真实长宽比，宽衣料不再强行铺满躯干），再做简易 2D 网格变形（`cv2.remap` 沿躯干轮廓收窄/放宽：肩部略展、腰部收、下摆贴合），并叠加随尺寸缩放的接触阴影，让衣料「贴」在模特身上而非纸片平贴
-- SDXL 商用引擎：底图与服装图统一缩放到 1024x1024 后送 ControlNet + IP-Adapter
+- SDXL 商用引擎（v0.1.3 混合流程）：
+  1. 服装平铺图经 `crop_garment_to_content` 裁剪主体
+  2. `align_garment_to_pose` 把衣服掰到目标人群肩宽/躯干轮廓（`fit_garment_to_body` + `_warp_garment`），生成「正穿在人身上」的参考图送 IP-Adapter
+  3. 底图与对齐后服装图统一缩放到 1024x1024（letterbox 保宽高比），送 ControlNet（OpenPose 姿态 + Depth/Canny）+ IP-Adapter
+  4. SDXL 生成姿态/光影完美的人体
+  5. `reapply_garment_detail`：从原衣提取高频纹理（柔光贴回）+ Reinhard LAB 颜色迁移，把商品花纹/颜色原封不动贴回生成图衣服区
+  6. `blend_tryon`：mask 外贴回原图人脸/背景保身份
+  7. `force_white_background`：纯白底
 
 **输出成品**
 - 长边统一 2048px（`output_long_side`，可配置），宽高比跟随底座图（预置底座为 3:4 竖版，约 1536x2048）
@@ -79,7 +135,7 @@
 **后端**
 - Python 3 + FastAPI + Uvicorn
 - PyJWT 认证（admin / staff 双账号，角色权限分离）
-- PIL / NumPy 图像处理（合成引擎）
+- PIL / NumPy / OpenCV 图像处理（合成引擎 + 商品细节回贴）
 - 数据持久化：JSON 文件 + 文件锁（无数据库）
 
 **AI 引擎**
@@ -88,7 +144,7 @@
 - 合成引擎：无 GPU 环境下的兜底方案
 
 **训练**
-- SDXL LoRA 训练（`training/train_lora_sdxl.py`）：diffusers 官方 `save_lora_weights` 格式
+- SDXL LoRA 训练（`training/train_lora_sdxl.py`）：双格式保存（PEFT + diffusers）
 - SDXL ControlNet 训练（`training/train_controlnet_sdxl.py`）
 - 一键脚本：`MODEL=lora bash training/run_train.sh`
 
@@ -187,9 +243,13 @@ MODEL=controlnet bash run_train.sh
 MODEL=lora_family bash run_train.sh
 ```
 
-训练要点：
+训练要点（v0.1.3 基线）：
 - CUDA 训练使用 `bfloat16`（Ampere+ GPU），CPU 回退 `float32`
-- LoRA 保存为 diffusers 官方格式（`pytorch_lora_weights.safetensors`）
+- LoRA 双格式保存：`adapter_model.safetensors`（PEFT，权威）+ `pytorch_lora_weights.safetensors`（diffusers）
+- **time_ids 修正**：`[res,res,0,0,res,res]`（original/crop/target ordering）
+- **letterbox**：`letterbox_rgb` 保宽高比补白，不再硬拉伸
+- **VAE fp32 编码**：`no_grad` 下 float32 编码，防 bf16 latent 伪影
+- **min-SNR 加权**：`--snr_gamma 5.0`（Kohya `min(snr,gamma)/snr`）
 - ControlNet 条件图归一化到 `[0,1]`，与推理端一致
 - 数据准备：`python3 prepare_dataset.py` + `python3 prepare_controlnet_data.py`
 
@@ -200,6 +260,21 @@ MODEL=lora_family bash run_train.sh
 - **diffusers 0.40.0**
 
 （其余训练依赖及其最低版本见 `training/requirements.txt`。）
+
+### 重训待办（需 GPU）
+
+当前 v0.1.2 checkpoint 有两个质量瓶颈，几何修复已落地但需重训才能烘入权重：
+
+| 问题 | 现状 | 目标 |
+|------|------|------|
+| caption 多样性 | 仅 2 句模板（cloth/human 各一句），25 张共用 | 逐张写颜色/品类/面料/细节 |
+| 训练分组 | cloth + human 混在一个 adapter | `GROUPS=human`（人像条件 LoRA），cloth 留作 IP-Adapter 参考 |
+
+下次重训命令：
+
+```bash
+MODEL=lora_family GROUPS=human bash training/run_train.sh
+```
 
 ## 多店铺与推送
 
@@ -252,12 +327,30 @@ API 凭证在本地 `state.json` 中以明文存储（文件权限 `0600`，不�
 - 底座列表显示完整分类标签，支持多选后「批量调整分类」
 - 「人种管理」面板：新增 / 改名 / 删除人种；删除人种时引用底座回退到「东亚」
 
+## SDXL 引擎环境变量（v0.1.3）
+
+以下环境变量控制 SDXL 引擎的混合生成流程，均有默认值，不设置即使用推荐配置：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `VTON_AR` | `1` | 保宽高比 letterbox；`=0` 硬拉伸 |
+| `VTON_WARP` | `1` | 几何对齐：把平铺衣掰到人体姿态送 IP-Adapter；`=0` 关闭用原平铺图 |
+| `VTON_WARP_STRENGTH` | 按品类 0.42-0.48 | warp 变形强度 |
+| `VTON_DETAIL` | `1` | 商品细节回贴：高频纹理 + Reinhard 颜色迁移；`=0` 关闭 |
+| `VTON_LOCK_ID` | `1` | 身份锁：mask 外贴回原图人脸/背景；`=0` 关闭 |
+| `VTON_LORA` | `0.7` | LoRA scale（r16 小数据不全量 1.0） |
+| `VTON_IPA` | `0.8` | IP-Adapter 参考强度 |
+| `VTON_CANNY` | `0.35` | Canny 边缘约束强度（透肤款调高留意鬼影） |
+| `VTON_GUIDANCE` | `7.5` | CFG guidance scale |
+| `VTON_SEED` | `42` | 随机种子 |
+| `VTON_PROMPT_HINT` | 空 | 额外 prompt 钩子（如"长袖须随手臂到手腕"） |
+
 ## 测试
 
 后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。前端组件测试用 vitest 覆盖 i18n 字典与人种翻译。
 
 ```bash
-# 后端测试（139 个，含安全回归测试）
+# 后端测试（192 passed / 1 skipped）
 pip3 install --break-system-packages pytest httpx
 cd backend
 python3 -m pytest tests/ -q
@@ -277,7 +370,8 @@ python3 -m ruff format --check backend/ training/
 
 覆盖分层：
 
-- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py` / `test_lora_io.py` / `test_engine_concurrency.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT 密钥随机化、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支、LoRA 加载格式转换、管线/检测器并发首载单飞
+- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py` / `test_lora_io.py` / `test_engine_concurrency.py` / `test_train_geometry.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT 密钥随机化、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支、LoRA 加载格式转换（PEFT 优先）、管线/检测器并发首载单飞、训练几何（time_ids/letterbox/min-SNR）
+- **平台适配测试**（`backend/tests/test_platform_presets.py`）：平台裁剪/压白/JPEG 限体积、clothing_mask 服装区提取、blend_tryon 身份锁、reapply_garment_detail 高频纹理+颜色迁移回贴
 - **组件测试**（`src/i18n.test.js` / `src/render.test.js`）：中英文切换、占位符插值、10 地域人种翻译、自定义人种回退原文、`basesView` DOM 标签平衡与批次面板结构
 - **集成测试**（`backend/tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、state.json 访问拦截、HTML 上传拦截、store 凭据脱敏、staff 权限隔离、健康与许可接口
 - **系统测试**（`backend/tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
@@ -286,13 +380,20 @@ python3 -m ruff format --check backend/ training/
 
 ```text
 backend/          FastAPI 后端、引擎包装器、推送适配器
-  tests/          pytest 测试（单元 / 集成 / 系统，90 个）
+  engine.py       合成引擎（CPU 兜底）：水印去除、garment warp、复合
+  engine_sdxl.py  SDXL 商用引擎：几何对齐 + ControlNet + IP-Adapter + 细节回贴 + 身份锁
+  platform_presets.py  平台店规 + clothing_mask + blend_tryon + reapply_garment_detail
+  lora_io.py      LoRA 加载（PEFT 优先 + diffusers 回退）
+  tests/          pytest 测试（单元 / 集成 / 系统，192 passed）
 src/              前端 SPA + i18n 字典
 public/           嵌入页、挂件、示例图
 docs/             文档
 scripts/          权重下载脚本
 training/         SDXL LoRA / ControlNet 训练脚本
-  lora_io.py      LoRA 加载共享模块（diffusers / PEFT 双格式）
+  train_lora_sdxl.py     LoRA 训练（letterbox + time_ids + min-SNR + VAE fp32 + 双格式保存）
+  train_controlnet_sdxl.py  ControlNet 训练（同上几何基线）
+  lora_io.py      LoRA 加载共享模块（PEFT / diffusers 双格式）
+models/sdxl/lora/ 训练好的 LoRA 权重（adapter_model.safetensors + pytorch_lora_weights.safetensors）
 IDM-VTON/         官方虚拟试衣仓库（git submodule）
 ```
 
@@ -306,6 +407,9 @@ STORE_STAFF_PASSWORD=<员工密码>
 
 # 引擎选择
 LICENSE_MODE=commercial  # commercial（生产）或 research（测试）
+
+# SDXL 引擎混合流程（均有默认值，详见上表）
+# VTON_AR / VTON_WARP / VTON_DETAIL / VTON_LOCK_ID / VTON_LORA / VTON_IPA ...
 
 # 可选
 IDM_WEIGHTS_DIR=/path/to/IDM-VTON/ckpt
@@ -377,6 +481,7 @@ GET  /api/health | /api/license              # 公开
 - GPU 部署：`docs/GPU_DEPLOY.md`
 - 商用 Pipeline：`docs/SDXL_PIPELINE.md`
 - 合规说明：`docs/LICENSE_COMPLIANCE.md`
+- 技术规格书：`.monkeycode/specs/virtual-tryon-dashboard/design.md`（含 LoRA 训练基线与重训计划）
 
 ## 许可
 

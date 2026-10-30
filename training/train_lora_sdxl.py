@@ -73,6 +73,41 @@ def _load_prompts(dataset_dir: Path):
     return prompts
 
 
+def letterbox_rgb(img, side: int, pad: int = 255):
+    """把图缩进 side x side,短边补白,不压扁。"""
+    from PIL import Image
+
+    w, h = img.size
+    scale = side / max(w, h)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    canvas = Image.new("RGB", (side, side), (pad, pad, pad))
+    canvas.paste(img.resize((nw, nh), Image.LANCZOS), ((side - nw) // 2, (side - nh) // 2))
+    return canvas
+
+
+def build_time_ids(resolution: int, batch_size: int, device=None):
+    """SDXL micro-conditioning:[orig_h, orig_w, crop_y, crop_x, target_h, target_w]。"""
+    import torch
+
+    ids = torch.tensor(
+        [resolution, resolution, 0, 0, resolution, resolution],
+        dtype=torch.long,
+        device=device,
+    )
+    return ids.repeat(batch_size, 1)
+
+
+def min_snr_weights(noise_scheduler, timesteps, gamma: float):
+    """Kohya/diffusers min-SNR:epsilon 预测用 min(snr, gamma)/snr,压低高 SNR(低噪)步。"""
+    import torch
+
+    alphas = noise_scheduler.alphas_cumprod.to(device=timesteps.device, dtype=torch.float32)
+    alpha = alphas[timesteps]
+    sigma2 = (1.0 - alpha).clamp(min=1e-8)
+    snr = alpha / sigma2
+    return torch.minimum(snr, snr.new_full(snr.shape, gamma)) / snr.clamp(min=1e-8)
+
+
 class _CaptionDataset:
     def __init__(self, dataset_dir: Path, resolution: int):
         self.items = []
@@ -90,8 +125,7 @@ class _CaptionDataset:
         from torchvision import transforms
 
         path, caption = self.items[idx]
-        img = Image.open(path).convert("RGB")
-        img = img.resize((self.resolution, self.resolution), Image.LANCZOS)
+        img = letterbox_rgb(Image.open(path).convert("RGB"), self.resolution)
         tensor = transforms.ToTensor()(img) * 2.0 - 1.0
         return tensor, caption
 
@@ -139,9 +173,12 @@ def train(args) -> int:
     tokenizer_2 = comps["tokenizer_2"]
     noise_scheduler = comps["noise_scheduler"]
 
-    for model in (vae, text_encoder, text_encoder_2):
+    for model in (text_encoder, text_encoder_2):
         model.to(device)
         model.requires_grad_(False)
+    # VAE 编码必须 fp32,bf16 会给 latent 加噪声。
+    vae.to(device=device, dtype=torch.float32)
+    vae.requires_grad_(False)
     unet.to(device)
 
     lora_config = LoraConfig(
@@ -168,8 +205,10 @@ def train(args) -> int:
     global_step = 0
     while global_step < args.max_train_steps:
         for images, prompts in loader:
-            images = images.to(device, dtype=dtype)
-            latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+            images = images.to(device, dtype=torch.float32)
+            with torch.no_grad():
+                latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+            latents = latents.to(dtype)
 
             prompt_embeds, pooled = _encode_text(tokenizer, tokenizer_2, text_encoder, text_encoder_2, prompts, device)
             prompt_embeds = prompt_embeds.to(dtype)
@@ -182,11 +221,7 @@ def train(args) -> int:
             noisy = noise_scheduler.add_noise(latents, noise, timesteps)
             added = {
                 "text_embeds": pooled,
-                "time_ids": torch.tensor(
-                    [args.resolution, args.resolution, args.resolution, args.resolution, 0, 0],
-                    device=device,
-                    dtype=torch.long,
-                ).repeat(bsz, 1),
+                "time_ids": build_time_ids(args.resolution, bsz, device),
             }
 
             noise_pred = unet(
@@ -196,7 +231,11 @@ def train(args) -> int:
                 added_cond_kwargs=added,
             ).sample
 
-            loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float())
+            loss = torch.nn.functional.mse_loss(noise_pred.float(), noise.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, loss.ndim)))
+            if args.snr_gamma > 0:
+                loss = loss * min_snr_weights(noise_scheduler, timesteps, args.snr_gamma)
+            loss = loss.mean()
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
@@ -207,12 +246,16 @@ def train(args) -> int:
             if global_step >= args.max_train_steps:
                 break
 
-    unet_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
+    peft_state = {k: v.detach().cpu() for k, v in get_peft_model_state_dict(unet).items()}
+    unet_lora_layers = convert_state_dict_to_diffusers(peft_state)
     StableDiffusionXLPipeline.save_lora_weights(
         str(writer),
         unet_lora_layers=unet_lora_layers,
     )
-    print(f"LoRA saved to {writer}/pytorch_lora_weights.safetensors", flush=True)
+    from safetensors.torch import save_file
+
+    save_file(peft_state, str(writer / "adapter_model.safetensors"))
+    print(f"LoRA saved to {writer}/pytorch_lora_weights.safetensors + adapter_model.safetensors", flush=True)
     return 0
 
 
@@ -227,6 +270,7 @@ def main() -> int:
     parser.add_argument("--learning_rate", type=float, default=1e-4)
     parser.add_argument("--lora_rank", type=int, default=16)
     parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--snr_gamma", type=float, default=5.0, help="min-SNR gamma; 0 disables")
     args = parser.parse_args()
 
     if not args.dataset_dir.exists() or not list(args.dataset_dir.rglob("*.png")):

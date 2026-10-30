@@ -22,12 +22,9 @@ def _resolve_base_model(base_model: str) -> str:
 
 
 def _build_time_ids(resolution: int, bs: int):
-    import torch
+    from train_lora_sdxl import build_time_ids
 
-    return torch.tensor(
-        [resolution, resolution, resolution, resolution, 0, 0],
-        dtype=torch.long,
-    ).repeat(bs, 1)
+    return build_time_ids(resolution, bs)
 
 
 class _ControlNetCaptionDataset:
@@ -51,8 +48,10 @@ class _ControlNetCaptionDataset:
         from torchvision import transforms
 
         img_path, cond_path, caption = self.pairs[idx]
-        img = Image.open(img_path).convert("RGB").resize((self.resolution, self.resolution), Image.LANCZOS)
-        cond = Image.open(cond_path).convert("RGB").resize((self.resolution, self.resolution), Image.LANCZOS)
+        from train_lora_sdxl import letterbox_rgb
+
+        img = letterbox_rgb(Image.open(img_path).convert("RGB"), self.resolution)
+        cond = letterbox_rgb(Image.open(cond_path).convert("RGB"), self.resolution)
         t = transforms.ToTensor()
         # 训练目标图归一化到 [-1,1] 供 VAE;ControlNet 条件图保持 [0,1](与推理端一致)。
         return t(img) * 2.0 - 1.0, t(cond), caption
@@ -130,7 +129,7 @@ def train(args) -> int:
     text_encoder = components["text_encoder"]
     text_encoder_2 = components["text_encoder_2"]
 
-    vae = vae.to(device=device, dtype=dtype)
+    vae = vae.to(device=device, dtype=torch.float32)
     unet = unet.to(device=device, dtype=dtype)
     controlnet = controlnet.to(device=device, dtype=dtype)
     text_encoder.to(device=device, dtype=dtype)
@@ -156,10 +155,11 @@ def train(args) -> int:
     global_step = 0
     while global_step < args.max_train_steps:
         for images, cond_images, captions in loader:
-            images = images.to(device=device, dtype=dtype)
+            images = images.to(device=device, dtype=torch.float32)
             cond_images = cond_images.to(device=device, dtype=dtype)
 
-            latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
+            with torch.no_grad():
+                latents = vae.encode(images).latent_dist.sample() * vae.config.scaling_factor
             latents = latents.to(dtype)
 
             prompt_embeds, pooled = _encode_prompts(
@@ -196,7 +196,13 @@ def train(args) -> int:
                 target = noise_scheduler.get_velocity(latents, noise, timesteps)
             else:
                 target = noise
-            loss = torch.nn.functional.mse_loss(model_pred.float(), target.float())
+            loss = torch.nn.functional.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, loss.ndim)))
+            if args.snr_gamma > 0:
+                from train_lora_sdxl import min_snr_weights
+
+                loss = loss * min_snr_weights(noise_scheduler, timesteps, args.snr_gamma)
+            loss = loss.mean()
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(controlnet.parameters(), 1.0)
@@ -224,6 +230,7 @@ def main() -> int:
     parser.add_argument("--max_train_steps", type=int, default=800)
     parser.add_argument("--learning_rate", type=float, default=1e-5)
     parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--snr_gamma", type=float, default=5.0, help="min-SNR gamma; 0 disables")
     args = parser.parse_args()
 
     if not (args.dataset_dir / "captions.csv").exists():

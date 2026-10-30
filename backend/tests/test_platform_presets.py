@@ -13,9 +13,12 @@ from platform_presets import (
     PLATFORM_PRESETS,
     PLATFORM_SET,
     apply_platform_preset,
+    blend_tryon,
     center_crop_square,
+    clothing_mask,
     encode_jpeg_within,
     force_white_background,
+    reapply_garment_detail,
     save_platform_result,
 )
 
@@ -306,6 +309,42 @@ def test_subject_mask_none_is_noop_regression():
     assert np.array_equal(a, b)
 
 
+def test_clothing_mask_none_without_subject():
+    img = Image.new("RGB", (200, 200), (180, 180, 180))
+    assert clothing_mask(img, subject_mask=np.zeros((200, 200), dtype=np.uint8)) is None
+
+
+def test_clothing_mask_upper_drops_face_and_legs():
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    img = Image.fromarray(np.full((200, 120, 3), 80, dtype=np.uint8), "RGB")
+    m = clothing_mask(img, garment_type="upper", subject_mask=subj)
+    assert m is not None
+    assert m.shape == (200, 120)
+    assert int(m[160, 60]) < 40
+    assert int(m[70, 60]) > 180
+
+
+def test_clothing_mask_lower_drops_torso():
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    img = Image.fromarray(np.full((200, 120, 3), 80, dtype=np.uint8), "RGB")
+    m = clothing_mask(img, garment_type="lower", subject_mask=subj)
+    assert m is not None
+    assert int(m[40, 60]) < 40
+    assert int(m[150, 60]) > 180
+
+
+def test_blend_tryon_keeps_unmasked_pixels():
+    orig = Image.new("RGB", (40, 40), (10, 20, 30))
+    gen = Image.new("RGB", (40, 40), (200, 10, 10))
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[10:30, 10:30] = 255
+    out = np.array(blend_tryon(orig, gen, mask))
+    assert tuple(out[0, 0]) == (10, 20, 30)
+    assert tuple(out[20, 20]) == (200, 10, 10)
+
+
 def test_foreground_mask_none_when_no_model(monkeypatch):
     """本地无完整 u2net.onnx → 快速返回 None(不触发慢下载), 调用方回退纯颜色压白。"""
     import platform_presets
@@ -341,3 +380,73 @@ def test_foreground_mask_runs_when_model_present():
     img = _beige_bg_with_subject()
     m = platform_presets.foreground_mask(img)
     assert m is None or np.asarray(m).dtype == np.uint8
+
+
+def test_reapply_garment_detail_passthrough_without_cv2(monkeypatch):
+    """无 cv2 时原样返回输入图(安全回退)。"""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def _block_cv2(name, *args, **kwargs):
+        if name == "cv2":
+            raise ImportError("cv2 blocked for test")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block_cv2)
+    gen = Image.new("RGB", (64, 64), (100, 150, 200))
+    ref = Image.new("RGB", (64, 64), (200, 100, 50))
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    out = reapply_garment_detail(gen, ref, mask)
+    assert out is gen
+
+
+def test_reapply_garment_detail_zero_mask_keeps_generated():
+    """mask 全 0(无衣服区)时,生成图像素不变。"""
+    gen = Image.new("RGB", (80, 80), (120, 80, 60))
+    ref = Image.new("RGB", (80, 80), (200, 200, 30))
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    out = reapply_garment_detail(gen, ref, mask)
+    a = np.array(gen)
+    b = np.array(out)
+    assert np.array_equal(a, b)
+
+
+def test_reapply_garment_detail_changes_masked_region():
+    """mask 有值时,衣服区像素必须改变(纹理+颜色注入生效)。"""
+    from PIL import ImageDraw
+
+    # 生成图:纯色衣服区;参考图:带花纹的另一种颜色
+    gen_arr = np.full((100, 100, 3), (100, 100, 100), dtype=np.uint8)
+    gen = Image.fromarray(gen_arr, "RGB")
+
+    ref = Image.new("RGB", (100, 100), (30, 160, 60))
+    d = ImageDraw.Draw(ref)
+    d.rectangle([20, 20, 80, 80], fill=(200, 40, 40))
+
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[10:90, 10:90] = 255
+
+    out = reapply_garment_detail(gen, ref, mask)
+    a = np.array(gen)
+    b = np.array(out)
+    # mask 区像素必须改变
+    assert not np.array_equal(a[10:90, 10:90], b[10:90, 10:90])
+    # mask 外像素不变
+    assert np.array_equal(a[:10, :], b[:10, :])
+    assert np.array_equal(a[90:, :], b[90:, :])
+
+
+def test_reapply_garment_detail_color_matches_source():
+    """颜色迁移后,生成图衣服区均值更接近参考图(颜色被拉过去)。"""
+    # 生成图衣服区偏蓝(60,60,180),参考图偏红(180,60,60)
+    gen_arr = np.full((64, 64, 3), (60, 60, 180), dtype=np.uint8)
+    gen = Image.fromarray(gen_arr, "RGB")
+    ref = Image.new("RGB", (64, 64), (180, 60, 60))
+    mask = np.full((64, 64), 255, dtype=np.uint8)
+
+    out = reapply_garment_detail(gen, ref, mask, texture_strength=0.0, color_strength=1.0)
+    out_arr = np.array(out)
+    # R 通道应上升(从60趋向180), B 通道应下降(从180趋向60)
+    assert out_arr[..., 0].mean() > 100  # R 上升
+    assert out_arr[..., 2].mean() < 140  # B 下降

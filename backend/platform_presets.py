@@ -286,6 +286,71 @@ def foreground_mask(
         return None
 
 
+def clothing_mask(
+    img: Image.Image,
+    garment_type: str = "upper",
+    subject_mask: np.ndarray | None = None,
+    face_margin: float = 0.65,
+) -> np.ndarray | None:
+    """服装替换区:主体减脸(及按品类裁切),返回 uint8 0-255;构不出则 None。
+
+    这是「只换衣、锁身份」的遮罩:255=贴生成衣物,0=保留原图像素(脸/发/手/背景)。
+    subject_mask 可注入(测试/上游已算过);缺省走 rembg。无主体或面积过小返回 None,
+    调用方回退整图采用生成结果。
+    """
+    arr = np.array(img.convert("RGB"))
+    h, w = arr.shape[:2]
+    subj = subject_mask if subject_mask is not None else foreground_mask(img)
+    if subj is None:
+        return None
+    subj = (np.asarray(subj) > 0).astype(np.uint8)
+    if subj.shape[:2] != (h, w) or float(subj.mean()) < 0.04:
+        return None
+    face = _detect_face_mask(arr, margin_frac=face_margin)
+    cloth = subj.copy()
+    if face is not None and face.any():
+        cloth[face > 0] = 0
+    ys = np.where(subj > 0)[0]
+    y0, y1 = int(ys.min()), int(ys.max())
+    span = max(1, y1 - y0)
+    if garment_type == "upper":
+        cloth[y0 + int(span * 0.62) :] = 0
+    elif garment_type == "lower":
+        cloth[: y0 + int(span * 0.48)] = 0
+    if float(cloth.mean()) < 0.02:
+        return None
+    try:
+        import cv2
+
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        cloth = cv2.erode(cloth, k, iterations=1)
+        if float(cloth.mean()) < 0.015:
+            return None
+        return cv2.GaussianBlur((cloth * 255).astype(np.uint8), (0, 0), 6)
+    except Exception:  # noqa: BLE001
+        return (cloth * 255).astype(np.uint8)
+
+
+def blend_tryon(
+    original: Image.Image,
+    generated: Image.Image,
+    mask_u8: np.ndarray,
+) -> Image.Image:
+    """mask 255 取 generated,0 取 original。尺寸不一致时把 generated 缩到 original。"""
+    orig = original.convert("RGB")
+    gen = generated.convert("RGB")
+    if gen.size != orig.size:
+        gen = gen.resize(orig.size, Image.Resampling.LANCZOS)
+    o = np.array(orig, dtype=np.float32)
+    g = np.array(gen, dtype=np.float32)
+    alpha = np.asarray(mask_u8)
+    if alpha.shape[:2] != o.shape[:2]:
+        alpha = np.array(Image.fromarray(alpha).resize((o.shape[1], o.shape[0]), Image.Resampling.BILINEAR))
+    a = (alpha.astype(np.float32) / 255.0)[..., None]
+    out = np.clip(g * a + o * (1.0 - a), 0, 255).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
+
+
 def center_crop_square(img: Image.Image) -> Image.Image:
     """1:1 居中裁剪(电商主图必须正方形,主体居中)。"""
     w, h = img.size
@@ -346,3 +411,87 @@ def save_platform_result(
     data = encode_jpeg_within(out, preset["max_bytes"])
     out_path.write_bytes(data)
     return out.size[0], len(data)
+
+
+def reapply_garment_detail(
+    generated: Image.Image,
+    garment_ref: Image.Image,
+    mask_u8: np.ndarray,
+    texture_strength: float = 0.55,
+    color_strength: float = 0.85,
+) -> Image.Image:
+    """AI 出骨架光影,代码保商品纹理颜色。
+
+    四步纯 CPU 后处理(SDXL 生成之后、身份锁之前执行):
+
+    1. **高频纹理提取**: garment_ref(已对齐姿态的服装图)减去高斯模糊低频,
+       得到花纹/面料质感的高频分量(居中到 128 中性灰)。
+    2. **柔光混合贴回**: 把高频以 softlight 模式叠加到 generated 的衣服区,
+       加回 SDXL 丢失的面料纹理/花纹细节(128 无影响,>128 提亮,<128 压暗)。
+    3. **Reinhard LAB 颜色迁移**: 把生成图衣服区的颜色分布(LAB 均值/方差)
+       拉到原衣的颜色统计 —— 等价颜色直方图匹配,强制颜色一致。
+    4. **mask 羽化混合**: 只动衣服区(mask 255),人脸/背景/手保持生成图原样;
+       texture/color 各有独立强度,mask 边缘平滑过渡无硬边。
+
+    无 cv2 时原样返回 generated(安全回退,不回归)。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return generated
+
+    gen = np.array(generated.convert("RGB"), dtype=np.float32)
+    ref = np.array(garment_ref.convert("RGB"), dtype=np.float32)
+    h, w = gen.shape[:2]
+    if ref.shape[:2] != (h, w):
+        ref = np.array(
+            Image.fromarray(ref.astype(np.uint8)).resize((w, h), Image.Resampling.LANCZOS),
+            dtype=np.float32,
+        )
+    mask = np.asarray(mask_u8, dtype=np.float32)
+    if mask.shape[:2] != (h, w):
+        mask = np.array(
+            Image.fromarray(mask_u8.astype(np.uint8)).resize((w, h), Image.Resampling.BILINEAR),
+            dtype=np.float32,
+        )
+    mask_norm = (mask / 255.0)[..., None]
+
+    # 步骤1: 高频纹理 = ref - 低频(高斯模糊), 居中到 128。
+    low_freq = cv2.GaussianBlur(ref, (0, 0), 4.0)
+    high_freq = ref - low_freq + 128.0
+
+    # 步骤2: 柔光混合(softlight): b + (t-128)/128 * b * (255-b)/255。
+    # 128=中性无影响; 花纹暗部(t<128)压暗生成图对应像素, 亮部提亮。
+    softlight = gen + (high_freq - 128.0) / 128.0 * gen * (255.0 - gen) / 255.0
+    softlight = np.clip(softlight, 0, 255)
+    tex_a = mask_norm * texture_strength
+    textured = softlight * tex_a + gen * (1.0 - tex_a)
+
+    # 步骤3: Reinhard LAB 颜色迁移(等价颜色直方图匹配)。
+    # source=ref(原衣颜色基准), target=textured(待校正); 只在 mask 区统计 target。
+    target_rgb = np.clip(textured, 0, 255).astype(np.uint8)
+    source_rgb = np.clip(ref, 0, 255).astype(np.uint8)
+    target_lab = cv2.cvtColor(target_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+    source_lab = cv2.cvtColor(source_rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
+
+    m_bin = mask > 10
+    if m_bin.any():
+        t_mean = target_lab[m_bin].mean(axis=0)
+        t_std = target_lab[m_bin].std(axis=0) + 1e-6
+    else:
+        flat = target_lab.reshape(-1, 3)
+        t_mean = flat.mean(axis=0)
+        t_std = flat.std(axis=0) + 1e-6
+    s_flat = source_lab.reshape(-1, 3)
+    s_mean = s_flat.mean(axis=0)
+    s_std = s_flat.std(axis=0) + 1e-6
+
+    corrected_lab = (target_lab - t_mean) / t_std * s_std + s_mean
+    corrected_lab = np.clip(corrected_lab, 0, 255).astype(np.uint8)
+    corrected_rgb = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
+
+    # 步骤4: mask 羽化混合 —— 只动衣服区, 强度由 color_strength 控制。
+    col_a = mask_norm * color_strength
+    out = corrected_rgb * col_a + gen * (1.0 - col_a)
+
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")

@@ -83,8 +83,12 @@ python3 training/infer_lora.py \
 ## 说明
 
 - 现有素材仅 25 张，目的是验证全链路（下载、编码、LoRA/ControlNet、保存、回载、出图），产出质量有限
+- caption 目前是 2 句模板（cloth / human 各一句）。重训前请按张改 `training/dataset/**/*.txt`（颜色、品类、面料、版型），否则 LoRA 只学到「一张衣服图」
+- 换衣 LoRA 建议只用 `human/`：`MODEL=lora_family GROUPS=human bash training/run_train.sh`
 - `train_lora_sdxl.py` / `train_controlnet_sdxl.py` 自动检测设备：CUDA 用 bf16（SDXL UNet fp16 训练会 NaN），否则退化 CPU fp32（很慢，仅验证）
-- LoRA 保存用 `unet.add_adapter` + `StableDiffusionXLPipeline.save_lora_weights`（`pytorch_lora_weights.safetensors`）。PEFT `adapter_model.safetensors` 由 `infer_lora.py` / `engine_sdxl.py` 在内存转成 unet 前缀后加载
+- 训练几何：letterbox 保比例（短边补白），`time_ids` 为 `[orig_h, orig_w, 0, 0, target_h, target_w]`，VAE 编码 fp32，min-SNR gamma=5
+- LoRA 同时写 `adapter_model.safetensors`（PEFT，引擎优先加载）和 `pytorch_lora_weights.safetensors`（diffusers）。两份必须来自同一次保存
+- 推理默认 `VTON_AR=1`（保比例）、`VTON_LORA=0.7`（小数据 r16 不全量 1.0）
 - transformers 5.x 下 CLIP text_encoder_2 取 `text_embeds`（无 `pooler_output` 时回退）
 - ControlNet 的 `captions.csv` 用 csv.writer 写，caption 含逗号不会列错位
 - ControlNet 从 UNet 初始化后立刻 `to(dtype)`，避免 SDXL time-embedding 分支残留 fp32

@@ -8,13 +8,19 @@ import threading
 from pathlib import Path
 
 from PIL import Image
-from platform_presets import force_white_background
+from platform_presets import blend_tryon, clothing_mask, force_white_background, reapply_garment_detail
 
 logger = logging.getLogger("atelier.engine_sdxl")
 
 _GPU_LOCK = threading.Lock()
 _PIPE_LOCK = threading.Lock()
-_sdxl_state: dict = {"pipe": None, "ip_adapter_loaded": False, "ip_adapter_reason": "", "depth_loaded": False}
+_sdxl_state: dict = {
+    "pipe": None,
+    "ip_adapter_loaded": False,
+    "ip_adapter_reason": "",
+    "depth_loaded": False,
+    "lora_loaded": False,
+}
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 SDXL_DIR = _REPO_ROOT / "models" / "sdxl"
@@ -322,6 +328,98 @@ def _remove_background(image: Image.Image) -> Image.Image:
         return image
 
 
+def fit_square(im: Image.Image, side: int, pad=(255, 255, 255)) -> Image.Image:
+    """保宽高比缩进 square,短边补白。VTON_AR=0 时回退硬拉伸。"""
+    if os.environ.get("VTON_AR", "1") == "0":
+        return im.resize((side, side), Image.Resampling.LANCZOS)
+    w, h = im.size
+    scale = side / max(w, h)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    canvas = Image.new("RGB", (side, side), pad)
+    canvas.paste(im.resize((nw, nh), Image.Resampling.LANCZOS), ((side - nw) // 2, (side - nh) // 2))
+    return canvas
+
+
+def _apply_lora_scale(pipe) -> None:
+    """小数据 r16 LoRA 默认 0.7,避免 1.0 过拟合模板句。VTON_LORA 可覆盖。"""
+    raw = os.environ.get("VTON_LORA", "0.7").strip()
+    try:
+        scale = float(raw)
+    except ValueError:
+        logger.warning("Invalid VTON_LORA=%r; keeping adapter default", raw)
+        return
+    if hasattr(pipe, "set_adapters"):
+        try:
+            pipe.set_adapters(["default"], adapter_weights=[scale])
+            logger.info("LoRA scale -> %s (env VTON_LORA)", scale)
+            return
+        except Exception:
+            logger.debug("pipe.set_adapters failed; trying fuse-less scale", exc_info=True)
+    if hasattr(pipe, "set_lora_scale"):
+        pipe.set_lora_scale(scale)
+        logger.info("LoRA scale -> %s via set_lora_scale", scale)
+
+
+def align_garment_to_pose(
+    garment: Image.Image,
+    audience: str,
+    ethnicity: str,
+    garment_type: str,
+    canvas: int = 1024,
+) -> Image.Image:
+    """把平铺衣"掰"到人体姿态:按目标人群肩宽/轮廓缩放并做水平网格变形,
+    得到一张"正穿在人身上"的服装参考图,供 SDXL IP-Adapter 使用。
+
+    这是 VITON 几何对齐步骤的纯 CPU 简化版——把衣服先贴到目标体型,
+    再让生成器在已对齐的参考上重绘纹理,显著提升衣服在身上的位置/比例
+    准确性,尤其解决"衣服飘在身外/袖长不合/比例错位"。
+
+    流程:crop 内容 -> fit_garment_to_body(按肩宽等比缩放) ->
+    _warp_garment(沿躯干轮廓收窄/展宽) -> 白底 RGB。
+
+    VTON_WARP=0 时关闭(回退原平铺图);VTON_WARP_STRENGTH 可覆盖默认强度。
+    """
+    if os.environ.get("VTON_WARP", "1") == "0":
+        return garment
+    try:
+        from engine import (
+            GARMENT_WARP_STRENGTH,
+            _warp_garment,
+            fit_garment_to_body,
+            garment_alpha,
+            torso_box,
+        )
+    except ImportError:
+        logger.debug("align_garment_to_pose: engine funcs unavailable; passthrough")
+        return garment
+
+    box = torso_box(audience, ethnicity)
+    base_strength = GARMENT_WARP_STRENGTH.get(garment_type, 0.42)
+    raw = os.environ.get("VTON_WARP_STRENGTH", "").strip()
+    try:
+        strength = float(raw) if raw else base_strength
+    except ValueError:
+        strength = base_strength
+        logger.warning("Invalid VTON_WARP_STRENGTH=%r; using default", raw)
+
+    # fit_garment_to_body 期望能取到衣料 alpha(RGBA)或自动估计(RGB)。
+    g = garment.convert("RGBA")
+    if int(g.split()[-1].getextrema()[0]) >= 250:
+        # 不透明图:用 garment_alpha 补一层 alpha 供 bbox/warp 使用。
+        g.putalpha(garment_alpha(garment))
+
+    fitted = fit_garment_to_body(g, box, canvas, canvas)
+    if fitted.mode != "RGBA":
+        fitted = fitted.convert("RGBA")
+    warped = _warp_garment(fitted, box, strength)
+    if warped.mode != "RGBA":
+        warped = warped.convert("RGBA")
+
+    out = Image.new("RGB", (canvas, canvas), (255, 255, 255))
+    out.paste(warped, (0, 0), warped)
+    return out
+
+
 def crop_garment_to_content(
     image: Image.Image,
     pad_frac: float = 0.03,
@@ -500,8 +598,12 @@ def _get_sdxl_pipe(device, dtype):
             pipe.vae = pipe.vae.to(torch.float32)
 
             lora_dir = SDXL_DIR / "lora"
+            lora_loaded = False
             try:
-                _load_trained_lora(pipe, lora_dir)
+                lora_fmt = _load_trained_lora(pipe, lora_dir)
+                if lora_fmt:
+                    lora_loaded = True
+                    logger.info("Loaded trained LoRA (%s) from %s", lora_fmt, lora_dir)
             except Exception:
                 logger.exception("Failed to load trained LoRA; continuing without it")
 
@@ -554,6 +656,7 @@ def _get_sdxl_pipe(device, dtype):
             _sdxl_state["ip_adapter_loaded"] = ip_adapter_loaded
             _sdxl_state["ip_adapter_reason"] = ip_adapter_reason
             _sdxl_state["depth_loaded"] = depth_loaded
+            _sdxl_state["lora_loaded"] = lora_loaded
             return pipe, ip_adapter_loaded, ip_adapter_reason
         except Exception:
             # 加载失败必须释放已占显存,否则残留半成品会持续占用 VRAM(NEW-H3)。
@@ -565,6 +668,7 @@ def _get_sdxl_pipe(device, dtype):
                 _sdxl_state["ip_adapter_loaded"] = False
                 _sdxl_state["ip_adapter_reason"] = ""
                 _sdxl_state["depth_loaded"] = False
+                _sdxl_state["lora_loaded"] = False
             try:
                 import gc
 
@@ -599,24 +703,20 @@ def compose_tryon_sdxl(
     if crop_garment:
         garment_img = crop_garment_to_content(garment_img)
 
-    import os as _os_ar
-
     target_w, target_h = 1024, 1024
+    human_img = fit_square(base_img, target_w)
+    cloth_img = fit_square(garment_img, target_h)
 
-    def _fit_square(im, side, pad=(255, 255, 255)):
-        # VTON_AR=1: 保宽高比(缩放进 square + 短边补白), 不压扁人物/衣物, 修复竖版底图被
-        # 硬拉成方形导致的姿态畸变与"往上裁丢腿"。默认(不设)=原硬拉伸, 行为不变。
-        if _os_ar.environ.get("VTON_AR") != "1":
-            return im.resize((side, side), PILImage.Resampling.LANCZOS)
-        w, h = im.size
-        s = side / max(w, h)
-        nw, nh = max(1, int(w * s)), max(1, int(h * s))
-        canvas = PILImage.new("RGB", (side, side), pad)
-        canvas.paste(im.resize((nw, nh), PILImage.Resampling.LANCZOS), ((side - nw) // 2, (side - nh) // 2))
-        return canvas
-
-    human_img = _fit_square(base_img, target_w)
-    cloth_img = _fit_square(garment_img, target_h)
+    # 几何对齐:把平铺衣掰到目标人群姿态,作为 IP-Adapter 参考图。
+    # VTON_WARP=1(默认)时,生成器看到的是"已穿在身上的衣服",而非平铺贴图,
+    # 显著改善衣服在身上的位置/比例/袖长;失败或关闭时回退原平铺图。
+    warp_enabled = os.environ.get("VTON_WARP", "1") != "0"
+    cloth_ref = cloth_img
+    if warp_enabled:
+        try:
+            cloth_ref = align_garment_to_pose(garment_img, audience, ethnicity, garment_type, target_w)
+        except Exception:
+            logger.exception("align_garment_to_pose failed; using flat cloth reference")
 
     prompt = AUDIENCE_PROMPTS.get(audience, AUDIENCE_PROMPTS["women"])
     eth_prompt = ETHNICITY_PROMPTS.get(ethnicity, ETHNICITY_PROMPTS["western_europe"])
@@ -648,6 +748,9 @@ def compose_tryon_sdxl(
         pipe.set_ip_adapter_scale(float(_ipa))
         logger.info("IP-Adapter scale overridden -> %s (env VTON_IPA)", float(_ipa))
 
+    if _sdxl_state.get("lora_loaded"):
+        _apply_lora_scale(pipe)
+
     control_pose = _get_openpose_control(human_img)
 
     # 贴合改进:depth 存在时用 pose+depth(深度图约束衣服包裹体型、产生立体
@@ -665,7 +768,7 @@ def compose_tryon_sdxl(
             control_images.append(PILImage.new("RGB", (target_w, target_h), (128, 128, 128)))
             control_scales.append(0.0)
     else:
-        control_images.append(_get_canny_control(cloth_img))
+        control_images.append(_get_canny_control(cloth_ref))
         # 0.35:边缘约束只用来"定轮廓"。0.55 在透视网眼/薄纱类面料上会把
         # Canny 边缘当结构画进布料,产生"鬼影/人脸重影"类伪影(实测 2048 成图)。
         # VTON_CANNY 可覆盖(治"袖子画短/结构弱";透肤款调高留意鬼影)。
@@ -689,7 +792,7 @@ def compose_tryon_sdxl(
     }
 
     if ip_adapter_loaded:
-        pipe_kwargs["ip_adapter_image"] = cloth_img
+        pipe_kwargs["ip_adapter_image"] = cloth_ref
 
     # 采样(含 denoise)在 autocast 下跑;VAE 解码移出 autocast 并以 fp32 执行,
     # 否则 SDXL fp16 VAE 解码溢出产生 NaN/黑图。
@@ -698,6 +801,34 @@ def compose_tryon_sdxl(
     with torch.no_grad():
         decoded = pipe.vae.decode(latents.to(torch.float32) / pipe.vae.config.scaling_factor, return_dict=False)[0]
     result = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
+
+    # 服装区遮罩:细节回贴(衣服纹理/颜色)与身份锁(人脸/背景)共用同一张
+    # clothing_mask, 只算一次(含 rembg u2net 推理,是重操作)。
+    # mask 255=衣服区(reapply 在此贴回原衣纹理颜色),0=人脸/手/背景
+    # (blend_tryon 在此贴回原图像素保身份)。两者互补:reapply 管衣服保真,
+    # 身份锁管人脸不走形。任一开关开启才算 mask,都关时跳过省一次推理。
+    need_mask = os.environ.get("VTON_DETAIL", "1") != "0" or os.environ.get("VTON_LOCK_ID", "1") != "0"
+    shared_mask = clothing_mask(human_img, garment_type=garment_type) if need_mask else None
+
+    # 商品细节回贴:AI 出骨架光影,代码保原衣纹理颜色。
+    # SDXL 生成的衣服颜色/花纹常与原平铺图有偏差(串色/丢花纹);把原衣的
+    # 高频纹理(柔光贴回)+ 颜色分布(Reinhard LAB 迁移)注入生成图衣服区。
+    # VTON_DETAIL=1(默认)开启;关闭时跳过。
+    detail_applied = False
+    if os.environ.get("VTON_DETAIL", "1") != "0" and shared_mask is not None:
+        try:
+            result = reapply_garment_detail(result, cloth_ref, shared_mask)
+            detail_applied = True
+            logger.info("reapply_garment_detail: texture+color re-injected on garment region")
+        except Exception:
+            logger.exception("reapply_garment_detail failed; using raw SDXL output")
+
+    # 身份锁:mask 外(人脸/手/背景)贴回原图 human_img,防止 SDXL 人脸走形。
+    # mask 内保留 reapply 修正后的衣服(不被覆盖)。VTON_LOCK_ID=1(默认)开启。
+    lock_identity = False
+    if os.environ.get("VTON_LOCK_ID", "1") != "0" and shared_mask is not None:
+        result = blend_tryon(human_img, result, shared_mask)
+        lock_identity = True
 
     if background == "transparent":
         result = _remove_background(result)
@@ -719,6 +850,8 @@ def compose_tryon_sdxl(
     # IP-Adapter 权重存在但加载失败时标记降级(N4-L6);「未安装」不视为降级。
     result.info["engine_degraded"] = bool(ip_adapter_reason)
     result.info["degraded_reason"] = ip_adapter_reason
+    result.info["lock_identity"] = lock_identity
+    result.info["detail_applied"] = detail_applied
     # 出图后清空 CUDA 缓存:VAE 解码的 fp32 中间张量会留下大块显存碎片,
     # 不清会在下一任务/下一解码时放大峰值,触发 cgroup OOM。
     if device.type == "cuda":

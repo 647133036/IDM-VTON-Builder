@@ -231,6 +231,36 @@ def test_pick_ip_adapter_weight_uses_hidden_size_fallback(tmp_path):
     assert engine_sdxl._pick_ip_adapter_weight(ip_adapter_dir) == plus_face
 
 
+def test_apply_lora_scale_uses_set_adapters(monkeypatch):
+    import engine_sdxl
+
+    monkeypatch.delenv("VTON_LORA", raising=False)
+    calls = {}
+
+    class _Pipe:
+        def set_adapters(self, names, adapter_weights=None):
+            calls["names"] = names
+            calls["weights"] = adapter_weights
+
+    engine_sdxl._apply_lora_scale(_Pipe())
+    assert calls["names"] == ["default"]
+    assert calls["weights"] == [0.7]
+
+
+def test_apply_lora_scale_honors_env(monkeypatch):
+    import engine_sdxl
+
+    monkeypatch.setenv("VTON_LORA", "0.4")
+    calls = {}
+
+    class _Pipe:
+        def set_adapters(self, names, adapter_weights=None):
+            calls["weights"] = adapter_weights
+
+    engine_sdxl._apply_lora_scale(_Pipe())
+    assert calls["weights"] == [0.4]
+
+
 def test_pipeline_loads_weight_matching_local_encoder(monkeypatch, tmp_path):
     import engine_sdxl
 
@@ -257,3 +287,41 @@ def test_pipeline_loads_weight_matching_local_encoder(monkeypatch, tmp_path):
     assert args[0] == str(ip_adapter_dir)
     assert kwargs["subfolder"] == ""
     assert kwargs["weight_name"] == "ip-adapter-plus_sdxl_vit-h.safetensors"
+
+
+def test_align_garment_to_pose_returns_square_rgb(monkeypatch):
+    import engine_sdxl
+    from PIL import Image
+
+    # VTON_WARP 默认开启;输入一张纯色平铺衣,输出应为 1024x1024 RGB。
+    garment = Image.new("RGB", (600, 800), (180, 60, 60))
+    out = engine_sdxl.align_garment_to_pose(garment, "women", "east_asia", "upper", 1024)
+    assert out.size == (1024, 1024)
+    assert out.mode == "RGB"
+
+
+def test_align_garment_to_pose_disabled_returns_original(monkeypatch):
+    import engine_sdxl
+    from PIL import Image
+
+    monkeypatch.setenv("VTON_WARP", "0")
+    garment = Image.new("RGB", (400, 500), (90, 90, 120))
+    out = engine_sdxl.align_garment_to_pose(garment, "men", "western_europe", "upper", 1024)
+    assert out is garment
+
+
+def test_align_garment_to_pose_changes_pixels_vs_flat(monkeypatch):
+    import engine_sdxl
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    # 带透明背景的服装图(让 fit_garment_to_body 能取到 alpha)。
+    garment = Image.new("RGBA", (500, 700), (0, 0, 0, 0))
+    d = ImageDraw.Draw(garment)
+    d.rectangle([120, 100, 380, 620], fill=(60, 140, 90, 255))
+    flat = engine_sdxl.fit_square(garment.convert("RGB"), 1024)
+    aligned = engine_sdxl.align_garment_to_pose(garment.convert("RGB"), "women", "east_asia", "upper", 1024)
+    a = np.asarray(flat)
+    b = np.asarray(aligned)
+    assert a.shape == b.shape
+    assert not np.array_equal(a, b)

@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
-from engine_sdxl import crop_garment_to_content
+from engine_sdxl import crop_garment_to_content, fit_square
 from PIL import Image
 
 
@@ -70,6 +70,25 @@ def test_crop_preserves_detail_in_content():
     assert o[oh // 2, ow // 2].tolist() == [90, 90, 160], o[oh // 2, ow // 2]
     # 白花纹仍在裁剪结果里(说明内部细节保留)
     assert (o == 255).any()
+
+
+def test_fit_square_keeps_aspect_by_default(monkeypatch):
+    monkeypatch.delenv("VTON_AR", raising=False)
+    img = Image.new("RGB", (100, 200), (10, 20, 30))
+    out = fit_square(img, 100)
+    assert out.size == (100, 100)
+    arr = np.array(out)
+    assert tuple(int(x) for x in arr[50, 50]) == (10, 20, 30)
+    assert tuple(int(x) for x in arr[0, 0]) == (255, 255, 255)
+
+
+def test_fit_square_hard_stretch_when_disabled(monkeypatch):
+    monkeypatch.setenv("VTON_AR", "0")
+    img = Image.new("RGB", (100, 200), (10, 20, 30))
+    out = fit_square(img, 100)
+    assert out.size == (100, 100)
+    arr = np.array(out)
+    assert tuple(int(x) for x in arr[0, 0]) == (10, 20, 30)
 
 
 def test_crop_real_flatlay_guarded():

@@ -47,6 +47,7 @@ def main() -> int:
             learning_rate=args.learning_rate,
             lora_rank=args.lora_rank,
             log_interval=50,
+            snr_gamma=5.0,
         )
         if train_lora_sdxl.train(train_args) != 0:
             failed.append(kind)

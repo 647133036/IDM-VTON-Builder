@@ -322,8 +322,19 @@ def compose_tryon_sdxl(
     garment_img = Image.open(garment_path).convert("RGB")
 
     target_w, target_h = 1024, 1024
-    human_img = base_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
-    cloth_img = garment_img.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+
+    def _fit_square(im, side, pad=(255, 255, 255)):
+        if os.environ.get("VTON_AR", "1") == "0":
+            return im.resize((side, side), PILImage.Resampling.LANCZOS)
+        w, h = im.size
+        scale = side / max(w, h)
+        nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+        canvas = PILImage.new("RGB", (side, side), pad)
+        canvas.paste(im.resize((nw, nh), PILImage.Resampling.LANCZOS), ((side - nw) // 2, (side - nh) // 2))
+        return canvas
+
+    human_img = _fit_square(base_img, target_w)
+    cloth_img = _fit_square(garment_img, target_h)
 
     prompt = AUDIENCE_PROMPTS.get(audience, AUDIENCE_PROMPTS["women"])
     eth_prompt = ETHNICITY_PROMPTS.get(ethnicity, ETHNICITY_PROMPTS["western_europe"])

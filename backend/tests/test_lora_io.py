@@ -14,15 +14,15 @@ from lora_io import (  # noqa: E402
 )
 
 
-def test_lora_weight_path_prefers_diffusers(tmp_path):
+def test_lora_weight_path_prefers_peft(tmp_path):
     (tmp_path / DIFFUSERS_LORA).write_bytes(b"x")
     (tmp_path / PEFT_LORA).write_bytes(b"y")
-    assert lora_weight_path(tmp_path).name == DIFFUSERS_LORA
-
-
-def test_lora_weight_path_falls_back_to_peft(tmp_path):
-    (tmp_path / PEFT_LORA).write_bytes(b"y")
     assert lora_weight_path(tmp_path).name == PEFT_LORA
+
+
+def test_lora_weight_path_falls_back_to_diffusers(tmp_path):
+    (tmp_path / DIFFUSERS_LORA).write_bytes(b"x")
+    assert lora_weight_path(tmp_path).name == DIFFUSERS_LORA
 
 
 def test_lora_weight_path_empty(tmp_path):
@@ -54,6 +54,33 @@ def test_lora_weight_path_finds_family_subdir(tmp_path):
     sub.mkdir()
     (sub / DIFFUSERS_LORA).write_bytes(b"x")
     assert lora_weight_path(tmp_path).name == DIFFUSERS_LORA
+
+
+def test_load_single_adapter_prefers_peft_when_both_exist(tmp_path, monkeypatch):
+    import lora_io
+    from lora_io import load_trained_lora
+
+    (tmp_path / DIFFUSERS_LORA).write_bytes(b"x")
+    (tmp_path / PEFT_LORA).write_bytes(b"y")
+    calls = []
+
+    class _FakePipe:
+        def load_lora_weights(self, payload, **k):
+            calls.append((payload, k))
+
+    monkeypatch.setattr(
+        lora_io,
+        "peft_state_to_diffusers_lora",
+        lambda state: {"unet.x.lora.down.weight": 1},
+    )
+    monkeypatch.setattr(
+        "safetensors.torch.load_file",
+        lambda _path: {"base_model.model.x.lora_A.weight": 1},
+    )
+    label = load_trained_lora(_FakePipe(), tmp_path)
+    assert label == "peft"
+    assert len(calls) == 1
+    assert calls[0][0] == {"unet.x.lora.down.weight": 1}
 
 
 def test_load_trained_lora_family_loads_each_group(tmp_path):

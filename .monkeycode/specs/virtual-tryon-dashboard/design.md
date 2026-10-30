@@ -127,3 +127,42 @@ graph TD
 [^4]: (engine selector) - [engine.py](./engine.py)
 [^5]: (SDXL pipeline) - [engine_sdxl.py](./engine_sdxl.py)
 [^6]: (store/state) - [store.py](./store.py)
+
+## LoRA Training Baseline and Retraining Plan
+
+### Current Training State (v0.1.2 checkpoint)
+
+The deployed LoRA adapter (`models/sdxl/lora/adapter_model.safetensors`, 93 MB, PEFT format, r16/alpha16, targets to_q/to_k/to_v/to_out.0) was trained on 25 images (16 cloth flat-lays + 9 human models) for 800 steps in bf16 on an A10 (peak 14.8 GB), using diffusers 0.40. The training log (`training/train_log.md`) records three bug fixes applied during that run: transformers 5.x pooler incompatibility, fp16→bf16 NaN, and CSV quote escaping.
+
+### Geometry Fixes Already Applied (retraining baseline)
+
+The following fixes are landed in `training/train_lora_sdxl.py` / `train_controlnet_sdxl.py` and form the baseline for the next retraining run. They were not present in the v0.1.2 checkpoint, so a retrain is required to bake them into the weights:
+
+1. **time_ids correction**: `[res, res, res, res, 0, 0]` → `[res, res, 0, 0, res, res]` (original/crop/target ordering per SDXL UNet convention).
+2. **Letterbox instead of hard stretch**: `letterbox_rgb` preserves aspect ratio with padding; `VTON_AR` defaults to on at inference.
+3. **VAE fp32 encoding**: VAE moved to float32 with `no_grad` for encode, preventing bf16 latent artifacts.
+4. **Min-SNR weighting**: Kohya `min(snr, gamma)/snr` with `--snr_gamma 5.0` (suppresses high-SNR/low-noise steps).
+5. **Dual-format save**: training now writes both `adapter_model.safetensors` (PEFT, authoritative) and `pytorch_lora_weights.safetensors` (diffusers) from the same checkpoint; `lora_io` prefers PEFT.
+
+### Retraining TODO (requires GPU)
+
+The v0.1.2 checkpoint has two quality bottlenecks that cannot be fixed by geometry alone and require a retraining run on a GPU (e.g. ModelScope A10):
+
+| Issue | Current | Target |
+|-------|---------|--------|
+| Caption diversity | Only 2 template sentences (one for cloth, one for human), shared across all 25 images | Per-image captions describing color, garment category, fabric, and notable details |
+| Training groups | cloth + human mixed in a single adapter | `GROUPS=human` only (human-pose-conditioned adapter); cloth remains as IP-Adapter reference, not a trained class |
+
+**Next retraining command:**
+
+```bash
+MODEL=lora_family GROUPS=human bash training/run_train.sh
+```
+
+**Caption rewrite requirement:** before retraining, replace the 2 template captions in `training/dataset/` with per-image descriptions. Each caption should cover:
+- Color (e.g. "charcoal grey", "ivory white")
+- Garment category (e.g. "crew-neck t-shirt", "pleated midi skirt")
+- Fabric (e.g. "cotton jersey", "silk twill")
+- Notable detail if present (e.g. "ribbed cuffs", "concealed back zip")
+
+This retrain is blocked on GPU availability and is not actionable in the CPU-only development environment.
