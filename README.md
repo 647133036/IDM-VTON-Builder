@@ -195,9 +195,9 @@ MODEL=lora_family bash run_train.sh
 
 训练依赖见 `training/requirements.txt`（含 `torchvision`，不含 `tensorboard`，训练日志走 stdout）。
 
-训练实测软件版本（验证环境）：
-- **PyTorch 2.8.0 + cu128**
-- **diffusers 0.42.0**
+训练实测软件版本（验证环境，A10 23GB 跑通）：
+- **PyTorch 2.13.0 + cu130**（驱动需 ≥550 支持 CUDA 13 运行时）
+- **diffusers 0.40.0**
 
 （其余训练依赖及其最低版本见 `training/requirements.txt`。）
 
