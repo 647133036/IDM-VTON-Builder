@@ -2,6 +2,9 @@ import sys
 import threading
 import types
 
+import torch
+from safetensors.torch import save_file
+
 # ---------------------------------------------------------------------------
 # N4-L6: IP-Adapter 权重存在但 load_ip_adapter 抛错时,必须标记降级而非静默继续。
 # ---------------------------------------------------------------------------
@@ -74,8 +77,13 @@ def test_sdxl_ip_adapter_load_failure_marks_degraded(monkeypatch, tmp_path):
     for d in ("sdxl_base", "controlnet_openpose", "controlnet_canny"):
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
     ipdir = tmp_path / "ip_adapter"
-    ipdir.mkdir()
-    (ipdir / "ip-adapter_sdxl_vit-h.safetensors").write_bytes(b"x")
+    (ipdir / "image_encoder").mkdir(parents=True)
+    (ipdir / "image_encoder" / "config.json").write_text('{"projection_dim": 1024}', encoding="utf-8")
+    # 新选择逻辑会读 image_proj 维度,这里造一个与 1024 编码器配套的合法 base 权重。
+    save_file(
+        {"image_proj.proj.weight": torch.zeros((16, 1024))},
+        str(ipdir / "ip-adapter_sdxl_vit-h.safetensors"),
+    )
 
     monkeypatch.setattr(engine_sdxl, "SDXL_DIR", tmp_path)
     monkeypatch.setattr(engine_sdxl, "_IDM_DIR", tmp_path)

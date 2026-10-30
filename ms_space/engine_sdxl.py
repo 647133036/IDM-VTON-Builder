@@ -26,8 +26,10 @@ SDXL_DIR = Path(os.environ.get("MODELS_DIR", "/mnt/workspace/models/sdxl"))
 #   MS_CLOTH_CANNY=1   加衣服边缘(第3 controlnet)约束衣服结构,避免严重变形;
 #   MS_IP_MODEL_REF=1  将模特图纳入 IP-Adapter 参考,保留模特身份(脸/肤色/体型);
 #   MS_IP_SCALE / MS_CFG / MS_STEPS 控制 IP-Adapter 强度、引导系数与步数。
-CLOTH_CANNY = os.environ.get("MS_CLOTH_CANNY", "1") == "1"
-IP_MODEL_REF = os.environ.get("MS_IP_MODEL_REF", "1") == "1"
+#   默认关:实测(魔塔 xGPU)仅衣服参考 + pose/depth 双 controlnet 已自然贴合,
+#   模特参考与衣服 canny 反而引入僵硬/混淆,故默认 0。
+CLOTH_CANNY = os.environ.get("MS_CLOTH_CANNY", "0") == "1"
+IP_MODEL_REF = os.environ.get("MS_IP_MODEL_REF", "0") == "1"
 IP_SCALE = float(os.environ.get("MS_IP_SCALE", "0.8"))
 CFG = float(os.environ.get("MS_CFG", "7.5"))
 STEPS = int(os.environ.get("MS_STEPS", "32"))
@@ -370,16 +372,10 @@ def compose_tryon_sdxl(
     }
 
     if ip_adapter_loaded:
-        if IP_MODEL_REF:
-            # 保留模特身份:把原模特图与衣服图水平拼接为单张 IP-Adapter 参考
-            # (脸/肤色/发型/体型 + 衣服外观)。不用多图 list:diffusers 0.42 的
-            # h94 非 plus 多图路径会挂死,拼接走单图路径避免该 bug。
-            combined = PILImage.new("RGB", (target_w * 2, target_h))
-            combined.paste(human_img, (0, 0))
-            combined.paste(cloth_img, (target_w, 0))
-            pipe_kwargs["ip_adapter_image"] = combined
-        else:
-            pipe_kwargs["ip_adapter_image"] = cloth_img
+        # 保留模特身份(可选):把原模特图一并作为 IP-Adapter 参考(脸/肤色/发型/体型)。
+        # 实测多图 list 在 diffusers 0.42 的 h94 非 plus 路径可运行(魔塔验证),故用 list;
+        # 默认关,仅衣服参考。
+        pipe_kwargs["ip_adapter_image"] = [human_img, cloth_img] if IP_MODEL_REF else cloth_img
 
     with _GPU_LOCK, torch.no_grad(), torch.amp.autocast(device_type="cuda" if device.type == "cuda" else "cpu"):
         latents = pipe(**{**pipe_kwargs, "output_type": "latent"}).images
