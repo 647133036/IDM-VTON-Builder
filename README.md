@@ -26,11 +26,13 @@
 ### 增加了什么
 
 - **`detect_garment_extent`（服装属性检测）**：从平铺衣料图自动判断袖长和衣长。按内容 alpha/背景差分取 bbox，纵向三段（肩/胸/下摆）宽度比 + 长宽比判定 `sleeve: long|short|sleeveless` 和 `hem: waist|long`。纯 CPU，无需模型推理。
-- **动态 `clothing_mask`（商业级遮罩）**：按检测结果动态调整换衣区范围：
-  - 长袖 → mask 延伸到 88% 身高（含整条手臂，新衣服的袖子能画上去）
-  - 短袖 → 62%（只含大臂）
+- **动态 `clothing_mask`（商业级遮罩）**：上衣同时看衣长(`hem`)和袖长(`sleeve`)决定裁切范围：
+  - 长款上衣(hem=long) → 80% 身高（垂过裤腰，解决「沿裤子齐边剪」问题）
+  - 长袖常规(hem=waist) → 72%（含手臂区，替代原 88% 过度延伸躯干）
+  - 短袖常规 → 62%
   - 无袖 → 55%（不含手臂）
   - 连衣裙 → 按衣长决定（过腰 96% / 正常 82%）
+- **`auto` 类型自动推断**：`garment_type=auto`（默认）时从平铺衣料宽高比推断——aspect>1.6→dress，<0.7→lower，其他→upper。不再穿透无裁切。
 - **`blend_tryon` 升级为 SeamlessClone**：身份区（mask=0，脸/手/脚）按连通分量逐块用 `cv2.seamlessClone(NORMAL_CLONE)` 无缝贴回原图；质心落在孔洞外时自动取组件内中位点；衣服区用增强 alpha 混合（×3 权重）锁死生成结果；seamlessClone 失败时安全回退羽化混合。
 
 ### 实现了什么功能

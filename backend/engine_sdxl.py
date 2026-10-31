@@ -713,6 +713,28 @@ def compose_tryon_sdxl(
     human_img = fit_square(base_img, target_w)
     cloth_img = fit_square(garment_img, target_h)
 
+    # 衣料属性检测(袖长/衣长/宽高比):提前算,用于 auto 类型推断 + mask 裁切。
+    garment_extent = None
+    try:
+        garment_extent = detect_garment_extent(garment_img)
+        logger.info("garment extent: %s", garment_extent)
+    except Exception:  # noqa: BLE001
+        logger.debug("detect_garment_extent failed; using defaults")
+
+    # auto 类型推断:从平铺衣料宽高比判断覆盖范围。
+    # aspect>1.6(高瘦)→dress(一体式覆盖躯干+腿);
+    # aspect<0.7(矮宽)→lower(裤子平铺宽矮);
+    # 其他→upper。
+    if garment_type == "auto":
+        aspect = garment_extent.get("aspect", 1.0) if garment_extent else 1.0
+        if aspect > 1.6:
+            garment_type = "dress"
+        elif aspect < 0.7:
+            garment_type = "lower"
+        else:
+            garment_type = "upper"
+        logger.info("auto garment_type -> %s (aspect=%s)", garment_type, aspect)
+
     # 几何对齐:把平铺衣掰到目标人群姿态,作为 IP-Adapter 参考图。
     # VTON_WARP=1(默认)时,生成器看到的是"已穿在身上的衣服",而非平铺贴图,
     # 显著改善衣服在身上的位置/比例/袖长;失败或关闭时回退原平铺图。
@@ -813,13 +835,7 @@ def compose_tryon_sdxl(
     # (blend_tryon 在此贴回原图像素保身份)。两者互补:reapply 管衣服保真,
     # 身份锁管人脸不走形。任一开关开启才算 mask,都关时跳过省一次推理。
     need_mask = os.environ.get("VTON_DETAIL", "1") != "0" or os.environ.get("VTON_LOCK_ID", "1") != "0"
-    garment_extent = None
-    if need_mask:
-        try:
-            garment_extent = detect_garment_extent(garment_img)
-            logger.info("garment extent: %s", garment_extent)
-        except Exception:  # noqa: BLE001
-            logger.debug("detect_garment_extent failed; using default mask")
+    # garment_extent 已在函数开头检测(用于 auto 推断),此处直接复用。
     shared_mask = (
         clothing_mask(human_img, garment_type=garment_type, garment_extent=garment_extent) if need_mask else None
     )

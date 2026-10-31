@@ -384,11 +384,16 @@ def clothing_mask(
     sleeve = garment_extent.get("sleeve", "short") if garment_extent else "short"
     hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
 
-    if garment_type == "upper":
-        if sleeve == "long":
-            cloth[y0 + int(span * 0.88) :] = 0
+    if garment_type in ("upper", "auto"):
+        # 衣长(hem)决定躯干覆盖范围;袖长(sleeve)微调手臂区。
+        # hem=long → 长款上衣/束腰衣,垂过裤腰(解决"沿裤子齐边剪"问题)。
+        # sleeve=long → 略下延含手臂区(72%,替代原 88% 过度延伸躯干)。
+        if hem == "long":
+            cloth[y0 + int(span * 0.80) :] = 0
         elif sleeve == "sleeveless":
             cloth[y0 + int(span * 0.55) :] = 0
+        elif sleeve == "long":
+            cloth[y0 + int(span * 0.72) :] = 0
         else:
             cloth[y0 + int(span * 0.62) :] = 0
     elif garment_type == "dress":

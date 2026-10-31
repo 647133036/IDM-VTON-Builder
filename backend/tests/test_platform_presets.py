@@ -552,15 +552,31 @@ def _subject_img(h=200, w=120):
 
 
 def test_clothing_mask_long_sleeve_extends_below_default():
-    """长袖 mask 比 default(short)延伸更远:row 140 在 long 保留、default 截断。"""
+    """长袖 mask 比 default(short)延伸更远:row 125 在 long 保留、default 截断。"""
     img, subj = _subject_img()
     m_default = clothing_mask(img, garment_type="upper", subject_mask=subj)
     m_long = clothing_mask(
         img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "long", "hem": "waist"}
     )
     assert m_default is not None and m_long is not None
-    # row 140: default cut at 20+160*0.62=119 → 截断; long cut at 20+160*0.88=160 → 保留
-    assert int(m_long[140, 60]) > int(m_default[140, 60]) + 50
+    # default cut at 20+160*0.62=119; long cut at 20+160*0.72=135
+    # row 125: default 截断, long 保留
+    assert int(m_long[125, 60]) > int(m_default[125, 60]) + 50
+
+
+def test_clothing_mask_upper_long_hem_drapes_over_pants():
+    """长款上衣(hem=long)垂过裤腰:row 140 在 hem=long 保留、hem=waist 截断。"""
+    img, subj = _subject_img()
+    m_waist = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "waist"}
+    )
+    m_long = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "long"}
+    )
+    assert m_waist is not None and m_long is not None
+    # waist cut at 20+160*0.62=119; long cut at 20+160*0.80=148
+    # row 140: waist 截断, long 保留(垂过裤腰)
+    assert int(m_long[140, 60]) > int(m_waist[140, 60]) + 50
 
 
 def test_clothing_mask_sleeveless_cuts_above_default():
@@ -596,6 +612,17 @@ def test_clothing_mask_onesie_does_not_fall_through():
     assert m is not None
     # onesie short cut at 20+160*0.82=151 → row 170 截断
     assert int(m[170, 60]) < 40
+    # row 70 保留
+    assert int(m[70, 60]) > 100
+
+
+def test_clothing_mask_auto_treated_as_upper():
+    """auto 类型按 upper 处理(不再穿透无裁切):底部截断 + 脸区保护。"""
+    img, subj = _subject_img()
+    m = clothing_mask(img, garment_type="auto", subject_mask=subj)
+    assert m is not None
+    # auto=upper → cut at 20+160*0.62=119 → row 160 截断
+    assert int(m[160, 60]) < 40
     # row 70 保留
     assert int(m[70, 60]) > 100
 
