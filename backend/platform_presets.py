@@ -367,6 +367,16 @@ def clothing_mask(
     cloth = subj.copy()
     if face is not None and face.any():
         cloth[face > 0] = 0
+    else:
+        # Heuristic fallback: cv2 5.0 removed CascadeClassifier/CASCADE_SCALE_IMAGE,
+        # _detect_face_mask returns all zeros. Estimate face as top 18% of subject
+        # bbox — protects face/hair from clothing replacement.
+        ys_early = np.where(subj > 0)[0]
+        if len(ys_early):
+            y_top = int(ys_early.min())
+            subj_h = max(1, int(ys_early.max()) - y_top)
+            face_band = y_top + int(subj_h * 0.18)
+            cloth[:face_band] *= (subj[:face_band] == 0).astype(np.uint8)
     ys = np.where(subj > 0)[0]
     y0, y1 = int(ys.min()), int(ys.max())
     span = max(1, y1 - y0)

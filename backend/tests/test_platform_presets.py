@@ -600,6 +600,27 @@ def test_clothing_mask_onesie_does_not_fall_through():
     assert int(m[70, 60]) > 100
 
 
+def test_clothing_mask_heuristic_face_when_detection_fails(monkeypatch):
+    """cv2 人脸检测不可用时(cv2 5.0 缺 CascadeClassifier),启发式仍保护头顶区域。
+
+    subject rows 20-180(span=160)→ face_band=20+28=48。
+    row 35(脸区)被保护(mask 低),row 70(衣服区)仍保留(mask 高)。
+    """
+    import platform_presets
+
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    img = Image.fromarray(np.full((200, 120, 3), 80, dtype=np.uint8), "RGB")
+
+    # 模拟 cv2 5.0: _detect_face_mask 返回全零
+    monkeypatch.setattr(platform_presets, "_detect_face_mask", lambda *a, **kw: np.zeros((200, 120), dtype=np.uint8))
+
+    m = clothing_mask(img, garment_type="upper", subject_mask=subj)
+    assert m is not None
+    assert int(m[35, 60]) < 40  # face area protected
+    assert int(m[70, 60]) > 180  # clothing area retained
+
+
 # --- _detect_face_mask down_margin_frac -------------------------------------
 
 
