@@ -30,6 +30,9 @@ const state = {
   baseBatchOpen: false,
   ethnicity: '',
   storeCode: '',
+  boundStoreId: '',
+  batchPushOpen: false,
+  batchPushStoreId: '',
   files: [],
   audience: 'auto',
   garmentType: 'auto',
@@ -134,6 +137,7 @@ function dashboardView() {
       ${state.view === 'embed' ? embedView() : ''}
       ${state.previewJob ? previewModal() : ''}
       ${state.pushJob ? pushModal() : ''}
+      ${state.batchPushOpen ? batchPushModal() : ''}
       <footer class="foot">${t('footer.powered')} · ${t('footer.licenseNote')}</footer>
     </div>
   `
@@ -223,6 +227,35 @@ function pushModal() {
         <div class="modal-foot">
           <button class="btn gold" id="confirm-push" ${stores.length ? '' : 'disabled'}>${t('push.confirm')}</button>
           <button class="btn ghost" id="close-push-2">${t('push.close')}</button>
+        </div>
+      </div>
+    </div>
+  `
+}
+
+function batchPushModal() {
+  const store = (state.stores || []).find((s) => s.id === state.batchPushStoreId)
+  const storeName = store ? store.name : ''
+  return `
+    <div class="modal" id="batch-push-modal">
+      <div class="modal-inner">
+        <div class="modal-head">
+          <div>
+            <h3>${t('batchPush.title')}</h3>
+            <small>${escapeHtml(storeName)}</small>
+          </div>
+          <button class="btn ghost small" id="close-batch-push">${t('push.close')}</button>
+        </div>
+        <div class="modal-body">
+          <p class="hint">${t('batchPush.hint')}</p>
+          <label>${t('batchPush.csvFile')}<input type="file" id="bp-csv" accept=".csv,.zip" /></label>
+          <p class="hint" style="margin-top:8px">${t('batchPush.csvFormat')}</p>
+          <div class="code">job_id,image_filename,source_name,store_name,store_id,product_id,sku,status</div>
+          <p class="err" id="bp-err"></p>
+        </div>
+        <div class="modal-foot">
+          <button class="btn gold" id="confirm-batch-push">${t('batchPush.confirm')}</button>
+          <button class="btn ghost" id="close-batch-push-2">${t('push.close')}</button>
         </div>
       </div>
     </div>
@@ -421,6 +454,7 @@ function queueView() {
       <h3>${t('queue.title')}</h3>
       <div class="row" style="margin-bottom:12px">
         <button class="btn ghost small" id="dl-all">${t('queue.dlAll', { n: done.length })}</button>
+        <button class="btn ghost small" id="export-csv">${t('queue.exportCsv', { n: done.length })}</button>
       </div>
       <div class="queue">${jobCards(state.jobs)}</div>
     </section>
@@ -437,6 +471,9 @@ function embedView() {
           <b>${escapeHtml(s.name)}</b>
           <span class="tag">${escapeHtml(s.platform || 'other')}</span>
           <span class="hint">${t('embed.product')}${s.product_id ? '#' + escapeHtml(s.product_id) : t('embed.bySku')}</span>
+          ${s.default_sku ? `<span class="hint">SKU: ${escapeHtml(s.default_sku)}</span>` : ''}
+          <button class="btn ghost small" data-tryon-store="${s.id}">${t('embed.tryon')}</button>
+          <button class="btn ghost small" data-batch-push-store="${s.id}">${t('embed.batchPush')}</button>
           <button class="btn ghost small" data-del-store="${s.id}">${t('embed.delStore')}</button>
         </div>
         <p class="hint">${t('embed.storeCode')}</p>
@@ -465,6 +502,7 @@ function embedView() {
         <label>${t('embed.shopUrl')}<input id="sshop" placeholder="${t('embed.shopUrlPh', { shop: '{shop}' })}" /></label>
         <label>${t('embed.api')}<input id="sapi" placeholder="${t('embed.apiPh')}" /></label>
         <label>${t('embed.productId')}<input id="sprod" placeholder="${t('embed.productIdPh')}" /></label>
+        <label>${t('embed.defaultSku')}<input id="ssku" placeholder="${t('embed.defaultSkuPh')}" /></label>
         <button class="btn gold" id="add-store">${t('embed.add')}</button>
         <p class="err" id="store-err"></p>
       </section>
@@ -1060,6 +1098,40 @@ function bindDashboard() {
   })
   const dlAll = document.querySelector('#dl-all')
   if (dlAll) dlAll.onclick = downloadAll
+  const exportCsvBtn = document.querySelector('#export-csv')
+  if (exportCsvBtn) exportCsvBtn.onclick = exportCsv
+  const closeBP = document.querySelector('#close-batch-push')
+  const closeBP2 = document.querySelector('#close-batch-push-2')
+  if (closeBP) closeBP.onclick = () => { state.batchPushOpen = false; render() }
+  if (closeBP2) closeBP2.onclick = () => { state.batchPushOpen = false; render() }
+  const bpModal = document.querySelector('#batch-push-modal')
+  if (bpModal) bpModal.onclick = (e) => { if (e.target === bpModal) { state.batchPushOpen = false; render() } }
+  const confirmBP = document.querySelector('#confirm-batch-push')
+  if (confirmBP) {
+    confirmBP.onclick = async () => {
+      const errEl = document.querySelector('#bp-err')
+      if (errEl) errEl.textContent = ''
+      const csvFile = document.querySelector('#bp-csv').files[0]
+      if (!csvFile) { if (errEl) errEl.textContent = t('batchPush.noFile'); return }
+      const form = new FormData()
+      form.append('csv_file', csvFile, csvFile.name)
+      try {
+        const res = await fetch(`/api/stores/${state.batchPushStoreId}/batch-push`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${state.token}` },
+          body: form
+        })
+        if (!res.ok) throw new Error(await res.text())
+        const result = await res.json()
+        state.batchPushOpen = false
+        alert(t('batchPush.done', { ok: result.pushed || 0, fail: result.failed || 0 }))
+        await refreshJobs()
+        render()
+      } catch (e) {
+        if (errEl) errEl.textContent = e.message
+      }
+    }
+  }
   document.querySelectorAll('[data-del-store]').forEach((btn) => {
     btn.onclick = async (e) => {
       e.stopPropagation()
@@ -1071,6 +1143,22 @@ function bindDashboard() {
       } catch (err) {
         alert(err.message)
       }
+    }
+  })
+  document.querySelectorAll('[data-tryon-store]').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation()
+      state.boundStoreId = btn.dataset.tryonStore
+      state.view = 'batch'
+      render()
+    }
+  })
+  document.querySelectorAll('[data-batch-push-store]').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation()
+      state.batchPushStoreId = btn.dataset.batchPushStore
+      state.batchPushOpen = true
+      render()
     }
   })
   const addStore = document.querySelector('#add-store')
@@ -1090,12 +1178,14 @@ function bindDashboard() {
             shop_url: document.querySelector('#sshop').value.trim(),
             webhook_url: '',
             api_key: document.querySelector('#sapi').value.trim(),
-            product_id: document.querySelector('#sprod').value.trim()
+            product_id: document.querySelector('#sprod').value.trim(),
+            default_sku: document.querySelector('#ssku').value.trim()
           })
         })
         document.querySelector('#sname').value = ''
         document.querySelector('#sapi').value = ''
         document.querySelector('#sprod').value = ''
+        document.querySelector('#ssku').value = ''
         await refreshStores()
         render()
       } catch (e) {
@@ -1146,6 +1236,7 @@ async function submitBatch() {
   form.append('garment_type', state.garmentType)
   form.append('output_format', state.outputFormat)
   form.append('background', state.background)
+  if (state.boundStoreId) form.append('bound_store_id', state.boundStoreId)
   state.files.forEach((f) => form.append('files', f, f.name))
   try {
     await api('/api/jobs/batch', { method: 'POST', body: form })
@@ -1195,6 +1286,27 @@ async function downloadAll() {
   }
 }
 
+async function exportCsv() {
+  const doneJobs = state.jobs.filter((j) => j.status === 'done')
+  if (!doneJobs.length) return
+  try {
+    const res = await fetch('/api/jobs/export-csv', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${state.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: doneJobs.map((j) => j.id) })
+    })
+    if (!res.ok) throw new Error(await res.text())
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = 'jobs_export.zip'
+    a.click()
+  } catch (e) {
+    alert(e.message)
+  }
+}
+
 async function refreshJobs() {
   const [bases, jobs, stats, settings, me, ethnicities] = await Promise.all([
     api('/api/bases'),
@@ -1239,6 +1351,8 @@ async function boot() {
   } catch {}
   const params = new URLSearchParams(location.search)
   state.storeCode = params.get('store') || ''
+  state.boundStoreId = params.get('store') || ''
+  if (state.boundStoreId) state.view = 'batch'
   render()
   setInterval(async () => {
     if (!state.token) return

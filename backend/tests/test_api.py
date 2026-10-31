@@ -640,3 +640,341 @@ def test_health_does_not_leak_abs_paths(client):
     assert "idm_vton_dir" not in detail
     assert "sdxl_dir" not in detail
     assert "/" not in str(detail.get("idm_vton_reason", "")) or "no" in str(detail.get("idm_vton_reason", "")).lower()
+
+
+def test_store_default_sku_roundtrip(client, auth_headers):
+    """Store 创建时带 default_sku,列表/编辑响应保留该字段。"""
+    r = client.post(
+        "/api/stores",
+        json={
+            "name": "SKU测试店",
+            "platform": "shopify",
+            "shop_url": "sku.myshopify.com",
+            "api_key": "tok",
+            "product_id": "42",
+            "default_sku": "SKU-RED-M",
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    store = r.json()
+    assert store["default_sku"] == "SKU-RED-M"
+
+    # patch 更新 default_sku
+    r = client.patch(f"/api/stores/{store['id']}", json={"default_sku": "SKU-BLU-L"}, headers=auth_headers)
+    assert r.status_code == 200
+    assert r.json()["default_sku"] == "SKU-BLU-L"
+
+    # 列表返回含 default_sku
+    r = client.get("/api/stores", headers=auth_headers)
+    matched = next(s for s in r.json() if s["id"] == store["id"])
+    assert matched["default_sku"] == "SKU-BLU-L"
+
+    client.delete(f"/api/stores/{store['id']}", headers=auth_headers)
+
+
+def test_batch_job_binds_store_id(client, auth_headers):
+    """batch 创建 job 时传 bound_store_id,job 记录该字段。"""
+    # 先建一个店铺
+    r = client.post(
+        "/api/stores",
+        json={"name": "绑定测试店", "platform": "other"},
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    seed = client.get("/api/bases", headers=auth_headers).json()
+    base_id = seed[0]["id"]
+    r = client.post(
+        "/api/jobs/batch",
+        data={
+            "base_id": base_id,
+            "audience": "women",
+            "garment_type": "upper",
+            "bound_store_id": store_id,
+        },
+        files=[("files", ("bind.png", _png_bytes((30, 90, 150)), "image/png"))],
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    job = r.json()["jobs"][0]
+    assert job["bound_store_id"] == store_id
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)
+
+
+def test_push_defaults_to_bound_store(client, auth_headers):
+    """job 有 bound_store_id 时,push 不传 store_ids 回退到该店铺(不会报 No pushable store)。"""
+    r = client.post(
+        "/api/stores",
+        json={"name": "回退测试店", "platform": "other"},
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    seed = client.get("/api/bases", headers=auth_headers).json()
+    base_id = seed[0]["id"]
+    r = client.post(
+        "/api/jobs/batch",
+        data={"base_id": base_id, "bound_store_id": store_id},
+        files=[("files", ("bound.png", _png_bytes((20, 60, 90)), "image/png"))],
+        headers=auth_headers,
+    )
+    job = r.json()["jobs"][0]
+
+    # job 未完成,push 应返回 400 "Only completed results"(不是 "No pushable store")
+    # —— 证明 bound_store_id 回退生效,store 找到了,只是 job 没 done。
+    r = client.post(
+        f"/api/jobs/{job['id']}/push",
+        json={"store_ids": []},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "completed" in r.json()["detail"].lower()
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)
+
+
+def test_export_csv_returns_zip_with_manifest_and_images(client, auth_headers):
+    """导出 ZIP:含 manifest.csv + 成品图,CSV 行数 = 图片数,image_filename 一致。"""
+    import io
+    import zipfile
+
+    from store import RESULTS, patch_job
+
+    job = create_job_via_api(client, auth_headers)
+    assert job is not None
+
+    # 手动标记 job 为 done 并写一张成品图(绕过引擎)
+    result_name = f"{job['id']}.jpg"
+    (RESULTS / result_name).write_bytes(_png_bytes((200, 100, 50)))
+    patch_job(job["id"], {"status": "done", "result_url": f"/files/results/{result_name}"})
+
+    r = client.post("/api/jobs/export-csv", json={"job_ids": [job["id"]]}, headers=auth_headers)
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+
+    zf = zipfile.ZipFile(io.BytesIO(r.content))
+    names = zf.namelist()
+    assert "manifest.csv" in names
+    assert f"{job['id']}.jpg" in names
+
+    import csv as csv_mod
+
+    reader = csv_mod.DictReader(io.StringIO(zf.read("manifest.csv").decode()))
+    rows = list(reader)
+    assert len(rows) == 1
+    assert rows[0]["job_id"] == job["id"]
+    assert rows[0]["image_filename"] == f"{job['id']}.jpg"
+    assert rows[0]["status"] == "done"
+    # CSV 行数 == 图片数(不含 manifest.csv)
+    image_files = [n for n in names if n != "manifest.csv"]
+    assert len(rows) == len(image_files)
+
+
+def test_export_csv_skips_non_done_jobs(client, auth_headers):
+    """不存在的 job_id 被跳过;无可导出任务时返回 400。"""
+    r = client.post("/api/jobs/export-csv", json={"job_ids": ["job_nonexistent"]}, headers=auth_headers)
+    assert r.status_code == 400
+
+
+def test_export_csv_empty_job_ids_rejected(client, auth_headers):
+    r = client.post("/api/jobs/export-csv", json={"job_ids": []}, headers=auth_headers)
+    assert r.status_code == 400
+
+
+def _make_done_job_with_result(client, auth_headers, color=(200, 100, 50)):
+    """创建一个 done 状态的 job 并写成品图,返回 job dict。"""
+    from store import RESULTS, patch_job
+
+    job = create_job_via_api(client, auth_headers)
+    assert job is not None
+    result_name = f"{job['id']}.jpg"
+    (RESULTS / result_name).write_bytes(_png_bytes(color))
+    patch_job(job["id"], {"status": "done", "result_url": f"/files/results/{result_name}"})
+    return get_job_via_api(client, auth_headers, job["id"])
+
+
+def get_job_via_api(client, auth_headers, job_id):
+    r = client.get(f"/api/jobs/{job_id}", headers=auth_headers)
+    return r.json()
+
+
+def test_batch_push_replacement_image_priority(client, auth_headers):
+    """CSV + 替换图包:上传包有同名图时用替换图,否则用原成品图。"""
+    import csv as csv_mod
+    import io as io_mod
+
+    from store import RESULTS
+
+    job = _make_done_job_with_result(client, auth_headers, color=(200, 100, 50))
+
+    # 创建店铺(platform=other,不需要真实推送,push_store 返回 tagged only)
+    r = client.post(
+        "/api/stores",
+        json={"name": "批量推送测试店", "platform": "other", "default_sku": "SKU-DEF"},
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    # 构造 CSV
+    csv_buf = io_mod.StringIO()
+    writer = csv_mod.DictWriter(
+        csv_buf,
+        fieldnames=["job_id", "image_filename", "source_name", "store_name", "store_id", "product_id", "sku", "status"],
+    )
+    writer.writeheader()
+    writer.writerow(
+        {
+            "job_id": job["id"],
+            "image_filename": f"{job['id']}.jpg",
+            "source_name": "test.png",
+            "store_name": "",
+            "store_id": "",
+            "product_id": "",
+            "sku": "",
+            "status": "done",
+        }
+    )
+
+    # 上传一张替换图(颜色不同)
+    replaced_bytes = _png_bytes((50, 200, 100))
+
+    r = client.post(
+        f"/api/stores/{store_id}/batch-push",
+        files={
+            "csv_file": ("manifest.csv", csv_buf.getvalue().encode(), "text/csv"),
+            "files": (f"{job['id']}.jpg", replaced_bytes, "image/jpeg"),
+        },
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    assert body["ok"] == 1
+    assert body["results"][0]["job_id"] == job["id"]
+    assert body["results"][0]["ok"] is True
+    # 替换图写到 RESULTS
+    assert (RESULTS / f"{job['id']}_replaced.jpg").exists()
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)
+
+
+def test_batch_push_missing_image_skipped(client, auth_headers):
+    """CSV 行的图片在上传包和原成品中都不存在时,跳过并标注「图片缺失」。"""
+    import csv as csv_mod
+    import io as io_mod
+
+    r = client.post(
+        "/api/stores",
+        json={"name": "缺图测试店", "platform": "other"},
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    csv_buf = io_mod.StringIO()
+    writer = csv_mod.DictWriter(
+        csv_buf,
+        fieldnames=["job_id", "image_filename", "sku", "product_id"],
+    )
+    writer.writeheader()
+    writer.writerow({"job_id": "job_nonexistent", "image_filename": "missing.jpg", "sku": "", "product_id": ""})
+
+    r = client.post(
+        f"/api/stores/{store_id}/batch-push",
+        files={"csv_file": ("manifest.csv", csv_buf.getvalue().encode(), "text/csv")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 1
+    assert body["ok"] == 0
+    assert body["results"][0]["ok"] is False
+    assert "not found" in body["results"][0]["message"].lower() or "缺失" in body["results"][0]["message"]
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)
+
+
+def test_batch_push_sku_fallback_chain(client, auth_headers):
+    """SKU 回退链:CSV 行有 sku → 用行 sku;行 sku 空 → 用店铺 default_sku。"""
+    import csv as csv_mod
+    import io as io_mod
+
+    job = _make_done_job_with_result(client, auth_headers)
+
+    # 店铺有 default_sku
+    r = client.post(
+        "/api/stores",
+        json={"name": "SKU回退测试店", "platform": "other", "default_sku": "SKU-STORE"},
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    # CSV 行 sku 为空 → 回退到店铺 default_sku
+    csv_buf = io_mod.StringIO()
+    writer = csv_mod.DictWriter(csv_buf, fieldnames=["job_id", "image_filename", "sku", "product_id"])
+    writer.writeheader()
+    writer.writerow({"job_id": job["id"], "image_filename": f"{job['id']}.jpg", "sku": "", "product_id": ""})
+
+    r = client.post(
+        f"/api/stores/{store_id}/batch-push",
+        files={"csv_file": ("manifest.csv", csv_buf.getvalue().encode(), "text/csv")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] == 1  # platform=other,push_store 返回 tagged only (ok=True)
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)
+
+
+def test_batch_push_rejects_bad_csv_columns(client, auth_headers):
+    """CSV 缺少必需列时返回 400,列出期望列名。"""
+    r = client.post(
+        "/api/stores",
+        json={"name": "CSV校验店", "platform": "other"},
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    r = client.post(
+        f"/api/stores/{store_id}/batch-push",
+        files={"csv_file": ("bad.csv", b"wrong_column,value\nfoo,bar\n", "text/csv")},
+        headers=auth_headers,
+    )
+    assert r.status_code == 400
+    assert "job_id" in r.json()["detail"]
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)
+
+
+def test_push_results_record_sku_and_product_id(client, auth_headers):
+    """push_results 记录每店使用的 product_id/sku(含回退到店铺默认)。"""
+
+    # 店铺有 default_sku 和 product_id
+    r = client.post(
+        "/api/stores",
+        json={
+            "name": "推送记录测试店",
+            "platform": "other",
+            "default_sku": "SKU-DEFAULT",
+            "product_id": "999",
+        },
+        headers=auth_headers,
+    )
+    store_id = r.json()["id"]
+
+    job = _make_done_job_with_result(client, auth_headers)
+
+    # push 不传 sku/product_id → 回退到店铺默认
+    r = client.post(
+        f"/api/jobs/{job['id']}/push",
+        json={"store_ids": [store_id]},
+        headers=auth_headers,
+    )
+    assert r.status_code == 200
+    push_results = r.json()["push_results"]
+    assert store_id in push_results
+    assert push_results[store_id]["sku"] == "SKU-DEFAULT"
+    assert push_results[store_id]["product_id"] == "999"
+
+    client.delete(f"/api/stores/{store_id}", headers=auth_headers)

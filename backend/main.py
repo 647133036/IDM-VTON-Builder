@@ -1,3 +1,4 @@
+import io
 import re
 import uuid
 from pathlib import Path
@@ -7,7 +8,7 @@ from auth import USERS, current_user, issue_token, require_admin
 from engine import engine_status
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from push import push_store
 from pydantic import BaseModel, Field
 from store import (
@@ -200,6 +201,7 @@ class StoreBody(BaseModel):
     webhook_url: str | None = ""
     api_key: str | None = ""
     product_id: str | None = ""
+    default_sku: str | None = ""
 
 
 class StorePatch(BaseModel):
@@ -209,6 +211,7 @@ class StorePatch(BaseModel):
     webhook_url: str | None = None
     api_key: str | None = None
     product_id: str | None = None
+    default_sku: str | None = None
 
 
 class PushBody(BaseModel):
@@ -422,6 +425,7 @@ def api_add_store(body: StoreBody, request: Request, _: dict = Depends(require_a
         "webhook_url": body.webhook_url or "",
         "api_key": body.api_key or "",
         "product_id": body.product_id or "",
+        "default_sku": body.default_sku or "",
         "created_at": int(__import__("time").time()),
         "active": True,
     }
@@ -689,6 +693,7 @@ async def api_batch(
     garment_type: str = Form("auto"),
     output_format: str = Form("jpg"),
     background: str = Form("white"),
+    bound_store_id: str = Form(""),
     _: dict = Depends(current_user),
 ):
     _validate_batch_params(audience, garment_type, background, output_format)
@@ -732,10 +737,113 @@ async def api_batch(
                 "source_name": display_name,
                 "source_url": public_url(dest),
                 "title": Path(display_name).stem,
+                "bound_store_id": bound_store_id or "",
             }
         )
         jobs.append(job)
     return {"count": len(jobs), "jobs": jobs}
+
+
+class ExportCsvBody(BaseModel):
+    job_ids: list[str]
+
+
+@app.post("/api/jobs/export-csv")
+def api_export_csv(body: ExportCsvBody, _: dict = Depends(current_user)):
+    """导出 ZIP:CSV 清单 + 已完成任务的成品图,供离线修图后批量回传推送。"""
+    from export_csv import export_jobs_csv
+
+    if not body.job_ids:
+        raise HTTPException(status_code=400, detail="Please select at least one job")
+    data = export_jobs_csv(body.job_ids)
+    if not data:
+        raise HTTPException(status_code=400, detail="No completed jobs found to export")
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=tryon_export.zip"},
+    )
+
+
+@app.post("/api/stores/{store_id}/batch-push")
+async def api_batch_push(
+    store_id: str,
+    csv_file: UploadFile = File(...),
+    files: list[UploadFile] = File(default=[]),
+    _: dict = Depends(require_admin),
+):
+    """CSV + 图片包批量推送:解析 CSV,逐行匹配替换图,推送到当前店铺。
+
+    流程:
+    1. 解析 CSV(manifest.csv 格式),校验列名
+    2. 逐行:store_id 缺失填当前店铺;image_filename 在上传包中存在用替换图,
+       否则用原成品图;都不存在跳过标注「图片缺失」
+    3. product_id/sku 缺失回退店铺 default_product_id / default_sku
+    4. 逐行调 push_store,返回 [{job_id, ok, message, url}]
+    """
+    import csv as csv_mod
+
+    from push import push_store
+
+    stores = {s["id"]: s for s in list_stores()}
+    if store_id not in stores:
+        raise HTTPException(status_code=404, detail="Store not found")
+    store = stores[store_id]
+
+    raw_csv = (await csv_file.read()).decode("utf-8-sig")
+    reader = csv_mod.DictReader(io.StringIO(raw_csv))
+    required = {"job_id", "image_filename"}
+    missing = required - set(reader.fieldnames or [])
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV missing required columns: {','.join(sorted(missing))}. Expected: {','.join(sorted(required))}",
+        )
+
+    # 上传图片包:filename -> bytes
+    uploaded: dict[str, bytes] = {}
+    for f in files:
+        data = await f.read()
+        if data:
+            uploaded[f.filename or ""] = data
+
+    results = []
+    for row in reader:
+        jid = (row.get("job_id") or "").strip()
+        img_name = (row.get("image_filename") or "").strip()
+        if not jid:
+            results.append({"job_id": "", "ok": False, "message": "Empty job_id", "url": ""})
+            continue
+
+        try:
+            job = get_job(jid)
+        except KeyError:
+            results.append({"job_id": jid, "ok": False, "message": "Job not found", "url": ""})
+            continue
+
+        # 替换图优先:上传包有同名文件 → 写到 RESULTS 临时位置,push_store 用它
+        result_url = job.get("result_url", "")
+        if img_name and img_name in uploaded:
+            replaced_name = f"{jid}_replaced.jpg"
+            replaced_path = RESULTS / replaced_name
+            replaced_path.write_bytes(uploaded[img_name])
+            result_url = f"/files/results/{replaced_name}"
+        elif not result_url or not (RESULTS / result_url.split("/")[-1]).exists():
+            results.append({"job_id": jid, "ok": False, "message": "图片缺失", "url": ""})
+            continue
+
+        # SKU/product_id 回退链:CSV 行 > 店铺默认
+        sku = (row.get("sku") or "").strip() or store.get("default_sku", "")
+        product_id = (row.get("product_id") or "").strip() or store.get("product_id", "")
+
+        # 构造临时 job dict(不污染原 job),用替换图路径
+        push_job = dict(job)
+        push_job["result_url"] = result_url
+        push_body = {"sku": sku, "product_id": product_id, "product_url": ""}
+        res = push_store(push_job, store, push_body)
+        results.append({"job_id": jid, "ok": res["ok"], "message": res["message"], "url": res.get("url", "")})
+
+    return {"results": results, "total": len(results), "ok": sum(1 for r in results if r["ok"])}
 
 
 @app.post("/api/jobs/{job_id}/push")
@@ -749,7 +857,9 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(require_admin)):
     stores = list_stores()
     store_ids = body.store_ids or []
     if not store_ids:
-        store_ids = [s["id"] for s in stores]
+        # 回退链:显式传入 > job 绑定店铺 > 全部店铺
+        bound = job.get("bound_store_id", "")
+        store_ids = [bound] if bound else [s["id"] for s in stores]
     existing = {s["id"]: s for s in stores}
     store_ids = [sid for sid in store_ids if sid in existing]
     if not store_ids:
@@ -765,8 +875,12 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(require_admin)):
     push_notes = []
     for sid in store_ids:
         store = existing[sid]
-        res = push_store(job, store, push_body)
-        results[sid] = res
+        # 每店 SKU/product_id 回退:body 显式 > 店铺默认 > 空
+        per_sku = push_body["sku"] or store.get("default_sku", "")
+        per_pid = push_body["product_id"] or store.get("product_id", "")
+        per_body = {**push_body, "sku": per_sku, "product_id": per_pid}
+        res = push_store(job, store, per_body)
+        results[sid] = {**res, "product_id": per_pid, "sku": per_sku}
         if res["ok"]:
             pushed.append(sid)
             push_notes.append(f"{store['name']}: {res['message']}")

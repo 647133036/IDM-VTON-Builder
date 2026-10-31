@@ -309,6 +309,7 @@ def create_job(payload: dict) -> dict:
             "prompt": payload.get("prompt", ""),
             "source_name": payload.get("source_name", ""),
             "source_url": payload.get("source_url", ""),
+            "bound_store_id": payload.get("bound_store_id", ""),
             "result_url": "",
             "preview_url": "",
             "progress": 0,
