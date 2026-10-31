@@ -1,54 +1,55 @@
-# Atelier v0.1.3
+# Atelier v0.1.4
 
 店铺后台固定底图换衣工作台。选一张模特底图，批量拖入服装平铺图，队列生成正面成品，下载或推送到商品页。界面内置中英文一键切换。
 
-## v0.1.3 更新日志
+## v0.1.4 更新日志
 
-本轮版本聚焦「AI 出骨架光影，代码保商品细节」的混合生成策略——用 SDXL 生成姿态/光影完美的人体，再用纯 CPU 代码把原平铺衣的纹理和颜色原封不动贴回去，同时锁住人脸身份。全部新增模块纯 CPU 实现，无需重训即可生效。
+本轮版本解决三个出图致命缺陷：**换图案**（SDXL 不按原衣图案画）、**衣袖截断**（长袖只画到腰）、**胸口深 V / 肩膀重影**（脸区遮罩吞掉胸口、高频纹理在肩臂交界叠成重影）。同时引入商业级换衣流程的动态遮罩与无缝贴回。
+
+### 解决了什么问题
+
+| 缺陷 | 根因 | 修复 |
+|------|------|------|
+| **换图案** | Canny 0.35 太低，衣服图案边缘没参与生成；IP-Adapter 0.8 对复杂花纹不够强 | Canny 按品类自动调权（实心面料 0.55 / 下装 0.45），IP-Adapter 提到 0.9，reapply texture_strength 提到 0.70 |
+| **衣袖截断** | `fit_garment_to_body` 把衣高 clamp 到躯干框 1.6 倍，canvas 只有躯干高，袖子被裁 | 去掉 max_scale 高度 clamp，canvas 高度取 `max(th, nh+pad)` 容纳长袖，`shirt_mask` 用 fitted 实际尺寸 |
+| **胸口深 V** | `clothing_mask` 的 `face_margin=0.65` 四方向等扩，脸框向下吞掉脖子和胸口 | `face_margin` 降到 0.35，新增 `down_margin_frac=0.08` 只向下扩到下巴线，脖子和胸口留给换衣区 |
+| **肩膀重影** | `reapply_garment_detail` 把高频纹理均匀贴到整个 mask 区，肩臂交界对齐偏差叠加成重影 | 加入 distanceTransform 边缘衰减：mask 中心区全强度贴纹理，边缘 25% 区渐弱到 0 |
 
 ### 优化了什么
 
-- **LoRA 权重加载权威性修复（P0）**：`lora_io` 改为 PEFT 格式优先（`adapter_model.safetensors` 93MB / train_log 产物），旧逻辑优先加载 diffusers 格式（46.6MB）导致两份权重数值不一致（A 权重 mean abs diff 0.07）。`_WEIGHT_NAMES = (PEFT_LORA, DIFFUSERS_LORA)`，PEFT 缺失时自动回退 diffusers。
-- **训练几何修复（重训基线）**：`train_lora_sdxl.py` / `train_controlnet_sdxl.py` 修复三处硬伤，作为下次重训基线：
-  - `time_ids` 顺序：`[res,res,res,res,0,0]` → `[res,res,0,0,res,res]`（original/crop/target ordering）
-  - `letterbox_rgb` 替代硬拉伸：保宽高比补白，不再把所有图拉成 1024 正方形
-  - VAE 强制 fp32 编码（`no_grad`）：防 bf16 latent 伪影
-- **min-SNR 加权**：Kohya `min(snr,gamma)/snr`（`--snr_gamma 5.0`），压制高 SNR 低噪步的过拟合。
-- **推理默认值优化**：
-  - `VTON_AR` 默认开（保宽高比 letterbox，`=0` 才硬拉伸）
-  - `VTON_LORA` 默认 0.7（r16 小数据不全量 1.0，`set_adapters` 控制）
-  - `_sdxl_state` 新增 `lora_loaded` 状态追踪，加载成功记日志
-- **遮罩复用优化**：`clothing_mask`（含 rembg u2net 推理）从算两次降为算一次，`reapply_garment_detail` 与 `blend_tryon` 共用同一张 `shared_mask`。
-- **创空间 demo**：`ms_space/engine_sdxl.py` 补 letterbox 支持。
+- **ControlNet Canny 按品类自动调权**：实心面料（upper/dress/onesie）0.55 锁图案结构；下装 0.45 防鬼影。`VTON_CANNY` 环境变量仍可显式覆盖。
+- **IP-Adapter 默认 0.9**：从 0.8 提升，blend_tryon 身份锁已保护人脸，可以加大服装特征注入权重。`VTON_IPA` 仍可覆盖。
+- **reapply_garment_detail 边缘衰减**：用 `cv2.distanceTransform` 计算每个像素到 mask 边缘的距离，在 0-25% 距离区间线性衰减 texture_strength，肩臂交界不再叠高频重影。
+- **reapply texture_strength 0.70**：从 0.55 提升，高频纹理回贴更狠，补 1024 分辨率丢失的细节。
+- **face_margin 非对称扩展**：`_detect_face_mask` 新增 `down_margin_frac` 参数，上/左/右扩 0.35 保护额头耳侧，向下只扩 0.08 盖到下巴线。
 
 ### 增加了什么
 
-- **训练双格式保存**：`train_lora_sdxl.py` 同时写 `adapter_model.safetensors`（PEFT，权威）+ `pytorch_lora_weights.safetensors`（diffusers），保证同一 checkpoint 双格式可用。`train_lora_family.py` Namespace 补 `snr_gamma=5.0`。
-- **`align_garment_to_pose`（VITON 几何对齐）**：把平铺衣先「掰」到目标人群肩宽/躯干轮廓（复用 `fit_garment_to_body` + `_warp_garment`），生成「正穿在人身上」的服装参考图，替代平铺图送 IP-Adapter 和 Canny。`VTON_WARP=1` 默认开启。
-- **`reapply_garment_detail`（商品细节回贴）**：四步纯 CPU 后处理，把原衣的纹理和颜色贴回 SDXL 生成图：
-  1. 高频纹理提取（`ref - GaussianBlur` → 花纹/面料质感）
-  2. 柔光混合贴回（softlight 模式，128 中性无影响）
-  3. Reinhard LAB 颜色迁移（等价颜色直方图匹配，强制颜色一致）
-  4. mask 羽化混合（只动衣服区，人脸/背景/手不动）
-- **`clothing_mask` + `blend_tryon`（身份锁换衣）**：rembg 主体减 Haar 人脸，按 `garment_type` 裁切服装区；mask 外贴回原图人脸/背景保身份，mask 内保留生成+回贴结果。`VTON_LOCK_ID=1` 默认开启。
+- **`detect_garment_extent`（服装属性检测）**：从平铺衣料图自动判断袖长和衣长。按内容 alpha/背景差分取 bbox，纵向三段（肩/胸/下摆）宽度比 + 长宽比判定 `sleeve: long|short|sleeveless` 和 `hem: waist|long`。纯 CPU，无需模型推理。
+- **动态 `clothing_mask`（商业级遮罩）**：按检测结果动态调整换衣区范围：
+  - 长袖 → mask 延伸到 88% 身高（含整条手臂，新衣服的袖子能画上去）
+  - 短袖 → 62%（只含大臂）
+  - 无袖 → 55%（不含手臂）
+  - 连衣裙 → 按衣长决定（过腰 96% / 正常 82%）
+- **`blend_tryon` 升级为 SeamlessClone**：身份区（mask=0，脸/手/脚）按连通分量逐块用 `cv2.seamlessClone(NORMAL_CLONE)` 无缝贴回原图；质心落在孔洞外时自动取组件内中位点；衣服区用增强 alpha 混合（×3 权重）锁死生成结果；seamlessClone 失败时安全回退羽化混合。
 
 ### 实现了什么功能
 
-完整的「AI 出骨架 + 代码保细节」混合生成流程，在 `compose_tryon_sdxl` 中按序执行：
+商业级换衣流程三步落地：
 
 ```
-SDXL 生成(姿态/光影/人体)
-  ↓
-align_garment_to_pose → 几何对齐参考送 IP-Adapter(衣服已掰到人体姿态)
-  ↓ SDXL 出图
-reapply_garment_detail → 衣服区贴回原衣纹理 + 颜色(VTON_DETAIL)
-  ↓
-blend_tryon → 人脸/背景贴回原图保身份(VTON_LOCK_ID)
-  ↓
-force_white_background → 纯白底
+1. 原图剥离    detect_garment_extent → 分析衣料袖长/衣长
+                clothing_mask        → 动态遮罩:长袖含手臂,无袖不含
+                
+2. AI 重绘     SDXL + ControlNet(Canny 0.55 锁图案) + IP-Adapter(0.9 注入服装特征)
+                reapply_garment_detail → 高频纹理边缘衰减贴回(中心强/边缘弱)
+                
+3. 无缝贴回    blend_tryon → seamlessClone 逐块贴回脸/手/脚(无硬边)
 ```
 
-全程纯 CPU 后处理，5 秒内跑完，出图效果对标商业级换衣。
+## v0.1.3 更新日志（历史）
+
+v0.1.3 引入「AI 出骨架光影，代码保商品细节」混合生成策略：`align_garment_to_pose` 几何对齐 + `reapply_garment_detail` 纹理颜色回贴 + `blend_tryon` 身份锁。全部纯 CPU 后处理，无需重训即可生效。同时修复 LoRA 权重加载权威性（PEFT 优先）、训练几何（time_ids / letterbox / VAE fp32 / min-SNR）、推理默认值（VTON_AR / VTON_LORA）。
 
 ## 功能
 
@@ -57,13 +58,13 @@ force_white_background → 纯白底
 - 白底 JPEG 或透明 PNG
 - 已上传图片形成可复用图片库，支持服饰分类管理与批量调整分类
 - 底座分类（受众 / 年龄带 / 人种）可管理、可批量调整
-- 人种标签可自定义（默认 10 个地理区域：西欧 / 东欧 / 西亚 / 中亚 / 东亚 / 东南亚 / 非洲 / 北美 / 南美 / 澳洲），换衣引擎按底座人种修正体型（肩宽、躯干比例）
-- 多店铺管理：每店铺独立 embed 嵌入链接，商品标识通过 `store` 参数区分
+- 人种标签可自定义（默认 10 个地理区域），换衣引擎按底座人种修正体型（肩宽、躯干比例）
+- 多店铺管理：每店铺独立 embed 嵌入链接 + CSV/SKU 批量推送
 - 真实推送：Shopify Admin API 上传商品图，WordPress REST 媒体 + WooCommerce 商品关联
 - 成品大图预览弹窗，左右对照原图与成品
-- 界面中英文一键切换（登录页 / 导航栏按钮），语言偏好本地持久化
-- 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底），UI 横幅实时显示当前引擎与 GPU 状态
-- **v0.1.3 新增**：几何对齐 + 商品细节回贴 + 身份锁，SDXL 引擎出图保商品纹理颜色、锁人脸身份
+- 界面中英文一键切换，语言偏好本地持久化
+- 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底）
+- **v0.1.4 新增**：动态袖长检测 + 动态遮罩 + SeamlessClone 无缝贴回 + Canny/IP-Adapter/texture 权重提升
 
 ## 安全
 
@@ -71,92 +72,53 @@ force_white_background → 纯白底
 
 ### 已修复
 
-- **文件服务鉴权**：`/files/{path}` 无需登录（HTML `<img>` 需要匿名访问），但仅暴露 `uploads` / `results` / `bases` 三个白名单目录，仅允许 `.png` / `.jpg` / `.jpeg` / `.webp` 图片后缀，`state.json`、`jobs/`、锁文件等内部文件返回 404；响应带 `X-Content-Type-Options: nosniff`
-- **上传路径校验**：文件名和分类名通过正则白名单校验，拒绝 `.`、`..`、路径穿越
-- **图片内容验证**：所有上传入口使用 PIL 解码校验，仅接受 PNG / JPEG / WEBP 真实格式（拒绝 GIF / BMP / TIFF 等伪装成 PNG 的文件），最大 20MB
-- **JWT 密钥**：无硬编码默认值；未设置 `STORE_JWT_SECRET` 时随机生成并持久化到 `backend/data/.jwt_secret`（chmod 600），多 worker 进程共享，重启不失效
-- **账号密码**：无公开默认密码；未设置环境变量时随机生成并通过 `print()` 输出到 stdout（同时写日志）
-- **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看，删除 / 推送 / 设置 / 人种管理需 admin
-- **凭据脱敏**：`/api/stores` 的 GET / POST / PATCH 响应均不返回明文 api_key，仅返回 `has_api_key` 和掩码值
-- **文件权限**：state.json 权限 600
-- **SSRF 防护**：`/api/push` 的店铺地址强制 https 且必须以 `.myshopify.com` 结尾，解析后仅允许全局可路由单播（拒绝内网 / 环回 / 链路本地 / 保留 / CGNAT / 组播 / 未指定），全部 HTTP 调用 `allow_redirects=False`
-- **XSS 防护**：前端动态字段经 `escapeHtml` 转义（含人种下拉 `value` 属性）；服务端对 `audience` / `garment_type` / `background` / `output_format` 做枚举白名单校验，`ethnicity.value` 限小写 slug（禁引号/尖括号/空格）
-- **GPU 并发**：扩散推理路径由全局 `threading.Lock` 串行化；SDXL / IDM-VTON 管线与 ControlNet 检测器首次加载均有独立单飞锁（double-checked），避免并发构建撑爆显存
-- **SDXL 管线缓存**：ControlNet 管线构建一次后常驻，不再每个任务重复加载
-- **异常可观测性**：引擎回退与失败路径写 `logger.exception`，不再静默吞掉异常
-- **批量事务性**：`/api/jobs/batch` 先全量校验所有文件再统一写盘，避免部分成功
-
-### 未修复
-
-- DNS 重绑定（TOCTOU）未完全消除：`/api/push` 在解析域名后、发起连接前，域名仍可能被重新绑定到内网地址；彻底解决需按已校验 IP 直连（网络层固定目标）。已拒绝解析结果为非全局地址的情形
-- 无 GPU 环境下合成引擎为启发式近似，效果有限；IDM-VTON / SDXL 扩散推理需 GPU 与权重
-- 去水印为浅色角部/上下带 logo 文字的 best-effort，深色或满铺水印不在覆盖范围
+- **文件服务鉴权**：`/files/{path}` 无需登录，但仅暴露 `uploads` / `results` / `bases` 三个白名单目录，仅允许图片后缀，内部文件返回 404；响应带 `X-Content-Type-Options: nosniff`
+- **上传路径校验**：文件名和分类名通过正则白名单校验，拒绝路径穿越
+- **图片内容验证**：PIL 解码校验，仅接受 PNG / JPEG / WEBP，最大 20MB
+- **JWT 密钥**：无硬编码默认值；未设置时随机生成并持久化（chmod 600），多 worker 共享
+- **账号密码**：无公开默认密码；未设置时随机生成并输出到 stdout
+- **角色权限**：admin 可执行所有操作，staff 仅可创建任务和查看
+- **凭据脱敏**：`/api/stores` 响应不返回明文 api_key
+- **SSRF 防护**：`/api/push` 强制 https + `.myshopify.com`，拒绝内网地址，`allow_redirects=False`
+- **XSS 防护**：前端 `escapeHtml` 转义；服务端枚举白名单校验
+- **GPU 并发**：扩散推理路径全局 `threading.Lock` 串行化
+- **SDXL 管线缓存**：构建一次后常驻
+- **批量事务性**：`/api/jobs/batch` 先全量校验再统一写盘
 
 ### 已知限制
 
-- **文件服务仅靠白名单 + 后缀**：`/files` 匿名可访问，目录白名单是唯一的访问控制。若需要按用户隔离文件，需重新引入鉴权并为 `<img>` 标签补带 token 的机制
-- **文件名 / 分类名仅允许 ASCII**：`_safe_name` 正则不含中文字符，上传中文文件名会被拒绝。这是有意收紧，避免 locale 编码问题
-- **JWT 单密钥**：不支持密钥轮换；改了 `STORE_JWT_SECRET` 会让所有已签发 token 失效
-- **SSRF 仅覆盖 push 出口**：上传与下载路径不涉及任意 URL 请求，故无 SSRF 面
-- **测试依赖**：后端测试用 pytest，前端测试用 vitest；`ruff check` 与 `ruff format --check` 在 `backend/` 和 `training/` 下运行（项目 `pyproject.toml` 固定行宽 120）
-
+- DNS 重绑定（TOCTOU）未完全消除
+- 无 GPU 环境下合成引擎为启发式近似，效果有限
+- 去水印为浅色角部 best-effort
 
 ## 图片规格
 
-**上传（服装图 / 底座图）**
-- 文件大小：最大 20MB
-- 格式：PNG / JPEG / WEBP（服务端 PIL 解码校验，拒绝伪造 Content-Type）
-- 分辨率与宽高比：不拦截，任意尺寸均可上传
+**上传**：PNG / JPEG / WEBP，最大 20MB，任意尺寸
 
-**生成处理**
-- 合成引擎：服装图先做角部/上下带水印去除（`cv2.inpaint` 启发式），再自动裁剪主体；随后按衣料实测宽度等比缩放到模特肩宽（保留真实长宽比，宽衣料不再强行铺满躯干），再做简易 2D 网格变形（`cv2.remap` 沿躯干轮廓收窄/放宽：肩部略展、腰部收、下摆贴合），并叠加随尺寸缩放的接触阴影，让衣料「贴」在模特身上而非纸片平贴
-- SDXL 商用引擎（v0.1.3 混合流程）：
-  1. 服装平铺图经 `crop_garment_to_content` 裁剪主体
-  2. `align_garment_to_pose` 把衣服掰到目标人群肩宽/躯干轮廓（`fit_garment_to_body` + `_warp_garment`），生成「正穿在人身上」的参考图送 IP-Adapter
-  3. 底图与对齐后服装图统一缩放到 1024x1024（letterbox 保宽高比），送 ControlNet（OpenPose 姿态 + Depth/Canny）+ IP-Adapter
-  4. SDXL 生成姿态/光影完美的人体
-  5. `reapply_garment_detail`：从原衣提取高频纹理（柔光贴回）+ Reinhard LAB 颜色迁移，把商品花纹/颜色原封不动贴回生成图衣服区
-  6. `blend_tryon`：mask 外贴回原图人脸/背景保身份
-  7. `force_white_background`：纯白底
+**生成处理（v0.1.4 商业级流程）**：
+1. `detect_garment_extent` 分析衣料袖长/衣长
+2. `crop_garment_to_content` 裁剪主体
+3. `align_garment_to_pose` 几何对齐送 IP-Adapter
+4. ControlNet（OpenPose 0.8 + Canny 0.55 锁图案 + Depth 0.95）+ IP-Adapter 0.9
+5. SDXL 生成姿态/光影/人体
+6. `reapply_garment_detail` 边缘衰减贴回纹理 + Reinhard 颜色迁移（texture_strength 0.70）
+7. `blend_tryon` 动态 mask + SeamlessClone 无缝贴回脸/手/脚
+8. `force_white_background` 纯白底
 
-**输出成品**
-- 长边统一 2048px（`output_long_side`，可配置），宽高比跟随底座图（预置底座为 3:4 竖版，约 1536x2048）
-- 背景支持白底 JPEG 或透明 PNG
-
-> 建议：输入图尽量不小于 512px 短边，避免放大后细节模糊。
+**输出**：长边 2048px，宽高比跟随底座图
 
 ## 技术栈
 
-**前端**
-- 原生 JavaScript（ES 模块，无框架）+ CSS
-- Vite 5 构建
-- 自研轻量 i18n（`src/i18n.js`，zh/en 字典）
+**前端**：原生 JavaScript（ES 模块）+ Vite 5 + 自研 i18n（zh/en）
 
-**后端**
-- Python 3 + FastAPI + Uvicorn
-- PyJWT 认证（admin / staff 双账号，角色权限分离）
-- PIL / NumPy / OpenCV 图像处理（合成引擎 + 商品细节回贴）
-- 数据持久化：JSON 文件 + 文件锁（无数据库）
+**后端**：Python 3 + FastAPI + Uvicorn + PyJWT + PIL / NumPy / OpenCV + JSON 文件持久化
 
-**AI 引擎**
-- IDM-VTON：基于知识蒸馏的虚拟试衣模型（ECCV 2024），**禁止商用，商用需购买授权**
-- SDXL + ControlNet + IP-Adapter：商用合规 pipeline（有 GPU 时启用）
-- 合成引擎：无 GPU 环境下的兜底方案
+**AI 引擎**：
+- IDM-VTON（CC BY-NC-SA 4.0，禁止商用）
+- SDXL + ControlNet + IP-Adapter（商用合规）
+- 合成引擎（无 GPU 兜底）
 
-**训练**
-- SDXL LoRA 训练（`training/train_lora_sdxl.py`）：双格式保存（PEFT + diffusers）
-- SDXL ControlNet 训练（`training/train_controlnet_sdxl.py`）
-- 一键脚本：`MODEL=lora bash training/run_train.sh`
-
-**部署**
-- Git submodule 管理依赖
-- 环境变量控制引擎选择与凭据注入
-- 许可证合规检查（研究 / 商用模式分流）
-
-## 授权说明
-
-- **IDM-VTON**（基于知识蒸馏的虚拟试衣模型，ECCV 2024）：遵循 **CC BY-NC-SA 4.0** 非商用许可，**仅限科研 / 学术用途，禁止商用**；如需商用，须向原作者购买授权。
-- **SDXL + ControlNet + IP-Adapter（店铺换衣管线）**：本仓库用于店铺换衣的重新训练 / 微调管线，**其商用权归作者所有**；如需商用，请与作者联系获取授权。
+**训练**：SDXL LoRA（双格式保存 PEFT + diffusers）+ ControlNet + 一键脚本 `MODEL=lora bash run_train.sh`
 
 ## 快速启动（无 GPU）
 
@@ -166,14 +128,12 @@ pip3 install --break-system-packages -r backend/requirements.txt
 cd backend
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
 
-# 前端（新终端）
+# 前端
 npm install
 npm run dev
 ```
 
-前端 Vite 开发服务器把 `/api` 和 `/files` 反代到 `8000`。
-
-首次启动时，后端会为 `admin` 和 `staff` 账号生成随机密码并输出到进程日志。生产部署请通过环境变量注入凭据：
+首次启动时后端为 `admin` 和 `staff` 生成随机密码并输出到日志。生产部署：
 
 ```bash
 export STORE_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
@@ -181,325 +141,152 @@ export STORE_ADMIN_PASSWORD="your-secure-password"
 export STORE_STAFF_PASSWORD="your-secure-password"
 ```
 
-缺失时使用随机值（每次重启失效），仅适合本地开发。
-
 ## GPU 部署（商用模式）
 
-有 NVIDIA GPU（最低 12GB VRAM）时，可启用 SDXL 商用引擎。页面横幅会随环境自动显示「SDXL + ControlNet + IP-Adapter（商用合规 pipeline）」。
-
 ```bash
-# 1. 克隆仓库（含 submodule）
 git clone https://github.com/647133036/IDM-VTON-Builder.git
 cd IDM-VTON-Builder
 git submodule update --init --recursive --depth 1
-
-# 2. 下载 SDXL 权重（约 12-15GB）
 bash scripts/download_sdxl_weights.sh
-
-# 3. 安装后端依赖
 cd backend
 pip install -r requirements.txt
 pip install "torch>=2.1.0" "diffusers>=0.27.0" "transformers>=4.40.0" "accelerate>=0.30.0" controlnet-aux rembg
-
-# 4. 启动后端（商用模式）
 export LICENSE_MODE=commercial
 export STORE_JWT_SECRET="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
 export STORE_ADMIN_PASSWORD="your-secure-password"
 python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
-
-# 5. 验证引擎状态
 curl http://localhost:8000/api/license
-# 期望 commercial_compliant: true, gpu_available: true
 ```
-
-完整 GPU 部署指南见 `docs/GPU_DEPLOY.md`。
-
-## GPU 部署（研究模式）
-
-```bash
-# 下载 IDM-VTON 权重（约 20-30GB）
-bash scripts/download_weights.sh
-
-# 启动后端（研究模式）
-cd backend
-LICENSE_MODE=research python3 -m uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-研究模式下 IDM-VTON 仅限测试 / 学习，禁止商用。
 
 ## SDXL 训练
 
-项目内置 SDXL LoRA 和 ControlNet 训练脚本，支持在魔搭（ModelScope）Notebook 或本地 GPU 上训练。
-
 ```bash
-# LoRA 训练（推荐，约 11 分钟 / 800 步）
 cd training
-MODEL=lora bash run_train.sh
-
-# ControlNet 训练
-MODEL=controlnet bash run_train.sh
-
-# LoRA 族（服装 + 人像双 LoRA）
-MODEL=lora_family bash run_train.sh
+MODEL=lora bash run_train.sh         # LoRA（约 11 分钟 / 800 步）
+MODEL=controlnet bash run_train.sh   # ControlNet
+MODEL=lora_family bash run_train.sh  # 服装 + 人像双 LoRA
 ```
 
-训练要点（v0.1.3 基线）：
-- CUDA 训练使用 `bfloat16`（Ampere+ GPU），CPU 回退 `float32`
-- LoRA 双格式保存：`adapter_model.safetensors`（PEFT，权威）+ `pytorch_lora_weights.safetensors`（diffusers）
-- **time_ids 修正**：`[res,res,0,0,res,res]`（original/crop/target ordering）
-- **letterbox**：`letterbox_rgb` 保宽高比补白，不再硬拉伸
-- **VAE fp32 编码**：`no_grad` 下 float32 编码，防 bf16 latent 伪影
-- **min-SNR 加权**：`--snr_gamma 5.0`（Kohya `min(snr,gamma)/snr`）
-- ControlNet 条件图归一化到 `[0,1]`，与推理端一致
-- 数据准备：`python3 prepare_dataset.py` + `python3 prepare_controlnet_data.py`
+训练基线（v0.1.3+）：
+- `bfloat16`（Ampere+ GPU），CPU 回退 `float32`
+- 双格式保存：PEFT `adapter_model.safetensors` + diffusers `pytorch_lora_weights.safetensors`
+- `time_ids` `[res,res,0,0,res,res]`、`letterbox_rgb` 保宽高比、VAE fp32、min-SNR gamma=5.0
 
-训练依赖见 `training/requirements.txt`（含 `torchvision`，不含 `tensorboard`，训练日志走 stdout）。
-
-训练实测软件版本（验证环境，A10 23GB 跑通）：
-- **PyTorch 2.13.0 + cu130**（驱动需 ≥550 支持 CUDA 13 运行时）
-- **diffusers 0.40.0**
-
-（其余训练依赖及其最低版本见 `training/requirements.txt`。）
-
-### 重训待办（需 GPU）
-
-当前 v0.1.2 checkpoint 有两个质量瓶颈，几何修复已落地但需重训才能烘入权重：
-
-| 问题 | 现状 | 目标 |
-|------|------|------|
-| caption 多样性 | 仅 2 句模板（cloth/human 各一句），25 张共用 | 逐张写颜色/品类/面料/细节 |
-| 训练分组 | cloth + human 混在一个 adapter | `GROUPS=human`（人像条件 LoRA），cloth 留作 IP-Adapter 参考 |
-
-下次重训命令：
-
-```bash
-MODEL=lora_family GROUPS=human bash training/run_train.sh
-```
+实测版本：PyTorch 2.13.0 + cu130 / diffusers 0.40.0（A10 23GB 验证）
 
 ## 多店铺与推送
 
-### 添加店铺
+### CSV/SKU 批量推送（v0.1.4）
 
-「店铺嵌入」页可添加多个店铺，每个店铺有独立 embed 链接与推送目标：
+- 任务队列页「导出 CSV+图」按钮：POST `/api/jobs/export-csv` 下载 ZIP（CSV 清单 + 成品图）
+- 店铺卡片「批量推送」按钮：上传 CSV/ZIP，POST `/api/stores/{id}/batch-push` 批量推送
+- 替换图优先于原成品，SKU 回退链：CSV 行 sku > 店铺 default_sku > 空
+- 店铺表单新增 `default_sku` 字段
+- URL 参数 `?store=xxx` 自动绑定店铺并切换到换衣视图
 
-| 字段 | 说明 |
-|---|---|
-| 店铺名称 | 展示名，例如 旗舰店 |
-| 平台 | Shopify / WordPress(WooCommerce) / TikTok Shop / 淘宝 / 其他（仅打标） |
-| 店铺地址 | Shopify: `{shop}.myshopify.com` · WordPress: `https://你的站点.com` |
-| API 凭证 | Shopify Admin token · WordPress: `用户名:应用密码` |
-| 默认商品 ID | 可选，推送时优先取请求里的 `product_id` |
+### 单张推送
 
-API 凭证在本地 `state.json` 中以明文存储（文件权限 `0600`，不加密、不上传），列表/编辑响应仅返回掩码值；新增、编辑、删除凭证均需 admin 权限。
+完成的任务勾选店铺推送（admin 权限）：
+- Shopify：Admin API 上传商品图
+- WordPress：REST 媒体上传 + WooCommerce 关联
+- 其他平台：仅打标
 
-### 推送
-
-完成的任务可勾选一个或多个店铺推送（需 admin 权限），推送记录（每店 ok / url / message）写入任务。
-
-- **Shopify**：Admin API `POST /products/{id}/images.json` 上传商品图
-- **WordPress**：REST `POST /wp-json/wp/v2/media` 上传媒体 -> `POST /wc/v3/products/{id}` 关联商品
-- **其他平台**：仅打标，不调用外部接口
-- 凭证缺失或外部返回错误时，推送失败会写回任务的 `push_results`，不会误标为已推送
-
-### 嵌入店铺
-
-```html
-<div id="atelier-tryon"></div>
-<script src="/widget.js" data-src="/embed.html?store=STORE_ID"></script>
-```
-
-或直接 iframe：
+### 嵌入
 
 ```html
 <iframe src="/embed.html?store=STORE_ID" style="width:100%;min-height:720px;border:0"></iframe>
 ```
 
-## 图片库与分类
-
-- 上传的图片自动保存，可复用、可加入生成队列
-- 「管理分类」面板：新建 / 改名 / 删除分类
-- 「移动到分类」：勾选多张图片后批量移动，或直接新建分类
-- 删除分类时其中图片自动移回「未分类」
-
-## 底座管理
-
-- 上传自家模特底座：名称 / 受众 / 年龄带 / 人种 / 备注 / 底图
-- 底座列表显示完整分类标签，支持多选后「批量调整分类」
-- 「人种管理」面板：新增 / 改名 / 删除人种；删除人种时引用底座回退到「东亚」
-
-## SDXL 引擎环境变量（v0.1.3）
-
-以下环境变量控制 SDXL 引擎的混合生成流程，均有默认值，不设置即使用推荐配置：
+## SDXL 引擎环境变量（v0.1.4）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `VTON_AR` | `1` | 保宽高比 letterbox；`=0` 硬拉伸 |
-| `VTON_WARP` | `1` | 几何对齐：把平铺衣掰到人体姿态送 IP-Adapter；`=0` 关闭用原平铺图 |
-| `VTON_WARP_STRENGTH` | 按品类 0.42-0.48 | warp 变形强度 |
-| `VTON_DETAIL` | `1` | 商品细节回贴：高频纹理 + Reinhard 颜色迁移；`=0` 关闭 |
-| `VTON_LOCK_ID` | `1` | 身份锁：mask 外贴回原图人脸/背景；`=0` 关闭 |
-| `VTON_LORA` | `0.7` | LoRA scale（r16 小数据不全量 1.0） |
-| `VTON_IPA` | `0.8` | IP-Adapter 参考强度 |
-| `VTON_CANNY` | `0.35` | Canny 边缘约束强度（透肤款调高留意鬼影） |
+| `VTON_AR` | `1` | 保宽高比 letterbox |
+| `VTON_WARP` | `1` | 几何对齐 |
+| `VTON_DETAIL` | `1` | 商品细节回贴（边缘衰减） |
+| `VTON_LOCK_ID` | `1` | 身份锁（SeamlessClone） |
+| `VTON_LORA` | `0.7` | LoRA scale |
+| `VTON_IPA` | `0.9` | IP-Adapter 参考强度 |
+| `VTON_CANNY` | 按品类 0.55/0.45 | Canny 边缘约束（实心面料 0.55 锁图案） |
 | `VTON_GUIDANCE` | `7.5` | CFG guidance scale |
 | `VTON_SEED` | `42` | 随机种子 |
-| `VTON_PROMPT_HINT` | 空 | 额外 prompt 钩子（如"长袖须随手臂到手腕"） |
+| `VTON_PROMPT_HINT` | 空 | 额外 prompt 钩子 |
 
 ## 测试
 
-后端单元 / 集成 / 系统测试，使用 pytest 与 FastAPI TestClient，state 与图片全部隔离在临时目录，不触碰真实 `backend/data`。前端组件测试用 vitest 覆盖 i18n 字典与人种翻译。
-
 ```bash
-# 后端测试（192 passed / 1 skipped）
-pip3 install --break-system-packages pytest httpx
+# 后端（203 passed / 1 skipped）
 cd backend
 python3 -m pytest tests/ -q
 
-# 前端组件测试（14 个）
-cd /workspace
-npm install
+# 前端（14 passed）
 npm test
-
-# 前端构建（会捕获模块语法错误，必须通过）
 npm run build
 
-# 静态检查（ruff check + ruff format）
-python3 -m ruff check backend/ training/
-python3 -m ruff format --check backend/ training/
+# 静态检查
+ruff check backend/ training/
+ruff format --check backend/ training/
 ```
 
-覆盖分层：
-
-- **单元测试**（`backend/tests/test_engine.py` / `test_store.py` / `test_auth.py` / `test_push.py` / `test_worker.py` / `test_lora_io.py` / `test_engine_concurrency.py` / `test_train_geometry.py`）：引擎按人种修正体型、底座人种迁移、CRUD、JWT 密钥随机化、Shopify/WordPress 推送适配器（网络层 mock）、worker 任务处理分支、LoRA 加载格式转换（PEFT 优先）、管线/检测器并发首载单飞、训练几何（time_ids/letterbox/min-SNR）
-- **平台适配测试**（`backend/tests/test_platform_presets.py`）：平台裁剪/压白/JPEG 限体积、clothing_mask 服装区提取、blend_tryon 身份锁、reapply_garment_detail 高频纹理+颜色迁移回贴
-- **组件测试**（`src/i18n.test.js` / `src/render.test.js`）：中英文切换、占位符插值、10 地域人种翻译、自定义人种回退原文、`basesView` DOM 标签平衡与批次面板结构
-- **集成测试**（`backend/tests/test_api.py`）：FastAPI 全 API 链路——登录鉴权、底座 / 人种 / 店铺 CRUD、批量任务创建、图片库、推送、路径穿越防护、state.json 访问拦截、HTML 上传拦截、store 凭据脱敏、staff 权限隔离、健康与许可接口
-- **系统测试**（`backend/tests/test_system.py`）：真实 worker 线程领取任务并跑完一张成品到 `done`，可下载；缺失源图正确标记 `failed`
+覆盖：单元（引擎/人种/CRUD/JWT/推送/worker/LoRA/并发/训练几何）、平台适配（clothing_mask/blend_tryon/reapply/detect_garment_extent）、组件（i18n/render）、集成（全 API 链路）、系统（真实 worker 出图）
 
 ## 目录结构
 
 ```text
-backend/          FastAPI 后端、引擎包装器、推送适配器
-  engine.py       合成引擎（CPU 兜底）：水印去除、garment warp、复合
-  engine_sdxl.py  SDXL 商用引擎：几何对齐 + ControlNet + IP-Adapter + 细节回贴 + 身份锁
-  platform_presets.py  平台店规 + clothing_mask + blend_tryon + reapply_garment_detail
-  lora_io.py      LoRA 加载（PEFT 优先 + diffusers 回退）
-  tests/          pytest 测试（单元 / 集成 / 系统，192 passed）
-src/              前端 SPA + i18n 字典
-public/           嵌入页、挂件、示例图
-docs/             文档
-scripts/          权重下载脚本
-training/         SDXL LoRA / ControlNet 训练脚本
-  train_lora_sdxl.py     LoRA 训练（letterbox + time_ids + min-SNR + VAE fp32 + 双格式保存）
-  train_controlnet_sdxl.py  ControlNet 训练（同上几何基线）
-  lora_io.py      LoRA 加载共享模块（PEFT / diffusers 双格式）
-models/sdxl/lora/ 训练好的 LoRA 权重（adapter_model.safetensors + pytorch_lora_weights.safetensors）
-IDM-VTON/         官方虚拟试衣仓库（git submodule）
+backend/
+  engine.py               合成引擎（CPU 兜底）
+  engine_sdxl.py           SDXL 商用引擎（几何对齐 + ControlNet + IP-Adapter + 动态遮罩 + 细节回贴 + SeamlessClone）
+  platform_presets.py      平台店规 + detect_garment_extent + clothing_mask + blend_tryon + reapply_garment_detail
+  export_csv.py            CSV/SKU 批量导出
+  lora_io.py               LoRA 加载（PEFT 优先）
+  tests/                   pytest（203 passed）
+src/                       前端 SPA + i18n
+training/                  SDXL LoRA / ControlNet 训练脚本
+models/sdxl/lora/          LoRA 权重（120 张训练，rank 16）
 ```
 
 ## 环境变量
 
 ```bash
-# 必填（生产环境，缺失时随机生成仅适合开发）
-STORE_JWT_SECRET=<至少 32 字节的随机字符串>
+STORE_JWT_SECRET=<至少 32 字节>
 STORE_ADMIN_PASSWORD=<管理员密码>
 STORE_STAFF_PASSWORD=<员工密码>
-
-# 引擎选择
-LICENSE_MODE=commercial  # commercial（生产）或 research（测试）
-
-# SDXL 引擎混合流程（均有默认值，详见上表）
-# VTON_AR / VTON_WARP / VTON_DETAIL / VTON_LOCK_ID / VTON_LORA / VTON_IPA ...
-
-# 可选
-IDM_WEIGHTS_DIR=/path/to/IDM-VTON/ckpt
+LICENSE_MODE=commercial
+# VTON_IPA=0.9  VTON_CANNY=0.55  VTON_DETAIL=1  VTON_LOCK_ID=1 ...
 ```
 
 ## 引擎选择
 
 | LICENSE_MODE | 引擎优先级 | 商用合规 |
 |---|---|---|
-| `commercial` | SDXL -> 合成引擎（SDXL 不可用时自动回退） | 合规 |
+| `commercial` | SDXL -> 合成引擎 | 合规 |
 | `research` | IDM-VTON -> 合成引擎 | 不合规 |
 | 未设置 | 合成引擎 | 需确认 |
 
-访问 `/api/license` 查看当前引擎、GPU 与合规状态；页面顶部横幅同步展示。
-
 ## API 概览
-
-所有 `/api/*` 接口（除 `/api/auth/login`、`/api/health`、`/api/license`）需 Bearer token 鉴权。标注 **[admin]** 的接口需管理员权限。
 
 ```text
 POST /api/auth/login
-GET  /api/me
-GET  /api/stats
-GET|PATCH /api/settings                      # PATCH [admin]
-
-GET  /api/bases
-POST /api/bases                              # 上传底座
-PATCH /api/bases/{id}
-POST /api/bases/batch/patch                  # 批量调整底座分类
-DELETE /api/bases/{id}                       # [admin]
-
-GET|POST /api/ethnicities                    # 人种管理，POST [admin]
-PATCH|DELETE /api/ethnicities/{value}        # [admin]
-
-GET|POST /api/stores                         # POST [admin]
-PATCH|DELETE /api/stores/{id}                # [admin]
-
-POST /api/jobs/batch
-GET  /api/jobs
-GET  /api/jobs/{id}
-POST /api/jobs/{id}/push                     # [admin]
-GET  /api/download/{id}
-
-GET  /api/uploads                            # 图片库
-POST /api/uploads                            # 上传图片（PIL 校验）
-DELETE /api/uploads/{filename}               # [admin]
-POST /api/uploads/{filename}/move            # [admin]
-GET|POST /api/uploads/categories             # POST [admin]
-PATCH|DELETE /api/uploads/categories/{cat}   # [admin]
-GET  /api/uploads/{category}/{filename}
-
-GET  /files/{path}                           # 需鉴权，仅图片，白名单目录
-GET  /api/health | /api/license              # 公开
+GET  /api/me  /api/stats  /api/settings
+GET|POST /api/bases  /api/ethnicities  /api/stores
+POST /api/jobs/batch  /api/jobs/export-csv
+POST /api/stores/{id}/batch-push
+POST /api/jobs/{id}/push                    # [admin]
+GET  /api/jobs  /api/jobs/{id}  /api/download/{id}
+GET|POST /api/uploads  /api/uploads/categories
+GET  /api/health  /api/license
 ```
+
+## 授权说明
+
+- **IDM-VTON**：CC BY-NC-SA 4.0，禁止商用
+- **SDXL + ControlNet + IP-Adapter（店铺换衣管线）**：商用权归作者所有
+- **Atelier 核心代码**：MIT License
 
 ## 感谢
 
-本项目使用了以下开源项目：
-
 - [IDM-VTON](https://github.com/yisol/IDM-VTON) - 虚拟试衣模型（ECCV 2024）
-- [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) - 图像生成基础模型
-- [ControlNet](https://github.com/lllyasviel/ControlNet) - 空间控制网络
-- [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter) - 图像提示适配器
-- [Rembg](https://github.com/danielgatis/rembg) - 背景移除工具
-
-## 文档
-
-- 安装部署：`docs/INSTALL.md`
-- GPU 部署：`docs/GPU_DEPLOY.md`
-- 商用 Pipeline：`docs/SDXL_PIPELINE.md`
-- 合规说明：`docs/LICENSE_COMPLIANCE.md`
-- 技术规格书：`.monkeycode/specs/virtual-tryon-dashboard/design.md`（含 LoRA 训练基线与重训计划）
-
-## 许可
-
-**Atelier 核心代码**：MIT License，允许商用。
-
-**IDM-VTON submodule**：遵循上游 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/legalcode)，**禁止商用，商用需购买授权**。
-
-**SDXL 基础模型**：遵循 **Stability AI Community License**。商用必须：
-1. 在 Stability AI 完成**免费注册**（商用目的使用或分发前）
-2. 随分发附带协议副本与仓库根目录 `NOTICE` 文件
-3. 在界面与文档**显著展示 `Powered by Stability AI`**（本项目已在前端页脚落实）
-
-收入门槛：你与关联公司合计年收入低于 $100 万时商用免费（仍需注册）；超过门槛需申请付费 Enterprise License。完整核对见 `docs/LICENSE_COMPLIANCE.md`。
-
-商用部署请设置 `LICENSE_MODE=commercial`，系统会自动禁用 IDM-VTON，使用 SDXL 商用 pipeline。
-
-```bash
-# 初始化 submodule
-git clone <本仓库>
-git submodule update --init --recursive --depth 1
-```
+- [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
+- [ControlNet](https://github.com/lllyasviel/ControlNet)
+- [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter)
+- [Rembg](https://github.com/danielgatis/rembg)

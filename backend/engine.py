@@ -320,17 +320,15 @@ def fit_garment_to_body(garment: Image.Image, box: dict, tw: int, th: int) -> Im
         return fit_garment(garment, (tw, th))
     target_w = max(1.0, box["shoulder"] * tw)
     scale = target_w / gw
-    # 防止极端比例:衣料高度保持在躯干框的 55%~1.6 倍。
     min_scale = (th * 0.55) / gh
-    max_scale = (th * 1.6) / gh
-    scale = max(min_scale, min(max_scale, scale))
+    scale = max(min_scale, scale)
     nw = max(1, round(gw * scale))
     nh = max(1, round(gh * scale))
     crop = garment.crop((bx0, by0, bx1 + 1, by1 + 1))
     resized = crop.resize((nw, nh), Image.Resampling.LANCZOS)
-    canvas = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+    canvas_h = max(th, nh + int(th * 0.04))
+    canvas = Image.new("RGBA", (tw, canvas_h), (0, 0, 0, 0))
     x = (tw - nw) // 2
-    # 顶部对齐颈线,衣料自然向下延伸。
     y = int(th * 0.04)
     canvas.paste(resized, (x, y), resized)
     return canvas
@@ -367,9 +365,9 @@ def _composite_engine(
     th = max(th, 32)
 
     fitted = fit_garment_to_body(garment, box, tw, th)
-    # 简易 2D 变形:让衣料贴合模特躯干轮廓(肩/腰/下摆)。
     fitted = _warp_garment(fitted, box, GARMENT_WARP_STRENGTH.get(garment_type, 0.4))
-    body = shirt_mask(tw, th, box)
+    fw, fh = fitted.size
+    body = shirt_mask(fw, fh, box)
     g_a = fitted.split()[-1]
     merged_a = ImageEnhance.Brightness(g_a).enhance(1.0)
     merged_a = Image.fromarray(

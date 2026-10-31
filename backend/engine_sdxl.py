@@ -8,7 +8,13 @@ import threading
 from pathlib import Path
 
 from PIL import Image
-from platform_presets import blend_tryon, clothing_mask, force_white_background, reapply_garment_detail
+from platform_presets import (
+    blend_tryon,
+    clothing_mask,
+    detect_garment_extent,
+    force_white_background,
+    reapply_garment_detail,
+)
 
 logger = logging.getLogger("atelier.engine_sdxl")
 
@@ -621,7 +627,7 @@ def _get_sdxl_pipe(device, dtype):
                         weight_name=str(ip_adapter_weight.name),
                         download_kwargs={"local_files_only": True},
                     )
-                    pipe.set_ip_adapter_scale(0.8)
+                    pipe.set_ip_adapter_scale(0.9)
                     ip_adapter_loaded = True
                 except Exception as exc:
                     # 权重存在但加载失败:标记降级(N4-L6),与「未安装权重」区分。
@@ -741,8 +747,6 @@ def compose_tryon_sdxl(
 
     pipe, ip_adapter_loaded, ip_adapter_reason = _get_sdxl_pipe(device, dtype)
 
-    # VTON_IPA 覆盖 IP-Adapter 参考强度(loader 默认 0.8):调高更贴服装原色/纹理,
-    # 过高会串色或丢脸。仅在显式设置时覆盖,保持默认行为不变。
     _ipa = os.environ.get("VTON_IPA")
     if ip_adapter_loaded and _ipa:
         pipe.set_ip_adapter_scale(float(_ipa))
@@ -769,10 +773,11 @@ def compose_tryon_sdxl(
             control_scales.append(0.0)
     else:
         control_images.append(_get_canny_control(cloth_ref))
-        # 0.35:边缘约束只用来"定轮廓"。0.55 在透视网眼/薄纱类面料上会把
-        # Canny 边缘当结构画进布料,产生"鬼影/人脸重影"类伪影(实测 2048 成图)。
-        # VTON_CANNY 可覆盖(治"袖子画短/结构弱";透肤款调高留意鬼影)。
-        control_scales.append(float(os.environ.get("VTON_CANNY", "0.35")))
+        # 按品类自动调节 Canny 强度:实心面料(upper/dress/onesie)用 0.55 锁图案;
+        # 薄纱/网眼类用 0.4 防鬼影。VTON_CANNY 显式覆盖优先级最高。
+        _canny_defaults = {"upper": 0.55, "dress": 0.55, "onesie": 0.55, "lower": 0.45}
+        _canny_default = _canny_defaults.get(garment_type, 0.55)
+        control_scales.append(float(os.environ.get("VTON_CANNY", str(_canny_default))))
 
     import os as _os
 
@@ -808,7 +813,16 @@ def compose_tryon_sdxl(
     # (blend_tryon 在此贴回原图像素保身份)。两者互补:reapply 管衣服保真,
     # 身份锁管人脸不走形。任一开关开启才算 mask,都关时跳过省一次推理。
     need_mask = os.environ.get("VTON_DETAIL", "1") != "0" or os.environ.get("VTON_LOCK_ID", "1") != "0"
-    shared_mask = clothing_mask(human_img, garment_type=garment_type) if need_mask else None
+    garment_extent = None
+    if need_mask:
+        try:
+            garment_extent = detect_garment_extent(garment_img)
+            logger.info("garment extent: %s", garment_extent)
+        except Exception:  # noqa: BLE001
+            logger.debug("detect_garment_extent failed; using default mask")
+    shared_mask = (
+        clothing_mask(human_img, garment_type=garment_type, garment_extent=garment_extent) if need_mask else None
+    )
 
     # 商品细节回贴:AI 出骨架光影,代码保原衣纹理颜色。
     # SDXL 生成的衣服颜色/花纹常与原平铺图有偏差(串色/丢花纹);把原衣的

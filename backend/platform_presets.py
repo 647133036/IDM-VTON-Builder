@@ -47,13 +47,15 @@ def _detect_face_mask(
     margin_frac: float = 0.5,
     scale_factor: float = 1.1,
     min_neighbors: int = 5,
+    down_margin_frac: float | None = None,
 ) -> np.ndarray:
-    """Haar 检脸,返回人脸 bbox 外扩 ``margin_frac*max(w,h)`` 的联合掩膜(uint8 0/1)。
+    """Haar 检脸,返回人脸 bbox 外扩掩膜(uint8 0/1)。
 
-    用于宽亮色通路保护:当"脸→脖子→浅色衣→背景"整条通路都在 L1 门限内时,
-    腐蚀切不断,脸部会随背景被压白。检到脸后直接用其外扩框豁免压白。
-    无 cv2 / 级联缺失 / 未检到脸时返回全 0 —— 调用方据此回退现状行为。
+    margin_frac 控制上/左/右外扩;down_margin_frac(默认=margin_frac)控制向下外扩。
+    服装遮罩场景传较小 down_margin_frac,避免脸区吞掉脖子/胸口。
+    无 cv2 / 级联缺失 / 未检到脸时返回全 0。
     """
+    dm = margin_frac if down_margin_frac is None else down_margin_frac
     h, w = arr.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
     try:
@@ -72,14 +74,16 @@ def _detect_face_mask(
             flags=cv2.CASCADE_SCALE_IMAGE,
             minSize=(min_side, min_side),
         )
-    except Exception:  # noqa: BLE001  # cv2 异常/级联损坏/内存:一律回退(不豁免)
+    except Exception:  # noqa: BLE001
         return mask
     if len(faces):
         for x, y, fw, fh in faces:
             x, y, fw, fh = int(x), int(y), int(fw), int(fh)
-            m = int(max(fw, fh) * margin_frac)
-            x0, y0 = max(0, x - m), max(0, y - m)
-            x1, y1 = min(w, x + fw + m), min(h, y + fh + m)
+            mx = int(max(fw, fh) * margin_frac)
+            md = int(max(fw, fh) * dm)
+            x0, y0 = max(0, x - mx), max(0, y - mx)
+            x1 = min(w, x + fw + mx)
+            y1 = min(h, y + fh + md)
             mask[y0:y1, x0:x1] = 1
     return mask
 
@@ -286,17 +290,70 @@ def foreground_mask(
         return None
 
 
+def detect_garment_extent(garment: Image.Image) -> dict:
+    """从平铺衣料图分析袖长和衣长。
+
+    返回:
+        sleeve: "long" | "short" | "sleeveless"
+        hem: "waist" | "long" (衣长是否过腰)
+    用于动态 clothing_mask:长袖→mask 含手臂,短袖→只含大臂,无袖→不含手臂。
+    """
+    arr = np.array(garment.convert("RGBA"))
+    _h, _w = arr.shape[:2]
+    alpha = arr[..., 3]
+    has_transp = int(alpha.min()) < 200
+
+    if has_transp:
+        content = alpha > 30
+    else:
+        rgb = arr[..., :3].astype(np.float32)
+        corners = np.median(rgb[:24, :24].reshape(-1, 3), axis=0)
+        content = np.abs(rgb - corners).sum(axis=2) > 40
+
+    ys, xs = np.where(content)
+    if len(ys) < 64:
+        return {"sleeve": "short", "hem": "waist"}
+
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    ch = max(1, y1 - y0)
+    cw = max(1, x1 - x0)
+    aspect = ch / cw
+
+    top_band = content[y0 : y0 + ch // 4, x0:x1]
+    mid_band = content[y0 + ch // 3 : y0 + 2 * ch // 3, x0:x1]
+    bot_band = content[y0 + 3 * ch // 4 : y1, x0:x1]
+    top_w = float(top_band.mean())
+    mid_w = float(mid_band.mean())
+    bot_w = float(bot_band.mean())
+
+    shoulder_spread = top_w / max(mid_w, 0.01)
+
+    sleeve = "short"
+    if aspect > 1.35 or bot_w > mid_w * 0.6:
+        sleeve = "long"
+    elif shoulder_spread < 1.15 or top_w < 0.15:
+        sleeve = "sleeveless"
+
+    hem = "long" if aspect > 1.6 else "waist"
+
+    return {"sleeve": sleeve, "hem": hem, "aspect": round(aspect, 2)}
+
+
 def clothing_mask(
     img: Image.Image,
     garment_type: str = "upper",
     subject_mask: np.ndarray | None = None,
-    face_margin: float = 0.65,
+    face_margin: float = 0.35,
+    garment_extent: dict | None = None,
 ) -> np.ndarray | None:
-    """服装替换区:主体减脸(及按品类裁切),返回 uint8 0-255;构不出则 None。
+    """服装替换区:主体减脸(及按品类+袖长动态裁切),返回 uint8 0-255;构不出则 None。
 
     这是「只换衣、锁身份」的遮罩:255=贴生成衣物,0=保留原图像素(脸/发/手/背景)。
-    subject_mask 可注入(测试/上游已算过);缺省走 rembg。无主体或面积过小返回 None,
-    调用方回退整图采用生成结果。
+    garment_extent(from detect_garment_extent)控制手臂区纳入范围:
+      long sleeve → 含整条手臂(62%→88%)
+      short sleeve → 只含大臂(62%,当前默认)
+      sleeveless → 不含手臂(55%)
     """
     arr = np.array(img.convert("RGB"))
     h, w = arr.shape[:2]
@@ -306,17 +363,36 @@ def clothing_mask(
     subj = (np.asarray(subj) > 0).astype(np.uint8)
     if subj.shape[:2] != (h, w) or float(subj.mean()) < 0.04:
         return None
-    face = _detect_face_mask(arr, margin_frac=face_margin)
+    face = _detect_face_mask(arr, margin_frac=face_margin, down_margin_frac=0.08)
     cloth = subj.copy()
     if face is not None and face.any():
         cloth[face > 0] = 0
     ys = np.where(subj > 0)[0]
     y0, y1 = int(ys.min()), int(ys.max())
     span = max(1, y1 - y0)
+
+    sleeve = garment_extent.get("sleeve", "short") if garment_extent else "short"
+    hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
+
     if garment_type == "upper":
-        cloth[y0 + int(span * 0.62) :] = 0
+        if sleeve == "long":
+            cloth[y0 + int(span * 0.88) :] = 0
+        elif sleeve == "sleeveless":
+            cloth[y0 + int(span * 0.55) :] = 0
+        else:
+            cloth[y0 + int(span * 0.62) :] = 0
+    elif garment_type == "dress":
+        if hem == "long":
+            cloth[y0 + int(span * 0.96) :] = 0
+        else:
+            cloth[y0 + int(span * 0.82) :] = 0
     elif garment_type == "lower":
         cloth[: y0 + int(span * 0.48)] = 0
+    elif garment_type == "onesie":
+        if sleeve == "long":
+            cloth[y0 + int(span * 0.95) :] = 0
+        else:
+            cloth[y0 + int(span * 0.82) :] = 0
     if float(cloth.mean()) < 0.02:
         return None
     try:
@@ -336,18 +412,63 @@ def blend_tryon(
     generated: Image.Image,
     mask_u8: np.ndarray,
 ) -> Image.Image:
-    """mask 255 取 generated,0 取 original。尺寸不一致时把 generated 缩到 original。"""
+    """mask 255 取 generated,0 取 original。
+
+    身份区(mask=0,脸/手/脚)用 cv2.seamlessClone 无缝贴回原模特像素,
+    避免硬边;seamlessClone 失败或多连通区域时回退羽化 alpha 混合。
+    """
     orig = original.convert("RGB")
     gen = generated.convert("RGB")
     if gen.size != orig.size:
         gen = gen.resize(orig.size, Image.Resampling.LANCZOS)
-    o = np.array(orig, dtype=np.float32)
-    g = np.array(gen, dtype=np.float32)
+    o = np.array(orig, dtype=np.uint8)
+    g = np.array(gen, dtype=np.uint8)
     alpha = np.asarray(mask_u8)
     if alpha.shape[:2] != o.shape[:2]:
         alpha = np.array(Image.fromarray(alpha).resize((o.shape[1], o.shape[0]), Image.Resampling.BILINEAR))
+
+    try:
+        import cv2
+
+        identity_mask = (alpha < 20).astype(np.uint8) * 255
+        identity_mask = cv2.morphologyEx(
+            identity_mask,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+        n_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(identity_mask, connectivity=8)
+
+        result = g.copy()
+        blended_any = False
+        for i in range(1, n_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 200:
+                continue
+            comp_mask = (labels == i).astype(np.uint8) * 255
+            cx, cy = centroids[i]
+            cx, cy = round(cx), round(cy)
+            if not (0 <= cx < o.shape[1] and 0 <= cy < o.shape[0]) or comp_mask[cy, cx] == 0:
+                ys_c, xs_c = np.where(labels == i)
+                if len(ys_c) == 0:
+                    continue
+                cx, cy = int(xs_c[len(xs_c) // 2]), int(ys_c[len(ys_c) // 2])
+            if 0 <= cx < o.shape[1] and 0 <= cy < o.shape[0] and comp_mask[cy, cx] > 0:
+                try:
+                    result = cv2.seamlessClone(o, result, comp_mask, (cx, cy), cv2.NORMAL_CLONE)
+                    blended_any = True
+                except Exception:  # noqa: BLE001
+                    continue
+
+        if blended_any:
+            cloth_a = (alpha.astype(np.float32) / 255.0)[..., None]
+            cloth_a = np.clip(cloth_a * 3.0, 0, 1)
+            out = (g.astype(np.float32) * cloth_a + result.astype(np.float32) * (1.0 - cloth_a)).astype(np.uint8)
+            return Image.fromarray(out, "RGB")
+    except Exception:  # noqa: BLE001
+        pass
+
     a = (alpha.astype(np.float32) / 255.0)[..., None]
-    out = np.clip(g * a + o * (1.0 - a), 0, 255).astype(np.uint8)
+    out = np.clip(g.astype(np.float32) * a + o.astype(np.float32) * (1.0 - a), 0, 255).astype(np.uint8)
     return Image.fromarray(out, "RGB")
 
 
@@ -417,7 +538,7 @@ def reapply_garment_detail(
     generated: Image.Image,
     garment_ref: Image.Image,
     mask_u8: np.ndarray,
-    texture_strength: float = 0.55,
+    texture_strength: float = 0.70,
     color_strength: float = 0.85,
 ) -> Image.Image:
     """AI 出骨架光影,代码保商品纹理颜色。
@@ -456,15 +577,22 @@ def reapply_garment_detail(
         )
     mask_norm = (mask / 255.0)[..., None]
 
-    # 步骤1: 高频纹理 = ref - 低频(高斯模糊), 居中到 128。
+    edge_weight = mask_norm
+    try:
+        dist = cv2.distanceTransform((mask > 20).astype(np.uint8), cv2.DIST_L2, 5)
+        d_max = float(dist.max())
+        if d_max > 3:
+            edge_fall = np.clip(dist / (d_max * 0.25), 0, 1)
+            edge_weight = (edge_fall[..., None]) * mask_norm
+    except Exception:  # noqa: BLE001
+        pass
+
     low_freq = cv2.GaussianBlur(ref, (0, 0), 4.0)
     high_freq = ref - low_freq + 128.0
 
-    # 步骤2: 柔光混合(softlight): b + (t-128)/128 * b * (255-b)/255。
-    # 128=中性无影响; 花纹暗部(t<128)压暗生成图对应像素, 亮部提亮。
     softlight = gen + (high_freq - 128.0) / 128.0 * gen * (255.0 - gen) / 255.0
     softlight = np.clip(softlight, 0, 255)
-    tex_a = mask_norm * texture_strength
+    tex_a = edge_weight * texture_strength
     textured = softlight * tex_a + gen * (1.0 - tex_a)
 
     # 步骤3: Reinhard LAB 颜色迁移(等价颜色直方图匹配)。
