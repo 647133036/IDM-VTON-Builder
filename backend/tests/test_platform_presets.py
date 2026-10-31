@@ -12,10 +12,12 @@ from PIL import Image
 from platform_presets import (
     PLATFORM_PRESETS,
     PLATFORM_SET,
+    _detect_face_mask,
     apply_platform_preset,
     blend_tryon,
     center_crop_square,
     clothing_mask,
+    detect_garment_extent,
     encode_jpeg_within,
     force_white_background,
     reapply_garment_detail,
@@ -450,3 +452,264 @@ def test_reapply_garment_detail_color_matches_source():
     # R 通道应上升(从60趋向180), B 通道应下降(从180趋向60)
     assert out_arr[..., 0].mean() > 100  # R 上升
     assert out_arr[..., 2].mean() < 140  # B 下降
+
+
+# ---------------------------------------------------------------------------
+# v0.1.4: detect_garment_extent / 动态 clothing_mask / seamlessClone / 边缘衰减
+# ---------------------------------------------------------------------------
+
+
+def _transparent_with_shapes(size, shapes):
+    """透明 RGBA 画布上绘制一系列矩形/多边形。
+
+    shapes: list of (type, coords, color)
+      type="rect" → coords=(x0,y0,x1,y1)
+      type="poly" → coords=[(x,y),...]
+    """
+    from PIL import ImageDraw
+
+    img = Image.new("RGBA", size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    color = (200, 50, 50, 255)
+    for typ, coords in shapes:
+        if typ == "rect":
+            d.rectangle(coords, fill=color)
+        elif typ == "poly":
+            d.polygon(coords, fill=color)
+    return img
+
+
+# --- detect_garment_extent --------------------------------------------------
+
+
+def test_detect_garment_extent_long_sleeve_by_aspect():
+    """高瘦矩形(aspect>1.35)→ sleeve=long, hem=long。"""
+    img = _transparent_with_shapes((100, 250), [("rect", (10, 25, 90, 225))])
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "long"
+    assert ext["hem"] == "long"
+
+
+def test_detect_garment_extent_short_sleeve_t_shape():
+    """T 恤形(宽肩+渐窄身)→ sleeve=short, hem=waist。
+
+    宽顶 bar 使 top_w≈1.0;渐窄三角形身使 bot_w<mid_w*0.6;shoulder_spread>1.15。
+    """
+    img = _transparent_with_shapes(
+        (200, 200),
+        [
+            ("rect", (20, 50, 180, 70)),  # 肩+短袖
+            ("poly", [(60, 70), (140, 70), (105, 125), (95, 125)]),  # 渐窄身
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "short"
+    assert ext["hem"] == "waist"
+
+
+def test_detect_garment_extent_sleeveless_narrow_top():
+    """吊带衫形(细带+三角形身,top_w<0.15)→ sleeve=sleeveless。"""
+    img = _transparent_with_shapes(
+        (200, 200),
+        [
+            ("rect", (95, 50, 105, 55)),  # 细吊带
+            ("poly", [(40, 70), (160, 70), (105, 130), (95, 130)]),  # 三角形身渐窄
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "sleeveless"
+
+
+def test_detect_garment_extent_tiny_content_defaults():
+    """内容 < 64 像素 → 兜底 short/waist。"""
+    img = _transparent_with_shapes((200, 200), [("rect", (97, 97, 103, 103))])
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "short"
+    assert ext["hem"] == "waist"
+
+
+def test_detect_garment_extent_opaque_background():
+    """不透明图(无 alpha 通道)走角部差分通路,仍能检测。"""
+    from PIL import ImageDraw
+
+    img = Image.new("RGB", (100, 250), (128, 128, 128))
+    d = ImageDraw.Draw(img)
+    d.rectangle((10, 25, 90, 225), fill=(200, 50, 50))
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "long"
+    assert ext["hem"] == "long"
+
+
+# --- clothing_mask with garment_extent --------------------------------------
+
+
+def _subject_img(h=200, w=120):
+    """统一主体: y 20-180 满宽,用于 clothing_mask 测试。span=160。"""
+    subj = np.zeros((h, w), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    img = Image.fromarray(np.full((h, w, 3), 80, dtype=np.uint8), "RGB")
+    return img, subj
+
+
+def test_clothing_mask_long_sleeve_extends_below_default():
+    """长袖 mask 比 default(short)延伸更远:row 140 在 long 保留、default 截断。"""
+    img, subj = _subject_img()
+    m_default = clothing_mask(img, garment_type="upper", subject_mask=subj)
+    m_long = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "long", "hem": "waist"}
+    )
+    assert m_default is not None and m_long is not None
+    # row 140: default cut at 20+160*0.62=119 → 截断; long cut at 20+160*0.88=160 → 保留
+    assert int(m_long[140, 60]) > int(m_default[140, 60]) + 50
+
+
+def test_clothing_mask_sleeveless_cuts_above_default():
+    """无袖 mask 比 default(short)截断更早:row 100 在 sleeveless 截断、default 保留。"""
+    img, subj = _subject_img()
+    m_default = clothing_mask(img, garment_type="upper", subject_mask=subj)
+    m_sleeveless = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "sleeveless", "hem": "waist"}
+    )
+    assert m_default is not None and m_sleeveless is not None
+    # row 100: default cut at 119 → 保留; sleeveless cut at 20+160*0.55=108 → 截断
+    assert int(m_default[100, 60]) > int(m_sleeveless[100, 60]) + 50
+
+
+def test_clothing_mask_dress_long_hem_keeps_more():
+    """连衣裙长款 hem=long 比 hem=waist 保留更多:row 150 在 long 保留、waist 截断。"""
+    img, subj = _subject_img()
+    m_waist = clothing_mask(
+        img, garment_type="dress", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "waist"}
+    )
+    m_long = clothing_mask(
+        img, garment_type="dress", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "long"}
+    )
+    assert m_waist is not None and m_long is not None
+    # row 150: waist cut at 20+160*0.82=151 → 截断; long cut at 20+160*0.96=173 → 保留
+    assert int(m_long[150, 60]) > int(m_waist[150, 60]) + 50
+
+
+def test_clothing_mask_onesie_does_not_fall_through():
+    """onesie 必须被显式处理(不穿透到无裁切),返回非 None 且底部截断。"""
+    img, subj = _subject_img()
+    m = clothing_mask(img, garment_type="onesie", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "waist"})
+    assert m is not None
+    # onesie short cut at 20+160*0.82=151 → row 170 截断
+    assert int(m[170, 60]) < 40
+    # row 70 保留
+    assert int(m[70, 60]) > 100
+
+
+# --- _detect_face_mask down_margin_frac -------------------------------------
+
+
+def test_face_mask_down_margin_asymmetric(monkeypatch):
+    """down_margin_frac < margin_frac 时,向下扩展远小于向上/左右扩展。"""
+    import cv2
+
+    # 构造一张 200x200 灰度图,中央放一个 60x60 "脸" 区
+    arr = np.full((200, 200, 3), 128, dtype=np.uint8)
+    arr[70:130, 70:130] = 200
+
+    # monkeypatch CascadeClassifier 返回固定 face bbox
+    class _FakeCascade:
+        def empty(self):
+            return False
+
+        def detectMultiScale(self, *a, **kw):
+            return np.array([[70, 70, 60, 60]])  # x, y, w, h
+
+    monkeypatch.setattr(cv2, "CascadeClassifier", lambda *a, **kw: _FakeCascade(), raising=False)
+    monkeypatch.setattr(cv2, "CASCADE_SCALE_IMAGE", 1, raising=False)
+
+    # 对称扩展(margin=0.5, down=0.5)
+    sym = _detect_face_mask(arr, margin_frac=0.5, down_margin_frac=0.5)
+    # 非对称扩展(margin=0.5, down=0.08)
+    asym = _detect_face_mask(arr, margin_frac=0.5, down_margin_frac=0.08)
+
+    assert sym.any() and asym.any()
+
+    # 脸 bbox: x=70,y=70,w=60,h=60。max(w,h)=60。margin=0.5 → mx=30。
+    # 对称: y0=70-30=40, y1=70+60+30=160 → 向下扩展到 row 160
+    # 非对称: md=60*0.08=4 → y1=70+60+4=134 → 向下只到 row 134
+    assert int(sym[155, 100]) == 1  # 对称覆盖 row 155
+    assert int(asym[155, 100]) == 0  # 非对称不覆盖 row 155
+    # 两者在 row 45(向上扩展区)都有值
+    assert int(sym[45, 100]) == 1
+    assert int(asym[45, 100]) == 1
+
+
+# --- blend_tryon seamlessClone ----------------------------------------------
+
+
+def test_blend_tryon_identity_region_from_original():
+    """mask=0 的身份区,seamlessClone 后像素更接近 original 而非 generated。"""
+    orig = Image.new("RGB", (80, 80), (10, 20, 30))
+    gen = Image.new("RGB", (80, 80), (200, 200, 10))
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    # 中心 30x30 = 衣服区(mask=255), 外围 = 身份区(mask=0)
+    mask[25:55, 25:55] = 255
+    out = np.array(blend_tryon(orig, gen, mask))
+
+    # 身份区(角落): 更接近 original (10,20,30)
+    corner = out[5, 5]
+    assert abs(int(corner[0]) - 10) < abs(int(corner[0]) - 200)
+    # 衣服区(中心): 更接近 generated (200,200,10)
+    center = out[40, 40]
+    assert abs(int(center[0]) - 200) < abs(int(center[0]) - 10)
+
+
+def test_blend_tryon_multi_component_identity():
+    """两个分离的身份区(上+下)都被 seamlessClone 贴回 original 像素。"""
+    orig = Image.new("RGB", (80, 80), (10, 20, 30))
+    gen = Image.new("RGB", (80, 80), (200, 200, 10))
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    mask[30:50, 10:70] = 255  # 中间一条衣服区
+    # 上方 row 10 和下方 row 70 都是身份区(mask=0)
+    out = np.array(blend_tryon(orig, gen, mask))
+
+    for pt in ((10, 40), (70, 40)):
+        px = out[pt[0], pt[1]]
+        assert abs(int(px[0]) - 10) < abs(int(px[0]) - 200), f"identity region {pt} not from original"
+
+
+# --- reapply_garment_detail edge falloff ------------------------------------
+
+
+def test_reapply_edge_falloff_center_stronger_than_edge(monkeypatch):
+    """distanceTransform 边缘衰减: 有衰减时边缘区纹理变化 < 无衰减时;中心区差异小。
+
+    通过 monkeypatch cv2.distanceTransform 返回全 1(d_max≤3 → 不触发衰减),
+    对比正常(有衰减)与禁用衰减两种输出的差异集中在边缘而非中心。
+    """
+    import cv2
+
+    rng = np.random.default_rng(42)
+    ref = Image.fromarray(rng.integers(0, 256, (100, 100, 3), dtype=np.uint8), "RGB")
+    gen = Image.fromarray(np.full((100, 100, 3), 128, dtype=np.uint8), "RGB")
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[20:80, 20:80] = 255
+
+    # 1) 正常 distanceTransform(有边缘衰减)
+    out_falloff = np.array(reapply_garment_detail(gen, ref, mask, texture_strength=1.0, color_strength=0.5))
+
+    # 2) 禁用衰减: distanceTransform 返回全 1 → d_max=1 ≤ 3 → edge_weight=mask_norm
+    def _uniform_dist(src, *a, **kw):
+        return np.ones(src.shape[:2], dtype=np.float32)
+
+    monkeypatch.setattr(cv2, "distanceTransform", _uniform_dist)
+    out_uniform = np.array(reapply_garment_detail(gen, ref, mask, texture_strength=1.0, color_strength=0.5))
+
+    gen_arr = np.array(gen)
+
+    # 边缘区(row 23-27,距 mask 顶边 3-7px): 衰减压制纹理 → falloff 变化 < uniform 变化
+    edge_falloff = np.abs(out_falloff[23:27, 45:55].astype(int) - gen_arr[23:27, 45:55].astype(int)).mean()
+    edge_uniform = np.abs(out_uniform[23:27, 45:55].astype(int) - gen_arr[23:27, 45:55].astype(int)).mean()
+    assert edge_uniform > edge_falloff, f"edge: uniform {edge_uniform:.1f} should > falloff {edge_falloff:.1f}"
+
+    # 中心区(row 45-55,距边缘 ≥25px): 衰减已满强度 → 两者接近
+    center_falloff = np.abs(out_falloff[45:55, 45:55].astype(int) - gen_arr[45:55, 45:55].astype(int)).mean()
+    center_uniform = np.abs(out_uniform[45:55, 45:55].astype(int) - gen_arr[45:55, 45:55].astype(int)).mean()
+    center_gap = abs(center_falloff - center_uniform)
+    edge_gap = edge_uniform - edge_falloff
+    assert edge_gap > center_gap, f"edge effect {edge_gap:.1f} should > center effect {center_gap:.1f}"
