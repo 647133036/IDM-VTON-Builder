@@ -12,6 +12,7 @@ from PIL import Image
 from platform_presets import (
     PLATFORM_PRESETS,
     PLATFORM_SET,
+    _build_inpaint_mask,
     _correct_skin_tone,
     _detect_face_mask,
     _detect_skin,
@@ -1144,6 +1145,45 @@ def test_sdxl_inpaint_repair_no_model_returns_unchanged(monkeypatch):
     out = _sdxl_inpaint_repair(img, mask)
     # 模型不存在 → 原样返回
     assert np.array_equal(np.array(out), np.array(img))
+
+
+def test_build_inpaint_mask_seam_band_only():
+    """无 original 时只提取接缝带,内部区域为 0。"""
+    mask = np.zeros((60, 60), dtype=np.uint8)
+    mask[10:50, 10:50] = 255
+    img = Image.fromarray(np.full((60, 60, 3), 128, dtype=np.uint8), "RGB")
+    focused = _build_inpaint_mask(img, mask, original=None)
+    assert focused.any()
+    # 内部(远离边界)不应在接缝带中
+    assert focused[30, 30] == 0
+    # 边界附近应有值
+    assert focused[10, 30] == 255 or focused[49, 30] == 255
+
+
+def test_build_inpaint_mask_adds_skin_anomaly():
+    """original 传入时检测肤色异常区,加入 focused mask。"""
+    skin = (180, 140, 120)
+    orig = np.full((100, 100, 3), (241, 241, 241), dtype=np.uint8)
+    orig[60:80, 10:30] = skin
+    res = np.full((100, 100, 3), (241, 241, 241), dtype=np.uint8)
+    res[60:80, 10:30] = (210, 190, 180)
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[10:90, 10:90] = 255
+    focused = _build_inpaint_mask(
+        Image.fromarray(res, "RGB"),
+        mask,
+        original=Image.fromarray(orig, "RGB"),
+    )
+    # 手臂区(60-80, 10-30)肤色差异 > 30,应被标记
+    assert focused[70, 20] == 255
+
+
+def test_build_inpaint_mask_smaller_than_full():
+    """聚焦 mask 像素数远少于整张 shared_mask。"""
+    mask = np.full((100, 100), 255, dtype=np.uint8)
+    img = Image.fromarray(np.full((100, 100, 3), 128, dtype=np.uint8), "RGB")
+    focused = _build_inpaint_mask(img, mask, original=None)
+    assert focused.sum() < mask.sum()
 
 
 # ---------------------------------------------------------------------------

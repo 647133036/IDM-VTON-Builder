@@ -157,6 +157,10 @@ Entries discovered by the Agent during task execution should follow this format:
   - `_correct_skin_tone` excludes face region (foreground bbox top 18%) from
     both shift statistics and correction application. Only arm/neck skin is
     corrected; face stays untouched to avoid unnatural color shifts.
+  - `_sdxl_inpaint_repair` v0.1.7: focused mask (_build_inpaint_mask = seam band
+    + skin anomaly vs original), pipeline singleton (_INPAINT_PIPE +
+    _INPAINT_LOCK, no per-call from_pretrained/del), `original` param for skin
+    anomaly detection. Still requires VTON_INPAINT_REPAIR=1 + model download.
   - `VTON_PATTERN_LOCK=0` keeps the old high-frequency softlight + Reinhard path.
   - PLTON / PhysDiff-VTON style high-frequency injection during denoising is not
     available on this SDXL ControlNet pipeline; do not claim generation-time

@@ -912,7 +912,7 @@ def compose_tryon_sdxl(
     # 未安装时原样返回(CPU 层已处理大部分问题)。
     if lock_identity:
         try:
-            result = _sdxl_inpaint_repair(result, shared_mask)
+            result = _sdxl_inpaint_repair(result, shared_mask, original=human_img)
         except Exception:  # noqa: BLE001
             logger.debug("_sdxl_inpaint_repair failed; using pre-inpaint result")
 

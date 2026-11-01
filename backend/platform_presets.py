@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import io
 import logging
+import os
+import threading
 from pathlib import Path
 from typing import Literal
 
@@ -236,18 +238,76 @@ def _seam_repair(
         return image
 
 
+_INPAINT_PIPE = None
+_INPAINT_LOCK = threading.Lock()
+
+
+def _build_inpaint_mask(
+    image: Image.Image,
+    mask_u8: np.ndarray,
+    original: Image.Image | None = None,
+    grow_px: int = 8,
+    anomaly_thresh: int = 30,
+) -> np.ndarray:
+    """构建聚焦 inpaint 遮罩:接缝带 + 肤色异常区。
+
+    不再用整张 shared_mask(会重画整个衣服区),改为只针对真正有问题的区域:
+    1. 接缝带:mask 边界 dilate-erode 带(同 _seam_repair)
+    2. 肤色异常区:result 中皮肤像素与 original 对应像素 L1 距离 > thresh,
+       排除脸区(前景顶部 18%)
+    """
+    import cv2
+
+    mask = np.asarray(mask_u8)
+    arr = np.array(image.convert("RGB"), dtype=np.uint8)
+    if mask.shape[:2] != arr.shape[:2]:
+        mask = np.array(Image.fromarray(mask).resize((arr.shape[1], arr.shape[0]), Image.Resampling.BILINEAR))
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow_px, grow_px))
+    dilated = cv2.dilate(mask, k)
+    eroded = cv2.erode(mask, k)
+    combined = ((dilated > 20) & (eroded < 20)).astype(np.uint8) * 255
+
+    if original is not None:
+        orig = np.array(original.convert("RGB"), dtype=np.uint8)
+        if orig.shape[:2] == arr.shape[:2]:
+            res_skin = _detect_skin(arr)
+            if res_skin.any():
+                h, w = arr.shape[:2]
+                non_white = arr.mean(axis=2) < 240
+                face_mask = np.zeros((h, w), dtype=np.uint8)
+                if non_white.any():
+                    ys = np.where(non_white.any(axis=1))[0]
+                    face_h = max(1, int((ys[-1] - ys[0]) * 0.18))
+                    face_mask[ys[0] : ys[0] + face_h, :] = 1
+                res_skin = res_skin * (1 - face_mask)
+                if res_skin.any():
+                    diff = np.linalg.norm(arr.astype(np.float32) - orig.astype(np.float32), axis=2)
+                    anomaly = (res_skin > 0) & (diff > anomaly_thresh)
+                    combined = np.maximum(combined, anomaly.astype(np.uint8) * 255)
+
+    return combined
+
+
 def _sdxl_inpaint_repair(
     image: Image.Image,
     mask_u8: np.ndarray,
     prompt: str = "natural skin texture, smooth transition, seamless blend, matching surrounding skin tone",
     strength: float = 0.35,
     device=None,
+    original: Image.Image | None = None,
 ) -> Image.Image:
     """SDXL Inpainting 二次修复:低降噪强度局部重绘接缝/肤色异常区。
 
     需要 SDXL Inpainting 模型 (stable-diffusion-xl-1.0-inpainting-0.1)。
-    用 StableDiffusionXLInpaintPipeline 对 mask 区域做低强度(0.35)重绘,
+    用 StableDiffusionXLInpaintPipeline 对聚焦 mask 区域做低强度(0.35)重绘,
     模型主要基于周边已有像素做微调,而非彻底重画。
+
+    v0.1.7 改进:
+    - 遮罩从整张 shared_mask 改为接缝带 + 肤色异常区(_build_inpaint_mask),
+      避免重画整个衣服区。
+    - 管线单例(_INPAINT_PIPE + _INPAINT_LOCK),不再每次调用 from_pretrained + del。
+    - original 参数传入原图,用于检测肤色异常区。
 
     启用条件:
       1. VTON_INPAINT_REPAIR=1 环境变量开启
@@ -256,51 +316,51 @@ def _sdxl_inpaint_repair(
 
     未满足时原样返回(安全回退,不回归)。
     """
-    import os
+    global _INPAINT_PIPE
 
     if os.environ.get("VTON_INPAINT_REPAIR", "0") != "1":
         return image
 
     try:
-        from pathlib import Path
+        import cv2
+
+        focused = _build_inpaint_mask(image, mask_u8, original=original)
+        if not focused.any():
+            return image
 
         inpaint_dir = Path(__file__).resolve().parent.parent / "models" / "sdxl" / "sdxl_inpaint"
         if not (inpaint_dir / "model_index.json").exists():
-            logger.warning("VTON_INPAINT_REPAIR=1 but SDXL Inpainting model not found at %s; skipping", inpaint_dir)
+            logger.warning("VTON_INPAINT_REPAIR=1 but model not found at %s; skipping", inpaint_dir)
             return image
 
-        import torch
-        from diffusers import StableDiffusionXLInpaintPipeline
+        with _INPAINT_LOCK:
+            if _INPAINT_PIPE is None:
+                import torch
+                from diffusers import StableDiffusionXLInpaintPipeline
 
-        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
-            str(inpaint_dir), torch_dtype=dtype, local_files_only=True
-        )
-        if torch.cuda.is_available():
-            pipe.enable_model_cpu_offload()
-            pipe.vae = pipe.vae.to(torch.float32)
+                dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+                _INPAINT_PIPE = StableDiffusionXLInpaintPipeline.from_pretrained(
+                    str(inpaint_dir), torch_dtype=dtype, local_files_only=True
+                )
+                if torch.cuda.is_available():
+                    _INPAINT_PIPE.enable_model_cpu_offload()
+                    _INPAINT_PIPE.vae = _INPAINT_PIPE.vae.to(torch.float32)
+            pipe = _INPAINT_PIPE
 
-        # 扩展 + 羽化遮罩:向外生长 8px,GaussianBlur 过渡
-        import cv2
-
-        mask = np.asarray(mask_u8)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 8))
-        mask_grown = cv2.dilate(mask, k)
+        mask_grown = cv2.dilate(focused, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 8)))
         mask_blurred = cv2.GaussianBlur(mask_grown, (0, 0), 4.0)
         mask_pil = Image.fromarray(mask_blurred.astype(np.uint8), "L")
 
-        result = pipe(
-            prompt=prompt,
-            image=image.convert("RGB"),
-            mask_image=mask_pil,
-            strength=strength,
-            num_inference_steps=20,
-            guidance_scale=7.5,
-        ).images[0]
+        with _INPAINT_LOCK:
+            result = pipe(
+                prompt=prompt,
+                image=image.convert("RGB"),
+                mask_image=mask_pil,
+                strength=strength,
+                num_inference_steps=20,
+                guidance_scale=7.5,
+            ).images[0]
 
-        del pipe
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
         return result
     except Exception:
         logger.debug("_sdxl_inpaint_repair failed; returning unmodified image", exc_info=True)

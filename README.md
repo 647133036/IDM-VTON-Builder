@@ -48,6 +48,22 @@ YCbCr 肤色检测加入 5x5 椭圆核开运算（去散点）+ 闭运算（填�
 
 v0.1.7 用前景 bbox 顶部 18% 估算脸区，从统计和应用两端排除：shift 只基于手臂/颈部肤色计算，校正只作用于手臂/颈部，脸部不动。
 
+### _sdxl_inpaint_repair 可用化
+
+v0.1.6 的 `_sdxl_inpaint_repair` 有三个问题导致审查结论"不能开"：
+
+1. **遮罩是整张 shared_mask**：inpaint 模型会重画整个衣服区，而非只修接缝和肤色异常
+2. **每次调用 from_pretrained + del pipe**：重复加载 7GB 模型，OOM 风险高
+3. **无原图对比**：无法定位肤色异常区
+
+v0.1.7 修复：
+
+- **聚焦遮罩**（`_build_inpaint_mask`）：接缝带（mask 边界 dilate-erode）+ 肤色异常区（result 皮肤与 original L1 距离 > 30，排除脸区）。像素数远少于整张 mask，inpaint 只修真正有问题的区域。
+- **管线单例**（`_INPAINT_PIPE` + `_INPAINT_LOCK`）：首次调用加载模型并缓存，后续调用直接复用。不再每次 `from_pretrained` + `del pipe`。
+- **original 参数**：调用方传入 `human_img`，用于检测肤色异常区。
+
+启用条件不变：`VTON_INPAINT_REPAIR=1` + `models/sdxl/sdxl_inpaint/model_index.json`。权重需手动下载 `stable-diffusion-xl-1.0-inpainting-0.1`（~7GB）。
+
 ## v0.1.6 更新日志
 
 ### 核心突破：频率分离——让立体感和图案保真同时成立
