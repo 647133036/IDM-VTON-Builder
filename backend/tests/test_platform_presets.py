@@ -16,6 +16,8 @@ from platform_presets import (
     _detect_face_mask,
     _detect_skin,
     _heuristic_face_mask,
+    _sdxl_inpaint_repair,
+    _seam_repair,
     apply_platform_preset,
     blend_tryon,
     center_crop_square,
@@ -978,3 +980,144 @@ def test_reapply_garment_detail_skin_color_not_shifted():
     # 肤色区颜色变化应很小(被抑制 85%)
     color_shift = np.abs(out[40:60, 40:60].astype(int) - gen_native[40:60, 40:60].astype(int)).mean()
     assert color_shift < 15, f"skin color shift {color_shift:.1f} should be small (<15)"
+
+
+# ---------------------------------------------------------------------------
+# clothing_mask: 短袖排除手臂皮肤(遮罩策略改进)
+# ---------------------------------------------------------------------------
+
+
+def _subject_with_skin(size=(200, 200)):
+    """主体图:深色衣身 + 肤色手臂在两侧。
+
+    返回 (Image, subject_mask) 用于 clothing_mask 测试。
+    """
+    arr = np.full((size[1], size[0], 3), (220, 220, 220), dtype=np.uint8)  # 白背景
+    # 主体:深色衣物在中心
+    arr[50:170, 70:130] = (40, 40, 80)  # 衣服
+    # 肤色手臂在两侧(短袖露出)
+    arr[50:120, 55:70] = (180, 140, 120)  # 左臂肤色
+    arr[50:120, 130:145] = (180, 140, 120)  # 右臂肤色
+    # 头部
+    arr[30:55, 85:115] = (180, 140, 120)
+    img = Image.fromarray(arr, "RGB")
+    subj = np.zeros(size, dtype=np.uint8)
+    subj[30:170, 55:145] = 1
+    return img, subj
+
+
+def test_clothing_mask_short_sleeve_excludes_arm_skin():
+    """短袖时手臂皮肤被排除出 clothing mask(保护原图手臂)。"""
+    img, subj = _subject_with_skin()
+    garment_extent = {"sleeve": "short", "hem": "waist"}
+    mask = clothing_mask(img, garment_type="upper", subject_mask=subj, garment_extent=garment_extent)
+    assert mask is not None
+    # 左臂肤色区(row 80, col 60): 应被排除(mask=0,保留原图皮肤)
+    assert mask[80, 60] < 20, f"left arm skin should be excluded, got {mask[80, 60]}"
+    # 右臂肤色区(row 80, col 135): 应被排除
+    assert mask[80, 135] < 20, f"right arm skin should be excluded, got {mask[80, 135]}"
+    # 衣物中心区(row 100, col 100): 应保留(mask>0,允许生成替换)
+    assert mask[100, 100] > 20, f"torso clothing should remain in mask, got {mask[100, 100]}"
+
+
+def test_clothing_mask_long_sleeve_keeps_arm_skin_in_mask():
+    """长袖时手臂皮肤不排除(新衣物需覆盖整条手臂)。"""
+    img, subj = _subject_with_skin()
+    garment_extent = {"sleeve": "long", "hem": "waist"}
+    mask = clothing_mask(img, garment_type="upper", subject_mask=subj, garment_extent=garment_extent)
+    assert mask is not None
+    # 长袖:手臂区(在 72% 裁切线以上)不应因肤色被排除
+    # row 80 在主体范围内,左臂 col 60 在侧边 25% (arm_w=50) 内
+    # 长袖不减肤色 → mask 应 > 0(允许生成结果覆盖手臂)
+    assert mask[80, 60] > 0, f"long sleeve should keep arm in mask, got {mask[80, 60]}"
+
+
+def test_clothing_mask_sleeveless_excludes_arm_skin():
+    """无袖时手臂皮肤被排除(无袖不覆盖手臂)。"""
+    img, subj = _subject_with_skin()
+    garment_extent = {"sleeve": "sleeveless", "hem": "waist"}
+    mask = clothing_mask(img, garment_type="upper", subject_mask=subj, garment_extent=garment_extent)
+    assert mask is not None
+    # 无袖:手臂皮肤应被排除
+    if mask[80, 60] > 0:
+        # 可能在 55% 裁切线下方已被清零,检查上方的肤色
+        assert mask[60, 60] < 20 or mask[80, 60] < 20, "sleeveless should exclude arm skin"
+
+
+# ---------------------------------------------------------------------------
+# _seam_repair: cv2.inpaint Telea 接缝修复
+# ---------------------------------------------------------------------------
+
+
+def test_seam_repair_smooths_boundary():
+    """mask 边界带像素被 Telea 修改,边界外像素保持不变。"""
+    arr = np.zeros((100, 200, 3), dtype=np.uint8)
+    arr[:, :100] = (200, 50, 50)
+    arr[:, 100:] = (50, 50, 200)
+    img = Image.fromarray(arr, "RGB")
+    mask = np.zeros((100, 200), dtype=np.uint8)
+    mask[:, :100] = 255
+
+    out = np.array(_seam_repair(img, mask, grow_px=8, radius=5))
+    orig = np.array(img)
+
+    changed = np.any(out != orig, axis=2)
+    assert changed.any(), "seam band pixels should be modified"
+    assert not changed[50, 20], "far-left (non-seam) should be unchanged"
+    assert not changed[50, 180], "far-right (non-seam) should be unchanged"
+
+
+def test_seam_repair_no_seam_returns_unchanged():
+    """无 mask 边界(全 0 或全 255)时原样返回。"""
+    img = Image.fromarray(np.full((50, 50, 3), 128, dtype=np.uint8), "RGB")
+    mask_all_zero = np.zeros((50, 50), dtype=np.uint8)
+    out = _seam_repair(img, mask_all_zero)
+    assert np.array_equal(np.array(out), np.array(img))
+
+    mask_all_full = np.full((50, 50), 255, dtype=np.uint8)
+    out2 = _seam_repair(img, mask_all_full)
+    assert np.array_equal(np.array(out2), np.array(img))
+
+
+def test_seam_repair_grow_px_controls_band_width():
+    """grow_px 越大,修复带越宽,更多边界像素被改变。radius 需大于带宽才能填满。"""
+    arr = np.zeros((100, 200, 3), dtype=np.uint8)
+    arr[:, :100] = (255, 0, 0)
+    arr[:, 100:] = (0, 0, 255)
+    img = Image.fromarray(arr, "RGB")
+    mask = np.zeros((100, 200), dtype=np.uint8)
+    mask[:, :100] = 255
+
+    orig = np.array(img)
+    out_small = np.array(_seam_repair(img, mask, grow_px=4, radius=20))
+    out_large = np.array(_seam_repair(img, mask, grow_px=16, radius=20))
+
+    changed_small = np.count_nonzero(np.any(out_small != orig, axis=2))
+    changed_large = np.count_nonzero(np.any(out_large != orig, axis=2))
+    assert changed_large > changed_small, (
+        f"larger grow_px should change more pixels: {changed_large} vs {changed_small}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# _sdxl_inpaint_repair: SDXL Inpainting 骨架(env var 控制)
+# ---------------------------------------------------------------------------
+
+
+def test_sdxl_inpaint_repair_disabled_by_default(monkeypatch):
+    """VTON_INPAINT_REPAIR 未设置时原样返回(不加载模型)。"""
+    monkeypatch.delenv("VTON_INPAINT_REPAIR", raising=False)
+    img = Image.fromarray(np.full((50, 50, 3), 128, dtype=np.uint8), "RGB")
+    mask = np.full((50, 50), 255, dtype=np.uint8)
+    out = _sdxl_inpaint_repair(img, mask)
+    assert np.array_equal(np.array(out), np.array(img))
+
+
+def test_sdxl_inpaint_repair_no_model_returns_unchanged(monkeypatch):
+    """VTON_INPAINT_REPAIR=1 但模型不存在时原样返回。"""
+    monkeypatch.setenv("VTON_INPAINT_REPAIR", "1")
+    img = Image.fromarray(np.full((50, 50, 3), 128, dtype=np.uint8), "RGB")
+    mask = np.full((50, 50), 255, dtype=np.uint8)
+    out = _sdxl_inpaint_repair(img, mask)
+    # 模型不存在 → 原样返回
+    assert np.array_equal(np.array(out), np.array(img))

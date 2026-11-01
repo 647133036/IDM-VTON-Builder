@@ -177,6 +177,115 @@ def _correct_skin_tone(
     return Image.fromarray(np.clip(res_f, 0, 255).astype(np.uint8), "RGB")
 
 
+def _seam_repair(
+    image: Image.Image,
+    mask_u8: np.ndarray,
+    grow_px: int = 8,
+    radius: int = 5,
+) -> Image.Image:
+    """用 cv2.inpaint (Telea) 平滑 mask 边界接缝。
+
+    blend_tryon 后,mask 边界处原图像素与生成像素的接缝可能有色阶断层
+    (胸口白块/领口硬边)。此函数提取 mask 边界带(grow_px 宽),用 Telea
+    算法以周边真实像素填充接缝,实现平滑过渡。
+
+    Telea 算法原理:从遮罩边界向内,按到边界距离的逆序填充,每个像素
+    取周围已知像素的加权平均。效果类似"用周围肤色涂抹接缝"。
+    """
+    try:
+        import cv2
+
+        arr = np.array(image.convert("RGB"), dtype=np.uint8)
+        mask = np.asarray(mask_u8)
+        if mask.shape[:2] != arr.shape[:2]:
+            mask = np.array(Image.fromarray(mask).resize((arr.shape[1], arr.shape[0]), Image.Resampling.BILINEAR))
+
+        # 边界带: dilate - erode = boundary band (width ≈ 2*grow_px)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow_px, grow_px))
+        dilated = cv2.dilate(mask, k)
+        eroded = cv2.erode(mask, k)
+        seam = ((dilated > 20) & (eroded < 20)).astype(np.uint8) * 255
+
+        if not seam.any():
+            return image
+
+        repaired = cv2.inpaint(arr, seam, radius, cv2.INPAINT_TELEA)
+        return Image.fromarray(repaired, "RGB")
+    except Exception:  # noqa: BLE001
+        return image
+
+
+def _sdxl_inpaint_repair(
+    image: Image.Image,
+    mask_u8: np.ndarray,
+    prompt: str = "natural skin texture, smooth transition, seamless blend, matching surrounding skin tone",
+    strength: float = 0.35,
+    device=None,
+) -> Image.Image:
+    """SDXL Inpainting 二次修复:低降噪强度局部重绘接缝/肤色异常区。
+
+    需要 SDXL Inpainting 模型 (stable-diffusion-xl-1.0-inpainting-0.1)。
+    用 StableDiffusionXLInpaintPipeline 对 mask 区域做低强度(0.35)重绘,
+    模型主要基于周边已有像素做微调,而非彻底重画。
+
+    启用条件:
+      1. VTON_INPAINT_REPAIR=1 环境变量开启
+      2. SDXL Inpainting 模型已下载到 models/sdxl/sdxl_inpaint/
+      3. torch + diffusers 可用
+
+    未满足时原样返回(安全回退,不回归)。
+    """
+    import os
+
+    if os.environ.get("VTON_INPAINT_REPAIR", "0") != "1":
+        return image
+
+    try:
+        from pathlib import Path
+
+        inpaint_dir = Path(__file__).resolve().parent.parent / "models" / "sdxl" / "sdxl_inpaint"
+        if not (inpaint_dir / "model_index.json").exists():
+            logger.warning("VTON_INPAINT_REPAIR=1 but SDXL Inpainting model not found at %s; skipping", inpaint_dir)
+            return image
+
+        import torch
+        from diffusers import StableDiffusionXLInpaintPipeline
+
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        pipe = StableDiffusionXLInpaintPipeline.from_pretrained(
+            str(inpaint_dir), torch_dtype=dtype, local_files_only=True
+        )
+        if torch.cuda.is_available():
+            pipe.enable_model_cpu_offload()
+            pipe.vae = pipe.vae.to(torch.float32)
+
+        # 扩展 + 羽化遮罩:向外生长 8px,GaussianBlur 过渡
+        import cv2
+
+        mask = np.asarray(mask_u8)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (8, 8))
+        mask_grown = cv2.dilate(mask, k)
+        mask_blurred = cv2.GaussianBlur(mask_grown, (0, 0), 4.0)
+        mask_pil = Image.fromarray(mask_blurred.astype(np.uint8), "L")
+
+        result = pipe(
+            prompt=prompt,
+            image=image.convert("RGB"),
+            mask_image=mask_pil,
+            strength=strength,
+            num_inference_steps=20,
+            guidance_scale=7.5,
+        ).images[0]
+
+        del pipe
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return result
+    except Exception:
+        logger.debug("_sdxl_inpaint_repair failed; returning unmodified image", exc_info=True)
+        return image
+
+
 def force_white_background(
     img: Image.Image,
     border_band: int = 8,
@@ -499,6 +608,25 @@ def clothing_mask(
             cloth[y0 + int(span * 0.82) :] = 0
     if float(cloth.mean()) < 0.02:
         return None
+
+    # 短袖/无袖:排除手臂皮肤。检测原图肤色(YCbCr),从 mask 两侧减去
+    # 皮肤像素 → 手臂皮肤标记为 0(保留原图),只有衣物区标记为 255(允许
+    # 生成替换)。躯干中心不减 → 胸口 V 领露肤仍可被新衣物覆盖。
+    # 长袖不减:新衣物需覆盖整条手臂,手臂皮肤应被生成结果替换。
+    # 用主体水平外扩 25% 定位手臂区(而非固定图像宽度比例)。
+    if garment_type in ("upper", "auto") and sleeve in ("short", "sleeveless"):
+        skin = _detect_skin(arr)
+        if skin.any():
+            xs = np.where(subj.any(axis=0))[0]
+            if len(xs):
+                x0s, x1s = int(xs.min()), int(xs.max())
+                subj_w = max(1, x1s - x0s)
+                arm_w = max(8, int(subj_w * 0.25))
+                left_end = x0s + arm_w
+                right_start = x1s - arm_w
+                cloth[:, :left_end][skin[:, :left_end] > 0] = 0
+                cloth[:, right_start:][skin[:, right_start:] > 0] = 0
+
     try:
         import cv2
 

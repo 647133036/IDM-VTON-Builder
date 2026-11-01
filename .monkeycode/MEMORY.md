@@ -111,3 +111,13 @@ Entries discovered by the Agent during task execution should follow this format:
   - `reapply_garment_detail` final blend `out = corrected_rgb * col_a + gen * (1-col_a)`
     means `color_strength=0` discards texture too (col_a=0 → out=gen). Tests
     must use non-zero color_strength to verify texture effects.
+  - `clothing_mask` now excludes arm skin for short/sleeveless: YCbCr skin in
+    the outer 25% of the *subject* bbox (not image width) is subtracted from
+    the mask. Long sleeve keeps arm skin in the mask so generated sleeves cover it.
+  - `_seam_repair` uses `cv2.inpaint(..., INPAINT_TELEA)` on the mask boundary
+    band (dilate-erode, grow_px=8). Telea only fills pixels within `radius` of
+    known pixels; tests that compare changed-pixel counts must set radius larger
+    than the band width.
+  - `_sdxl_inpaint_repair` is gated by `VTON_INPAINT_REPAIR=1` and requires
+    `models/sdxl/sdxl_inpaint/model_index.json`. Without the model it is a no-op.
+    Official weight: `stable-diffusion-xl-1.0-inpainting-0.1` (~7GB).

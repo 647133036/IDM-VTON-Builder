@@ -10,6 +10,8 @@ from pathlib import Path
 from PIL import Image
 from platform_presets import (
     _correct_skin_tone,
+    _sdxl_inpaint_repair,
+    _seam_repair,
     blend_tryon,
     clothing_mask,
     detect_garment_extent,
@@ -873,6 +875,14 @@ def compose_tryon_sdxl(
         result = blend_tryon(human_img, result, shared_mask)
         lock_identity = True
 
+    # 接缝修复:blend_tryon 后 mask 边界处原图与生成像素的接缝可能有色阶
+    # 断层(胸口白块/领口硬边)。用 cv2.inpaint Telea 以周边像素平滑过渡。
+    if lock_identity:
+        try:
+            result = _seam_repair(result, shared_mask)
+        except Exception:  # noqa: BLE001
+            logger.debug("_seam_repair failed; using raw blend result")
+
     # 肤色校正:SDXL 重画手臂皮肤常丢失原始肤色(发白发灰)。
     # 检测 result 中肤色像素,把色调向 human_img 原始肤色偏移。
     if lock_identity:
@@ -880,6 +890,15 @@ def compose_tryon_sdxl(
             result = _correct_skin_tone(human_img, result)
         except Exception:  # noqa: BLE001
             logger.debug("_correct_skin_tone failed; using raw blend result")
+
+    # SDXL Inpainting 二次修复(可选):低降噪强度(0.35)局部重绘接缝/肤色
+    # 异常区。需要 SDXL Inpainting 模型 + VTON_INPAINT_REPAIR=1。
+    # 未安装时原样返回(CPU 层已处理大部分问题)。
+    if lock_identity:
+        try:
+            result = _sdxl_inpaint_repair(result, shared_mask)
+        except Exception:  # noqa: BLE001
+            logger.debug("_sdxl_inpaint_repair failed; using pre-inpaint result")
 
     if background == "transparent":
         result = _remove_background(result)
