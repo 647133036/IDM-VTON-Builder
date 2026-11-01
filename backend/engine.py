@@ -231,9 +231,14 @@ def _silhouette_scale(ys: np.ndarray, box: dict, strength: float) -> np.ndarray:
 
 
 def _warp_garment(garment: Image.Image, box: dict, strength: float) -> Image.Image:
-    """水平网格变形:沿躯干轮廓收窄/放宽,肩部略展、腰部收、下摆贴合。
+    """2D 网格变形:沿躯干轮廓水平收窄/展宽 + 垂直锚点对齐(领口→颈部、下摆→腰部)。
 
     纯 CPU(cv2.remap 双线性采样),无 GPU 依赖;cv2 缺失时原样返回。
+
+    垂直对齐受 VTON_WARP_VERTICAL(默认 1.0)控制:
+      - 1.0:衣料内容(从 alpha 检测的领口→下摆)映射到躯干框(颈部→腰部),
+            修正 fit_garment_to_body 仅按肩宽等比缩放导致的垂直偏位。
+      - 0.0:仅水平变形(与 v0.1.6 行为一致)。
     """
     if strength <= 0:
         return garment
@@ -251,7 +256,26 @@ def _warp_garment(garment: Image.Image, box: dict, strength: float) -> Image.Ima
     xg, yg = np.meshgrid(np.arange(tw, dtype=np.float32), np.arange(th, dtype=np.float32))
     # 目标像素 -> 源像素:沿中心线按该行缩放系数反算。
     map_x = (cx + (xg - cx) / scale[:, None]).astype(np.float32)
+
+    # 垂直锚点对齐:衣料内容(领口→下摆)映射到躯干框(颈部→腰部)。
+    v_strength = float(os.environ.get("VTON_WARP_VERTICAL", "1.0"))
     map_y = yg.astype(np.float32)
+    if v_strength > 0:
+        alpha = arr[..., 3]
+        content_rows = np.where(alpha.sum(axis=1) > 20)[0]
+        if len(content_rows) > 10:
+            content_top = float(content_rows[0])
+            content_bottom = float(content_rows[-1])
+            target_top = float(np.clip(box["y"] * th, 0.0, th - 1.0))
+            target_bottom = float(np.clip((box["y"] + box["h"]) * th, 1.0, float(th)))
+            if target_bottom > target_top + 1 and content_bottom > content_top + 1:
+                aligned = np.interp(
+                    np.arange(th, dtype=np.float32),
+                    [0.0, target_top, target_bottom, float(th)],
+                    [0.0, content_top, content_bottom, float(th)],
+                ).astype(np.float32)
+                map_y = (yg * (1.0 - v_strength) + aligned[:, None] * v_strength).astype(np.float32)
+
     out = cv2.remap(arr, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT101)
     return Image.fromarray(out.astype(np.uint8), "RGBA")
 

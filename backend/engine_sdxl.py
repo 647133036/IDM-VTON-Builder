@@ -377,7 +377,7 @@ def align_garment_to_pose(
     garment_type: str,
     canvas: int = 1024,
 ) -> Image.Image:
-    """把平铺衣"掰"到人体姿态:按目标人群肩宽/轮廓缩放并做水平网格变形,
+    """把平铺衣"掰"到人体姿态:按目标人群肩宽/轮廓缩放并做 2D 网格变形,
     得到一张"正穿在人身上"的服装参考图,供 SDXL IP-Adapter 使用。
 
     这是 VITON 几何对齐步骤的纯 CPU 简化版——把衣服先贴到目标体型,
@@ -385,7 +385,11 @@ def align_garment_to_pose(
     准确性,尤其解决"衣服飘在身外/袖长不合/比例错位"。
 
     流程:crop 内容 -> fit_garment_to_body(按肩宽等比缩放) ->
-    _warp_garment(沿躯干轮廓收窄/展宽) -> 白底 RGB。
+    _warp_garment(水平轮廓收窄/展宽 + 垂直锚点对齐) -> 白底 RGB。
+
+    垂直对齐(VTON_WARP_VERTICAL, 默认 1.0)将领口→颈部、下摆→腰部,
+    修正仅按肩宽缩放导致的 logo/花纹垂直偏位——pattern_lock 残余风险
+    的主要来源。
 
     VTON_WARP=0 时关闭(回退原平铺图);VTON_WARP_STRENGTH 可覆盖默认强度。
     """

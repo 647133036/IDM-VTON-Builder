@@ -216,6 +216,73 @@ def test_warp_garment_noop_without_cv2_or_zero_strength():
     assert out is img or out.size == img.size
 
 
+def test_warp_garment_vertical_aligns_content_to_torso():
+    """VTON_WARP_VERTICAL=1 时,衣料内容中心向躯干框中心对齐。"""
+    import os
+
+    import numpy as np
+    from PIL import Image
+
+    w, h = 200, 300
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    arr[200:280, 50:150, :3] = 128
+    arr[200:280, 50:150, 3] = 255
+    img = Image.fromarray(arr, "RGBA")
+    box = torso_box("women", "east_asia")
+
+    old = os.environ.get("VTON_WARP_VERTICAL")
+    os.environ["VTON_WARP_VERTICAL"] = "1.0"
+    try:
+        out = _warp_garment(img, box, 0.42)
+    finally:
+        if old is None:
+            os.environ.pop("VTON_WARP_VERTICAL", None)
+        else:
+            os.environ["VTON_WARP_VERTICAL"] = old
+
+    out_arr = np.asarray(out)
+    content_before = np.where(arr[..., 3].sum(axis=1) > 20)[0]
+    content_after = np.where(out_arr[..., 3].sum(axis=1) > 20)[0]
+    assert len(content_before) > 0
+    assert len(content_after) > 0
+    center_before = (content_before[0] + content_before[-1]) / 2
+    center_after = (content_after[0] + content_after[-1]) / 2
+    assert center_after < center_before
+
+
+def test_warp_garment_vertical_disabled_preserves_rows():
+    """VTON_WARP_VERTICAL=0 时,垂直方向不变形(仅水平缩放)。"""
+    import os
+
+    import numpy as np
+    from PIL import Image
+
+    w, h = 200, 300
+    arr = np.zeros((h, w, 4), dtype=np.uint8)
+    arr[100:180, 50:150, :3] = 128
+    arr[100:180, 50:150, 3] = 255
+    img = Image.fromarray(arr, "RGBA")
+    box = torso_box("women", "east_asia")
+
+    old = os.environ.get("VTON_WARP_VERTICAL")
+    os.environ["VTON_WARP_VERTICAL"] = "0.0"
+    try:
+        out = _warp_garment(img, box, 0.42)
+    finally:
+        if old is None:
+            os.environ.pop("VTON_WARP_VERTICAL", None)
+        else:
+            os.environ["VTON_WARP_VERTICAL"] = old
+
+    out_arr = np.asarray(out)
+    content_before = np.where(arr[..., 3].sum(axis=1) > 20)[0]
+    content_after = np.where(out_arr[..., 3].sum(axis=1) > 20)[0]
+    assert len(content_before) > 0
+    assert len(content_after) > 0
+    assert content_after[0] == content_before[0]
+    assert content_after[-1] == content_before[-1]
+
+
 def test_remove_watermark_reduces_corner_highlights():
     import numpy as np
     from PIL import Image, ImageDraw, ImageFont

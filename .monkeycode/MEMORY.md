@@ -142,8 +142,12 @@ Entries discovered by the Agent during task execution should follow this format:
     `VTON_PATTERN_LOCK_WHITE_THRESH` (245).
   - White pixels (RGB>245) connected to image border are skipped (canvas white);
     interior near-white still overlays.
-  - Residual risks: warp misalignment shifts logo position; seam feather zone
-    HF discontinuity may break thin stripes at cuffs/collars.
+  - Residual risks: seam feather zone HF discontinuity may break thin stripes
+    at cuffs/collars; extreme body proportions (very long/short torso) still
+    misalign since vertical warp uses statistical torso_box, not keypoints.
+  - `VTON_WARP_VERTICAL` (default 1.0) controls vertical anchor alignment in
+    `_warp_garment`: maps garment content (collar→hem from alpha) to torso box
+    (neck→waist). 0=horizontal-only (v0.1.6 behavior), 1=full vertical align.
   - `VTON_PATTERN_LOCK=0` keeps the old high-frequency softlight + Reinhard path.
   - PLTON / PhysDiff-VTON style high-frequency injection during denoising is not
     available on this SDXL ControlNet pipeline; do not claim generation-time

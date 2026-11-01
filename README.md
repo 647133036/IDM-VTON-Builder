@@ -1,8 +1,33 @@
-# Atelier v0.1.6
+# Atelier v0.1.7
 
 店铺后台固定底图换衣工作台。选一张模特底图，批量拖入服装平铺图，队列生成正面成品，下载或推送到商品页。界面内置中英文一键切换。
 
 **基本运行条件：8 核 CPU / 32GB 内存 / NVIDIA A10（24GB 显存）。** SDXL 商用管线（ControlNet + IP-Adapter + LoRA）按此规格验证；无 GPU 时自动降级合成引擎，效果有限。
+
+## v0.1.7 更新日志
+
+### warp 垂直锚点对齐：修正 logo/花纹垂直偏位
+
+v0.1.6 的 `_warp_garment` 仅做**水平**网格变形（沿躯干轮廓收窄/展宽），垂直方向是恒等映射。`fit_garment_to_body` 按肩宽等比缩放后，衣料的领口和下摆位置由初始放置决定，与人体颈部/腰部没有对齐——这是 pattern_lock 残余风险的主要来源：logo 偏高或偏低，花纹和褶皱不重合。
+
+v0.1.7 在 `_warp_garment` 中加入**垂直锚点对齐**：
+
+1. 从 alpha 通道检测衣料内容范围（领口行 → 下摆行）
+2. 计算躯干框的垂直目标（颈部 `box["y"]` → 腰部 `box["y"]+box["h"]`）
+3. 用 `np.interp` 构建非线性 `map_y`，将领口映射到颈部、下摆映射到腰部
+4. 与水平 `map_x` 合成到同一次 `cv2.remap`，纯 CPU，无额外开销
+
+```
+VTON_WARP_VERTICAL=1.0  # 默认：全强度垂直对齐
+VTON_WARP_VERTICAL=0.0  # 关闭：仅水平变形（v0.1.6 行为）
+VTON_WARP_VERTICAL=0.5  # 半强度：在恒等和全对齐之间插值
+```
+
+**效果**：cloth_ref 的领口对齐颈部、下摆对齐腰部，pattern_lock overlay 的 logo 位置与人体姿态一致，不再因垂直偏位导致花纹错位。
+
+### 残余风险
+
+垂直对齐基于躯干框（`torso_box` 的人群/人种统计值），不是关键点检测。极端体型（超长躯干/超短腰）仍会偏；学习型 warp（TPS/光流）留待后续。
 
 ## v0.1.6 更新日志
 
@@ -327,12 +352,13 @@ MODEL=lora_family bash run_train.sh  # 服装 + 人像双 LoRA
 <iframe src="/embed.html?store=STORE_ID" style="width:100%;min-height:720px;border:0"></iframe>
 ```
 
-## SDXL 引擎环境变量（v0.1.6）
+## SDXL 引擎环境变量（v0.1.7）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `VTON_AR` | `1` | 保宽高比 letterbox |
 | `VTON_WARP` | `1` | 几何对齐 |
+| `VTON_WARP_VERTICAL` | `1.0` | 垂直锚点对齐强度：1.0=领口→颈部/下摆→腰部全对齐，0=仅水平变形（v0.1.6 行为） |
 | `VTON_DETAIL` | `1` | 商品细节回贴（边缘衰减；肤色区降权） |
 | `VTON_PATTERN_LOCK` | `1` | DualFit 贴图：warp 衣覆盖衣服区，生成图只按亮度比调褶皱；白底跳过边缘连通近白；肤色降权。需 `VTON_WARP=1`。`0` 回退高频柔光+Reinhard |
 | `VTON_PATTERN_LOCK_LIGHT_STRENGTH` | `1.0` | 光照总闸：0=精确 ref（纯贴图），1=全效 |
