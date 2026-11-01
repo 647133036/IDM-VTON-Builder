@@ -623,6 +623,31 @@ def detect_garment_extent(garment: Image.Image) -> dict:
     return {"sleeve": sleeve, "hem": hem, "aspect": round(aspect, 2)}
 
 
+def _estimate_waist_ratio(subj: np.ndarray, y0: int, span: int) -> float:
+    """从主体 mask 行宽分布估算腰线占身高的比例。
+
+    在躯干区(30%-75% 身高)找行宽最小点作为腰线。
+    无明显收腰(min/max > 0.85)时回退 0.62,与 v0.1.6 固定比例一致。
+    """
+    h = subj.shape[0]
+    torso_top = y0 + int(span * 0.30)
+    torso_bottom = min(y0 + int(span * 0.75), h)
+    if torso_bottom <= torso_top + 5:
+        return 0.62
+    widths = np.array([subj[r].sum() for r in range(torso_top, torso_bottom)], dtype=np.float32)
+    if len(widths) < 5:
+        return 0.62
+    kernel = np.ones(5, dtype=np.float32) / 5
+    smooth = np.convolve(widths, kernel, mode="valid")
+    min_idx = int(np.argmin(smooth)) + 2
+    min_w = float(smooth.min())
+    max_w = float(smooth.max())
+    if max_w > 0 and min_w / max_w > 0.85:
+        return 0.62
+    ratio = (torso_top + min_idx - y0) / max(1, span)
+    return float(np.clip(ratio, 0.45, 0.75))
+
+
 def clothing_mask(
     img: Image.Image,
     garment_type: str = "upper",
@@ -663,30 +688,29 @@ def clothing_mask(
     sleeve = garment_extent.get("sleeve", "short") if garment_extent else "short"
     hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
 
+    waist_r = _estimate_waist_ratio(subj, y0, span)
+
     if garment_type in ("upper", "auto"):
-        # 衣长(hem)决定躯干覆盖范围;袖长(sleeve)微调手臂区。
-        # hem=long → 长款上衣/束腰衣,垂过裤腰(解决"沿裤子齐边剪"问题)。
-        # sleeve=long → 略下延含手臂区(72%,替代原 88% 过度延伸躯干)。
         if hem == "long":
-            cloth[y0 + int(span * 0.80) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.18)) :] = 0
         elif sleeve == "sleeveless":
-            cloth[y0 + int(span * 0.55) :] = 0
+            cloth[y0 + int(span * (waist_r - 0.07)) :] = 0
         elif sleeve == "long":
-            cloth[y0 + int(span * 0.72) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.10)) :] = 0
         else:
-            cloth[y0 + int(span * 0.62) :] = 0
+            cloth[y0 + int(span * waist_r) :] = 0
     elif garment_type == "dress":
         if hem == "long":
-            cloth[y0 + int(span * 0.96) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.34)) :] = 0
         else:
-            cloth[y0 + int(span * 0.82) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.20)) :] = 0
     elif garment_type == "lower":
-        cloth[: y0 + int(span * 0.48)] = 0
+        cloth[: y0 + int(span * (waist_r - 0.14))] = 0
     elif garment_type == "onesie":
         if sleeve == "long":
-            cloth[y0 + int(span * 0.95) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.33)) :] = 0
         else:
-            cloth[y0 + int(span * 0.82) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.20)) :] = 0
     if float(cloth.mean()) < 0.02:
         return None
 

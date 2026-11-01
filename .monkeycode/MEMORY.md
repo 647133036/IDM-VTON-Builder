@@ -161,6 +161,10 @@ Entries discovered by the Agent during task execution should follow this format:
     + skin anomaly vs original), pipeline singleton (_INPAINT_PIPE +
     _INPAINT_LOCK, no per-call from_pretrained/del), `original` param for skin
     anomaly detection. Still requires VTON_INPAINT_REPAIR=1 + model download.
+  - `_estimate_waist_ratio` detects waist from subject_mask row-width profile
+    (torso 30%-75% height, min width via valid-mode convolve). Falls back to
+    0.62 when no narrowing (min/max > 0.85). clothing_mask cut ratios changed
+    from fixed values to `waist_r + offset` preserving original deltas.
   - `VTON_PATTERN_LOCK=0` keeps the old high-frequency softlight + Reinhard path.
   - PLTON / PhysDiff-VTON style high-frequency injection during denoising is not
     available on this SDXL ControlNet pipeline; do not claim generation-time

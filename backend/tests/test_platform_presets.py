@@ -16,6 +16,7 @@ from platform_presets import (
     _correct_skin_tone,
     _detect_face_mask,
     _detect_skin,
+    _estimate_waist_ratio,
     _heuristic_face_mask,
     _sdxl_inpaint_repair,
     _seam_repair,
@@ -652,6 +653,43 @@ def test_clothing_mask_heuristic_face_when_detection_fails(monkeypatch):
     assert m is not None
     assert int(m[35, 60]) < 40  # face area protected
     assert int(m[70, 60]) > 180  # clothing area retained
+
+
+def test_estimate_waist_ratio_uniform_falls_back():
+    """均匀宽度(无收腰)回退到 0.62。"""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    ratio = _estimate_waist_ratio(subj, 20, 160)
+    assert ratio == 0.62
+
+
+def test_estimate_waist_ratio_narrowed_detects_waist():
+    """有收腰的主体,腰线比例偏离 0.62。"""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:60, 20:100] = 1
+    subj[60:90, 35:85] = 1
+    subj[90:110, 45:75] = 1
+    subj[110:140, 35:85] = 1
+    subj[140:180, 25:95] = 1
+    ratio = _estimate_waist_ratio(subj, 20, 160)
+    assert ratio != 0.62
+    assert 0.45 <= ratio <= 0.58
+
+
+def test_clothing_mask_waist_aware_cut():
+    """有收腰的主体,腰线裁切跟随实际腰线(非固定 0.62)。"""
+    subj_w = np.zeros((200, 120), dtype=np.uint8)
+    subj_w[20:60, 20:100] = 1
+    subj_w[60:90, 35:85] = 1
+    subj_w[90:110, 45:75] = 1
+    subj_w[110:140, 35:85] = 1
+    subj_w[140:180, 25:95] = 1
+    img = Image.fromarray(np.full((200, 120, 3), 80, dtype=np.uint8), "RGB")
+    m_waist = clothing_mask(img, garment_type="upper", subject_mask=subj_w)
+    _, subj_u = _subject_img()
+    m_uniform = clothing_mask(img, garment_type="upper", subject_mask=subj_u)
+    assert m_waist is not None and m_uniform is not None
+    assert int(m_waist[105, 60]) < int(m_uniform[105, 60])
 
 
 # --- _detect_face_mask down_margin_frac -------------------------------------

@@ -64,6 +64,24 @@ v0.1.7 修复：
 
 启用条件不变：`VTON_INPAINT_REPAIR=1` + `models/sdxl/sdxl_inpaint/model_index.json`。权重需手动下载 `stable-diffusion-xl-1.0-inpainting-0.1`（~7GB）。
 
+### 腰线启发式检测：替代固定 62% 裁切
+
+`clothing_mask` 此前用固定比例（short=62%、long=72%、sleeveless=55%）裁切衣料 mask 底部，对身材比例不同的模特偏差大（长躯干/短腿 → 裁切偏高；短躯干/长腿 → 偏低）。
+
+v0.1.7 加入 `_estimate_waist_ratio`：从 subject_mask 的行宽分布检测躯干区（30%-75% 身高）最窄点作为腰线。无明显收腰（min/max > 0.85）时回退 0.62。所有裁切比例改为 `waist_ratio + offset`，offset 保持原差值不变。
+
+| 品类 | 条件 | 原比例 | 新公式 |
+|------|------|--------|--------|
+| upper | short | 0.62 | waist_r |
+| upper | long sleeve | 0.72 | waist_r + 0.10 |
+| upper | sleeveless | 0.55 | waist_r - 0.07 |
+| upper | long hem | 0.80 | waist_r + 0.18 |
+| dress | normal | 0.82 | waist_r + 0.20 |
+| dress | long | 0.96 | waist_r + 0.34 |
+| lower | top cut | 0.48 | waist_r - 0.14 |
+| onesie | normal | 0.82 | waist_r + 0.20 |
+| onesie | long sleeve | 0.95 | waist_r + 0.33 |
+
 ## v0.1.6 更新日志
 
 ### 核心突破：频率分离——让立体感和图案保真同时成立
