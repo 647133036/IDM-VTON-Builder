@@ -122,6 +122,8 @@ def _detect_skin(rgb: np.ndarray) -> np.ndarray:
     标准 YCbCr 肤色范围:Cb 77-127, Cr 133-173。
     用于 reapply_garment_detail 排除手臂皮肤(防服装纹理贴到皮肤上发白)
     和 _correct_skin_tone 校正 SDXL 生成肤色。
+
+    形态学开运算去散点噪声,闭运算填小孔,保证肤色区连通完整。
     """
     try:
         import cv2
@@ -131,6 +133,9 @@ def _detect_skin(rgb: np.ndarray) -> np.ndarray:
         cr = ycbcr[:, :, 1]
         cb = ycbcr[:, :, 2]
         skin = ((cb >= 77) & (cb <= 127) & (cr >= 133) & (cr <= 173)).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        skin = cv2.morphologyEx(skin, cv2.MORPH_OPEN, kernel)
+        skin = cv2.morphologyEx(skin, cv2.MORPH_CLOSE, kernel)
         return skin
     except Exception:  # noqa: BLE001
         return np.zeros(rgb.shape[:2], dtype=np.uint8)
@@ -145,6 +150,9 @@ def _correct_skin_tone(
     SDXL 重画手臂皮肤时常丢失原始肤色(发白发灰)。此函数用 YCbCr 肤色检测
     找到两图的皮肤区,计算 original 肤色均值,把 result 肤色向其偏移。
     肤色掩码经 GaussianBlur 羽化,避免校正边界硬切。
+
+    脸区排除:SDXL 通常正确生成脸部肤色,全局平移会让脸色不自然。
+    用前景 bbox 顶部 18% 估算脸区,从校正统计和校正应用两端都排除。
     """
     try:
         import cv2
@@ -161,6 +169,19 @@ def _correct_skin_tone(
 
     orig_skin = _detect_skin(orig)
     res_skin = _detect_skin(res)
+    if not orig_skin.any() or not res_skin.any():
+        return result
+
+    # 排除脸区:前景 bbox 顶部 18% 估算脸区,统计和应用两端都排除。
+    h, w = res.shape[:2]
+    non_white = res.mean(axis=2) < 240
+    face_mask = np.zeros((h, w), dtype=np.uint8)
+    if non_white.any():
+        ys = np.where(non_white.any(axis=1))[0]
+        face_h = max(1, int((ys[-1] - ys[0]) * 0.18))
+        face_mask[ys[0] : ys[0] + face_h, :] = 1
+    orig_skin = orig_skin * (1 - face_mask)
+    res_skin = res_skin * (1 - face_mask)
     if not orig_skin.any() or not res_skin.any():
         return result
 

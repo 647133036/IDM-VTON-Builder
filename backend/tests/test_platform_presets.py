@@ -775,14 +775,11 @@ def test_reapply_edge_falloff_center_stronger_than_edge(monkeypatch):
 
 def test_detect_skin_finds_skin_tone():
     """肤色像素(Cb 77-127, Cr 133-173)被检测为 255,非肤色为 0。"""
-    arr = np.zeros((4, 4, 3), dtype=np.uint8)
-    # 典型肤色 RGB(180,140,120) → YCbCr 约 (148,105,150) → 命中
-    arr[0:2, 0:2] = (180, 140, 120)
-    # 白色背景 → 非肤色
-    arr[2:4, 2:4] = (255, 255, 255)
+    arr = np.full((10, 10, 3), (255, 255, 255), dtype=np.uint8)
+    arr[0:6, 0:6] = (180, 140, 120)
     skin = _detect_skin(arr)
-    assert skin[0, 0] == 255
-    assert skin[3, 3] == 0
+    assert skin[2, 2] == 255
+    assert skin[8, 8] == 0
 
 
 def test_detect_skin_returns_zeros_on_error(monkeypatch):
@@ -929,6 +926,32 @@ def test_correct_skin_tone_close_match_returns_unchanged():
     out_arr = np.array(out)
     # shift < 2 → 不校正
     assert abs(out_arr[25, 25, 0].astype(int) - 181) <= 1
+
+
+def test_detect_skin_morphology_removes_noise():
+    """形态学开运算去除散点噪声,连续区域保留。"""
+    arr = np.full((20, 20, 3), (255, 255, 255), dtype=np.uint8)
+    arr[5, 5] = (180, 140, 120)
+    arr[10:15, 10:15] = (180, 140, 120)
+    skin = _detect_skin(arr)
+    assert skin[5, 5] == 0
+    assert skin[12, 12] == 255
+
+
+def test_correct_skin_tone_excludes_face_region():
+    """脸区(前景顶部 18%)不被校正,手臂区被校正。"""
+    skin = (180, 140, 120)
+    light = (210, 190, 180)
+    orig = np.full((100, 100, 3), (241, 241, 241), dtype=np.uint8)
+    orig[10:25, 40:60] = skin
+    orig[60:80, 10:30] = skin
+    res = np.full((100, 100, 3), (241, 241, 241), dtype=np.uint8)
+    res[10:25, 40:60] = light
+    res[60:80, 10:30] = light
+    out = np.array(_correct_skin_tone(Image.fromarray(orig, "RGB"), Image.fromarray(res, "RGB")))
+    face_delta = abs(out[15, 50, 0].astype(int) - 210)
+    arm_delta = abs(out[70, 20, 0].astype(int) - 210)
+    assert arm_delta > face_delta
 
 
 # ---------------------------------------------------------------------------

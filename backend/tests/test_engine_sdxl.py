@@ -325,3 +325,18 @@ def test_align_garment_to_pose_changes_pixels_vs_flat(monkeypatch):
     b = np.asarray(aligned)
     assert a.shape == b.shape
     assert not np.array_equal(a, b)
+
+
+def test_align_garment_to_pose_dress_differs_from_upper():
+    """dress 和 upper 应用不同 GARMENT_BOX, warp 结果不同。"""
+    import engine_sdxl
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    garment = Image.new("RGBA", (500, 700), (0, 0, 0, 0))
+    d = ImageDraw.Draw(garment)
+    d.rectangle([120, 100, 380, 620], fill=(60, 140, 90, 255))
+    g = garment.convert("RGB")
+    upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024))
+    dress = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "dress", 1024))
+    assert not np.array_equal(upper, dress)

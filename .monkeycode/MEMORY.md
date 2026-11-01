@@ -148,6 +148,15 @@ Entries discovered by the Agent during task execution should follow this format:
   - `VTON_WARP_VERTICAL` (default 1.0) controls vertical anchor alignment in
     `_warp_garment`: maps garment content (collar→hem from alpha) to torso box
     (neck→waist). 0=horizontal-only (v0.1.6 behavior), 1=full vertical align.
+  - `align_garment_to_pose` now applies `GARMENT_BOX` before warp so dress/
+    lower/onesie target the correct vertical body region (dress h=1.55→knee,
+    lower y=0.92→hip). Previously only `_composite_engine` applied it.
+  - `_detect_skin` uses morphological open+close (5x5 ellipse kernel) to remove
+    scatter noise and fill holes. Tests must use >= 6x6 skin regions (smaller
+    ones get eroded by the open operation).
+  - `_correct_skin_tone` excludes face region (foreground bbox top 18%) from
+    both shift statistics and correction application. Only arm/neck skin is
+    corrected; face stays untouched to avoid unnatural color shifts.
   - `VTON_PATTERN_LOCK=0` keeps the old high-frequency softlight + Reinhard path.
   - PLTON / PhysDiff-VTON style high-frequency injection during denoising is not
     available on this SDXL ControlNet pipeline; do not claim generation-time

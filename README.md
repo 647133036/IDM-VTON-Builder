@@ -29,6 +29,25 @@ VTON_WARP_VERTICAL=0.5  # 半强度：在恒等和全对齐之间插值
 
 垂直对齐基于躯干框（`torso_box` 的人群/人种统计值），不是关键点检测。极端体型（超长躯干/超短腰）仍会偏；学习型 warp（TPS/光流）留待后续。
 
+### GARMENT_BOX 适配：dress/lower/onesie 垂直范围修正
+
+`align_garment_to_pose` 此前未应用 `GARMENT_BOX` 调整，连衣裙/裤子/连体衣的垂直 warp 目标与上衣相同（颈部→腰部），导致 dress 被压缩到躯干、lower 被贴到胸口。v0.1.7 在 warp 前按品类调整 `box["y"]` 和 `box["h"]`：
+
+- `upper`（y=0, h=1.0）：颈部→腰部（无变化）
+- `dress`（y=0, h=1.55）：颈部→膝部
+- `lower`（y=0.92, h=0.95）：髋部→大腿
+- `onesie`（y=0, h=1.35）：颈部→大腿
+
+### _detect_skin 形态学去噪
+
+YCbCr 肤色检测加入 5x5 椭圆核开运算（去散点）+ 闭运算（填小孔），避免散点噪声影响 `_correct_skin_tone` 的肤色均值统计和 `reapply_garment_detail` 的肤色排除。
+
+### _correct_skin_tone 脸区排除
+
+此前 `_correct_skin_tone` 对 result 中**所有**肤色像素做全局平移（`shift = orig_mean - res_mean`），包括 SDXL 通常生成正确的脸部。全局平移会让脸色不自然偏移。
+
+v0.1.7 用前景 bbox 顶部 18% 估算脸区，从统计和应用两端排除：shift 只基于手臂/颈部肤色计算，校正只作用于手臂/颈部，脸部不动。
+
 ## v0.1.6 更新日志
 
 ### 核心突破：频率分离——让立体感和图案保真同时成立

@@ -387,9 +387,9 @@ def align_garment_to_pose(
     流程:crop 内容 -> fit_garment_to_body(按肩宽等比缩放) ->
     _warp_garment(水平轮廓收窄/展宽 + 垂直锚点对齐) -> 白底 RGB。
 
-    垂直对齐(VTON_WARP_VERTICAL, 默认 1.0)将领口→颈部、下摆→腰部,
-    修正仅按肩宽缩放导致的 logo/花纹垂直偏位——pattern_lock 残余风险
-    的主要来源。
+    垂直对齐(VTON_WARP_VERTICAL, 默认 1.0)按 GARMENT_BOX 调整后的躯干框
+    映射领口→颈部、下摆→腰部(上衣)或膝部(连衣裙)或髋部(下装),
+    修正仅按肩宽缩放导致的 logo/花纹垂直偏位。
 
     VTON_WARP=0 时关闭(回退原平铺图);VTON_WARP_STRENGTH 可覆盖默认强度。
     """
@@ -397,6 +397,7 @@ def align_garment_to_pose(
         return garment
     try:
         from engine import (
+            GARMENT_BOX,
             GARMENT_WARP_STRENGTH,
             _warp_garment,
             fit_garment_to_body,
@@ -408,6 +409,9 @@ def align_garment_to_pose(
         return garment
 
     box = torso_box(audience, ethnicity)
+    adj = GARMENT_BOX.get(garment_type, GARMENT_BOX["upper"])
+    box["y"] = box["y"] + adj["y"] * box["h"]
+    box["h"] = box["h"] * adj["h"]
     base_strength = GARMENT_WARP_STRENGTH.get(garment_type, 0.42)
     raw = os.environ.get("VTON_WARP_STRENGTH", "").strip()
     try:
