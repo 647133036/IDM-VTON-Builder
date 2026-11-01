@@ -121,3 +121,30 @@ Entries discovered by the Agent during task execution should follow this format:
   - `_sdxl_inpaint_repair` is gated by `VTON_INPAINT_REPAIR=1` and requires
     `models/sdxl/sdxl_inpaint/model_index.json`. Without the model it is a no-op.
     Official weight: `stable-diffusion-xl-1.0-inpainting-0.1` (~7GB).
+
+[Project Knowledge Summary]
+- Date: 2026-11-01
+- Context: Discovered by Agent while implementing DualFit-style pattern lock
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - `VTON_PATTERN_LOCK=1` (default) overlays warped `cloth_ref` onto the garment
+    mask. PLTON-inspired frequency separation: `shade_full = clamp(L_gen/L_ref,
+    0.75, 1.25)`; `lit = LF_ref * shade_full + HF_ref * shade_half` where
+    `shade_half` scales deviation by `VTON_PATTERN_LOCK_HF_SHADE` (default 0.5).
+    LF (base color) gets full lighting modulation; HF (pattern/logo) gets half,
+    so shadows darken base color but pattern contrast survives.
+  - Pattern lock env vars: `VTON_PATTERN_LOCK_LIGHT_STRENGTH` (1.0, total
+    lighting dial: 0=exact ref, 1=full), `VTON_PATTERN_LOCK_LF_STRENGTH` (1.0),
+    `VTON_PATTERN_LOCK_HF_STRENGTH` (0.5), `VTON_PATTERN_LOCK_LF_BLUR_SIGMA`
+    (8.0), `VTON_PATTERN_LOCK_LIGHTING_MIN/MAX` (0.75/1.25, clamp on lighting
+    ratio not on shade), `VTON_PATTERN_LOCK_SKIN_WEIGHT` (0.85),
+    `VTON_PATTERN_LOCK_FEATHER_PX` (5), `VTON_PATTERN_LOCK_SKIP_WHITE_BG` (1),
+    `VTON_PATTERN_LOCK_WHITE_THRESH` (245).
+  - White pixels (RGB>245) connected to image border are skipped (canvas white);
+    interior near-white still overlays.
+  - Residual risks: warp misalignment shifts logo position; seam feather zone
+    HF discontinuity may break thin stripes at cuffs/collars.
+  - `VTON_PATTERN_LOCK=0` keeps the old high-frequency softlight + Reinhard path.
+  - PLTON / PhysDiff-VTON style high-frequency injection during denoising is not
+    available on this SDXL ControlNet pipeline; do not claim generation-time
+    pattern constraints.

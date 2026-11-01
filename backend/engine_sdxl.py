@@ -855,16 +855,24 @@ def compose_tryon_sdxl(
         else None
     )
 
-    # 商品细节回贴:AI 出骨架光影,代码保原衣纹理颜色。
-    # SDXL 生成的衣服颜色/花纹常与原平铺图有偏差(串色/丢花纹);把原衣的
-    # 高频纹理(柔光贴回)+ 颜色分布(Reinhard LAB 迁移)注入生成图衣服区。
+    # 商品细节回贴:VTON_PATTERN_LOCK=1(默认)时 warp 衣直接覆盖衣服区,
+    # 生成图只调褶皱光影;关闭则走高频柔光 + Reinhard 颜色迁移。
     # VTON_DETAIL=1(默认)开启;关闭时跳过。
     detail_applied = False
     if os.environ.get("VTON_DETAIL", "1") != "0" and shared_mask is not None:
         try:
-            result = reapply_garment_detail(result, cloth_ref, shared_mask)
+            pattern_lock = os.environ.get("VTON_PATTERN_LOCK", "1") != "0" and warp_enabled
+            result = reapply_garment_detail(
+                result,
+                cloth_ref,
+                shared_mask,
+                pattern_lock=pattern_lock,
+            )
             detail_applied = True
-            logger.info("reapply_garment_detail: texture+color re-injected on garment region")
+            logger.info(
+                "reapply_garment_detail: pattern_lock=%s on garment region",
+                pattern_lock,
+            )
         except Exception:
             logger.exception("reapply_garment_detail failed; using raw SDXL output")
 

@@ -1121,3 +1121,86 @@ def test_sdxl_inpaint_repair_no_model_returns_unchanged(monkeypatch):
     out = _sdxl_inpaint_repair(img, mask)
     # 模型不存在 → 原样返回
     assert np.array_equal(np.array(out), np.array(img))
+
+
+# ---------------------------------------------------------------------------
+# reapply_garment_detail pattern_lock: warp 衣覆盖,生成图只调光影
+# ---------------------------------------------------------------------------
+
+
+def test_pattern_lock_center_matches_ref_pattern():
+    """pattern_lock 中心区应贴回参考图花纹,而不是生成图颜色。"""
+    gen = Image.fromarray(np.full((80, 80, 3), (40, 40, 180), dtype=np.uint8), "RGB")
+    ref_arr = np.full((80, 80, 3), (180, 40, 40), dtype=np.uint8)
+    ref_arr[20:60, 20:40] = (40, 180, 40)
+    ref = Image.fromarray(ref_arr, "RGB")
+    mask = np.zeros((80, 80), dtype=np.uint8)
+    mask[10:70, 10:70] = 255
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
+    # 中心红区贴近 ref 红,远离 gen 蓝
+    red = out[30:50, 45:55]
+    assert red[..., 0].mean() > 120
+    assert red[..., 2].mean() < 80
+    # 中心绿条贴近 ref 绿
+    green = out[30:50, 25:35]
+    assert green[..., 1].mean() > 120
+    # mask 外保持生成图
+    assert np.array_equal(out[:10, :], np.array(gen)[:10, :])
+
+
+def test_pattern_lock_skips_white_background():
+    """cloth_ref 白底不得覆盖生成图像素。"""
+    gen_arr = np.full((64, 64, 3), (30, 80, 160), dtype=np.uint8)
+    gen = Image.fromarray(gen_arr, "RGB")
+    ref_arr = np.full((64, 64, 3), 255, dtype=np.uint8)
+    ref_arr[16:48, 16:48] = (200, 40, 40)
+    ref = Image.fromarray(ref_arr, "RGB")
+    mask = np.full((64, 64), 255, dtype=np.uint8)
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
+    # 白底区(角)保持生成图蓝
+    corner = out[2:8, 2:8]
+    assert np.abs(corner.astype(int) - gen_arr[2:8, 2:8].astype(int)).mean() < 5
+    # 内容区贴近红色参考
+    inner = out[24:40, 24:40]
+    assert inner[..., 0].mean() > 120
+
+
+def test_pattern_lock_zero_mask_keeps_generated():
+    """pattern_lock 在 mask 全 0 时不改像素。"""
+    gen = Image.new("RGB", (48, 48), (90, 70, 50))
+    ref = Image.new("RGB", (48, 48), (10, 200, 30))
+    mask = np.zeros((48, 48), dtype=np.uint8)
+    out = reapply_garment_detail(gen, ref, mask, pattern_lock=True)
+    assert np.array_equal(np.array(out), np.array(gen))
+
+
+def test_pattern_lock_reduces_overlay_on_skin():
+    """pattern_lock 对肤色区降权,手臂不被贴上服装色。"""
+    gen_arr = np.full((80, 80, 3), (180, 140, 120), dtype=np.uint8)
+    gen = Image.fromarray(gen_arr, "RGB")
+    ref = Image.fromarray(np.full((80, 80, 3), (40, 40, 160), dtype=np.uint8), "RGB")
+    mask = np.full((80, 80), 255, dtype=np.uint8)
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
+    shift = np.abs(out[20:60, 20:60].astype(int) - gen_arr[20:60, 20:60].astype(int)).mean()
+    assert shift < 40, f"skin overlay shift {shift:.1f} should stay small"
+
+
+def test_pattern_lock_frequency_separation_preserves_pattern():
+    """频率分离: 强光影下花纹高频仍可见(std > 均匀区)。"""
+    ref_arr = np.full((80, 80, 3), 180, dtype=np.uint8)
+    for c in range(0, 80, 4):
+        ref_arr[:, c : c + 2] = 40
+    ref = Image.fromarray(ref_arr, "RGB")
+
+    gen_arr = np.full((80, 80, 3), 128, dtype=np.uint8)
+    gen_arr[:, :40] = 50
+    gen_arr[:, 40:] = 200
+    gen = Image.fromarray(gen_arr, "RGB")
+    mask = np.full((80, 80), 255, dtype=np.uint8)
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=1.0))
+    center = out[30:50, 30:50]
+    assert center.std() > 15, f"high-freq pattern should survive strong lighting: std={center.std():.1f}"

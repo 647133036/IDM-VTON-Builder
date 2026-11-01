@@ -766,14 +766,111 @@ def save_platform_result(
     return out.size[0], len(data)
 
 
+def _pattern_lock_overlay(
+    gen: np.ndarray,
+    ref: np.ndarray,
+    mask_f32: np.ndarray,
+    skin_u8: np.ndarray,
+    light_strength: float,
+) -> Image.Image:
+    """Warp 后的衣覆盖衣服区;生成图只提供褶皱光影(PLTON 频率分离)。
+
+    lighting = clamp(L_gen / L_ref, lighting_min, lighting_max)
+    shade_lf = 1 + (lighting - 1) * light_strength * lf_strength
+    shade_hf = 1 + (lighting - 1) * light_strength * hf_strength
+    lit = LF_ref * shade_lf + HF_ref * shade_hf
+    底色按 lf_strength 调,花纹按 hf_strength 调(默认半强度,保对比度)。
+    light_strength=0 时 lit=cloth_ref(纯贴图,快速回退基准)。
+
+    环境变量:
+      VTON_PATTERN_LOCK_LIGHT_STRENGTH  (1.0)  光照总闸:0=精确 ref,1=全效
+      VTON_PATTERN_LOCK_LF_STRENGTH     (1.0)  底色光照响应系数(1=全强度)
+      VTON_PATTERN_LOCK_HF_STRENGTH     (0.5)  花纹光照响应系数(0=不受光照,1=全强度)
+      VTON_PATTERN_LOCK_LF_BLUR_SIGMA   (8.0)  低频提取高斯 sigma
+      VTON_PATTERN_LOCK_LIGHTING_MIN    (0.75) 亮度比下限(clamp 作用于 lighting)
+      VTON_PATTERN_LOCK_LIGHTING_MAX    (1.25) 亮度比上限
+      VTON_PATTERN_LOCK_SKIN_WEIGHT     (0.85) 肤色降权
+      VTON_PATTERN_LOCK_FEATHER_PX      (5)    mask 边缘羽化像素
+      VTON_PATTERN_LOCK_SKIP_WHITE_BG   (1)    跳过画布边缘连通白底
+      VTON_PATTERN_LOCK_WHITE_THRESH    (245)  白底 RGB 判定阈值
+    """
+    import os
+
+    import cv2
+
+    env_ls = os.environ.get("VTON_PATTERN_LOCK_LIGHT_STRENGTH")
+    ls_val = float(env_ls) if env_ls else light_strength
+    ls = float(np.clip(ls_val, 0.0, 1.0))
+    lf_strength = float(os.environ.get("VTON_PATTERN_LOCK_LF_STRENGTH", "1.0"))
+    hf_strength = float(os.environ.get("VTON_PATTERN_LOCK_HF_STRENGTH", "0.5"))
+    lf_blur = float(os.environ.get("VTON_PATTERN_LOCK_LF_BLUR_SIGMA", "8.0"))
+    light_min = float(os.environ.get("VTON_PATTERN_LOCK_LIGHTING_MIN", "0.75"))
+    light_max = float(os.environ.get("VTON_PATTERN_LOCK_LIGHTING_MAX", "1.25"))
+    skin_w = float(os.environ.get("VTON_PATTERN_LOCK_SKIN_WEIGHT", "0.85"))
+    feather = float(os.environ.get("VTON_PATTERN_LOCK_FEATHER_PX", "5"))
+    skip_white = os.environ.get("VTON_PATTERN_LOCK_SKIP_WHITE_BG", "1") == "1"
+    white_thresh = int(os.environ.get("VTON_PATTERN_LOCK_WHITE_THRESH", "245"))
+
+    if skip_white:
+        ref_u8 = np.clip(ref, 0, 255).astype(np.uint8)
+        near_white = (
+            (ref_u8[..., 0] > white_thresh) & (ref_u8[..., 1] > white_thresh) & (ref_u8[..., 2] > white_thresh)
+        ).astype(np.uint8)
+        _n_labels, labels = cv2.connectedComponents(near_white, connectivity=8)
+        border_ids = set(labels[0].tolist())
+        border_ids.update(labels[-1].tolist())
+        border_ids.update(labels[:, 0].tolist())
+        border_ids.update(labels[:, -1].tolist())
+        border_ids.discard(0)
+        canvas_white = np.isin(labels, list(border_ids)) if border_ids else np.zeros_like(near_white, dtype=bool)
+        content = (~canvas_white).astype(np.float32)[..., None]
+    else:
+        content = np.ones((*ref.shape[:2], 1), dtype=np.float32)
+
+    mask_norm = (mask_f32 / 255.0)[..., None]
+    edge_weight = mask_norm
+    try:
+        dist = cv2.distanceTransform((mask_f32 > 20).astype(np.uint8), cv2.DIST_L2, 5)
+        if float(dist.max()) > 3:
+            edge_fall = np.clip(dist / feather, 0, 1)
+            edge_weight = edge_fall[..., None] * mask_norm
+    except Exception:  # noqa: BLE001
+        pass
+
+    skin_factor = 1.0
+    if skin_u8.any():
+        skin_factor = 1.0 - (skin_u8.astype(np.float32) / 255.0)[..., None] * skin_w
+
+    lf_ref = cv2.GaussianBlur(ref, (0, 0), lf_blur)
+    hf_ref = ref - lf_ref
+
+    gen_gray = gen[..., 0] * 0.299 + gen[..., 1] * 0.587 + gen[..., 2] * 0.114
+    ref_gray = ref[..., 0] * 0.299 + ref[..., 1] * 0.587 + ref[..., 2] * 0.114
+    lighting = np.clip(gen_gray / (ref_gray + 1.0), light_min, light_max)
+
+    shade_lf = 1.0 + (lighting - 1.0) * ls * lf_strength
+    shade_hf = 1.0 + (lighting - 1.0) * ls * hf_strength
+    lit = np.clip(lf_ref * shade_lf[..., None] + hf_ref * shade_hf[..., None], 0, 255)
+
+    alpha = edge_weight * content * skin_factor
+    out = lit * alpha + gen * (1.0 - alpha)
+    return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
+
+
 def reapply_garment_detail(
     generated: Image.Image,
     garment_ref: Image.Image,
     mask_u8: np.ndarray,
     texture_strength: float = 0.70,
     color_strength: float = 0.85,
+    pattern_lock: bool = False,
+    light_strength: float = 1.0,
 ) -> Image.Image:
     """AI 出骨架光影,代码保商品纹理颜色。
+
+    pattern_lock=True: warp 后的 garment_ref 直接覆盖衣服区(锁死花纹/logo),
+    生成图只按亮度比调制褶皱光影;mask 边缘仍衰减,接缝交给生成像素。
+    pattern_lock=False: 高频柔光 + Reinhard 颜色迁移(旧路径)。
 
     四步纯 CPU 后处理(SDXL 生成之后、身份锁之前执行):
 
@@ -809,6 +906,11 @@ def reapply_garment_detail(
         )
     mask_norm = (mask / 255.0)[..., None]
 
+    skin = _detect_skin(gen.astype(np.uint8))
+
+    if pattern_lock:
+        return _pattern_lock_overlay(gen, ref, mask, skin, light_strength)
+
     edge_weight = mask_norm
     try:
         dist = cv2.distanceTransform((mask > 20).astype(np.uint8), cv2.DIST_L2, 5)
@@ -819,19 +921,16 @@ def reapply_garment_detail(
     except Exception:  # noqa: BLE001
         pass
 
+    skin_factor = 1.0
+    if skin.any():
+        skin_factor = 1.0 - (skin.astype(np.float32) / 255.0)[..., None] * 0.85
+
     low_freq = cv2.GaussianBlur(ref, (0, 0), 4.0)
     high_freq = ref - low_freq + 128.0
 
     softlight = gen + (high_freq - 128.0) / 128.0 * gen * (255.0 - gen) / 255.0
     softlight = np.clip(softlight, 0, 255)
-    tex_a = edge_weight * texture_strength
-
-    # 肤色区抑制:短袖 mask=255 含上臂皮肤,SDXL 生成的皮肤不应被贴上服装
-    # 纹理/颜色(否则手臂发白发灰)。检测 mask 区内肤色,将 tex_a 降低 85%。
-    skin = _detect_skin(gen.astype(np.uint8))
-    if skin.any():
-        skin_factor = 1.0 - (skin.astype(np.float32) / 255.0)[..., None] * 0.85
-        tex_a = tex_a * skin_factor
+    tex_a = edge_weight * texture_strength * skin_factor
 
     textured = softlight * tex_a + gen * (1.0 - tex_a)
 
@@ -858,11 +957,7 @@ def reapply_garment_detail(
     corrected_lab = np.clip(corrected_lab, 0, 255).astype(np.uint8)
     corrected_rgb = cv2.cvtColor(corrected_lab, cv2.COLOR_LAB2RGB).astype(np.float32)
 
-    # 步骤4: mask 羽化混合 —— 只动衣服区, 强度由 color_strength 控制。
-    col_a = mask_norm * color_strength
-    # 肤色区同样抑制颜色迁移:手臂皮肤不应被拉向服装颜色。
-    if skin.any():
-        col_a = col_a * skin_factor
+    col_a = mask_norm * color_strength * skin_factor
     out = corrected_rgb * col_a + gen * (1.0 - col_a)
 
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
