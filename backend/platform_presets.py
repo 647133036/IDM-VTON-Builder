@@ -88,6 +88,95 @@ def _detect_face_mask(
     return mask
 
 
+def _heuristic_face_mask(
+    arr: np.ndarray,
+    subject_mask: np.ndarray | None,
+    frac: float = 0.18,
+) -> np.ndarray:
+    """cv2 5.0 兜底:用主体 bbox 顶部 frac 比例估算脸区。返回 uint8 0/1。
+
+    cv2 5.0 移除 CascadeClassifier/CASCADE_SCALE_IMAGE, _detect_face_mask 全走
+    except 返回全零。此函数用 subject_mask(rembg 前景)的 bbox 顶部估算脸区,
+    让 clothing_mask 和 force_white_background 在 cv2 5.0 下仍能保护人脸。
+    """
+    h, w = arr.shape[:2]
+    mask = np.zeros((h, w), dtype=np.uint8)
+    if subject_mask is None:
+        return mask
+    sm = np.asarray(subject_mask, dtype=np.uint8) > 0
+    if not sm.any():
+        return mask
+    ys = np.where(sm.any(axis=1))[0]
+    if len(ys) == 0:
+        return mask
+    y_top = int(ys.min())
+    subj_h = max(1, int(ys.max()) - y_top)
+    face_band = min(h, y_top + int(subj_h * frac))
+    mask[:face_band] = sm[:face_band].astype(np.uint8)
+    return mask
+
+
+def _detect_skin(rgb: np.ndarray) -> np.ndarray:
+    """YCbCr 肤色检测。返回 uint8 0/255,255=肤色。
+
+    标准 YCbCr 肤色范围:Cb 77-127, Cr 133-173。
+    用于 reapply_garment_detail 排除手臂皮肤(防服装纹理贴到皮肤上发白)
+    和 _correct_skin_tone 校正 SDXL 生成肤色。
+    """
+    try:
+        import cv2
+
+        ycbcr = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+        # OpenCV YCrCb 通道顺序: [Y, Cr, Cb]
+        cr = ycbcr[:, :, 1]
+        cb = ycbcr[:, :, 2]
+        skin = ((cb >= 77) & (cb <= 127) & (cr >= 133) & (cr <= 173)).astype(np.uint8) * 255
+        return skin
+    except Exception:  # noqa: BLE001
+        return np.zeros(rgb.shape[:2], dtype=np.uint8)
+
+
+def _correct_skin_tone(
+    original: Image.Image,
+    result: Image.Image,
+) -> Image.Image:
+    """把 result 中肤色像素的色调校正到 original 的肤色色调。
+
+    SDXL 重画手臂皮肤时常丢失原始肤色(发白发灰)。此函数用 YCbCr 肤色检测
+    找到两图的皮肤区,计算 original 肤色均值,把 result 肤色向其偏移。
+    肤色掩码经 GaussianBlur 羽化,避免校正边界硬切。
+    """
+    try:
+        import cv2
+    except ImportError:
+        return result
+
+    orig = np.array(original.convert("RGB"), dtype=np.uint8)
+    res = np.array(result.convert("RGB"), dtype=np.uint8)
+    if orig.shape[:2] != res.shape[:2]:
+        res = np.array(
+            Image.fromarray(res).resize((orig.shape[1], orig.shape[0]), Image.Resampling.LANCZOS),
+            dtype=np.uint8,
+        )
+
+    orig_skin = _detect_skin(orig)
+    res_skin = _detect_skin(res)
+    if not orig_skin.any() or not res_skin.any():
+        return result
+
+    orig_mean = orig[orig_skin > 0].mean(axis=0).astype(np.float32)
+    res_mean = res[res_skin > 0].mean(axis=0).astype(np.float32)
+    shift = orig_mean - res_mean
+    if np.abs(shift).max() < 2:
+        return result
+
+    res_f = res.astype(np.float32)
+    skin_mask = (res_skin > 0).astype(np.float32)
+    skin_mask = cv2.GaussianBlur(skin_mask, (0, 0), 3.0)
+    res_f += shift[None, None, :] * skin_mask[..., None]
+    return Image.fromarray(np.clip(res_f, 0, 255).astype(np.uint8), "RGB")
+
+
 def force_white_background(
     img: Image.Image,
     border_band: int = 8,
@@ -143,6 +232,10 @@ def force_white_background(
     # 宽亮色通路保护:检到脸则把外扩框记下来,各出口处对该区豁免压白。
     # face_guard=False(或检不到脸/无 cv2)时全 0,行为与现状完全一致。
     face_mask = _detect_face_mask(arr, margin_frac=face_margin) if face_guard else np.zeros((h, w), dtype=np.uint8)
+    # cv2 5.0 fallback: CascadeClassifier 被移除,_detect_face_mask 返回全零。
+    # 用 subject_mask bbox 顶部 18% 估算脸区,防止胸口/脖子被压白。
+    if face_guard and not face_mask.any() and subject_mask is not None:
+        face_mask = _heuristic_face_mask(arr, subject_mask)
     try:
         import cv2
 
@@ -368,15 +461,11 @@ def clothing_mask(
     if face is not None and face.any():
         cloth[face > 0] = 0
     else:
-        # Heuristic fallback: cv2 5.0 removed CascadeClassifier/CASCADE_SCALE_IMAGE,
-        # _detect_face_mask returns all zeros. Estimate face as top 18% of subject
-        # bbox — protects face/hair from clothing replacement.
-        ys_early = np.where(subj > 0)[0]
-        if len(ys_early):
-            y_top = int(ys_early.min())
-            subj_h = max(1, int(ys_early.max()) - y_top)
-            face_band = y_top + int(subj_h * 0.18)
-            cloth[:face_band] *= (subj[:face_band] == 0).astype(np.uint8)
+        # cv2 5.0 fallback: CascadeClassifier 被移除,_detect_face_mask 返回全零。
+        # 用主体 bbox 顶部 18% 估算脸区,保护脸/头发不被服装遮罩覆盖。
+        heur = _heuristic_face_mask(arr, subj)
+        if heur.any():
+            cloth[heur > 0] = 0
     ys = np.where(subj > 0)[0]
     y0, y1 = int(ys.min()), int(ys.max())
     span = max(1, y1 - y0)
@@ -608,6 +697,14 @@ def reapply_garment_detail(
     softlight = gen + (high_freq - 128.0) / 128.0 * gen * (255.0 - gen) / 255.0
     softlight = np.clip(softlight, 0, 255)
     tex_a = edge_weight * texture_strength
+
+    # 肤色区抑制:短袖 mask=255 含上臂皮肤,SDXL 生成的皮肤不应被贴上服装
+    # 纹理/颜色(否则手臂发白发灰)。检测 mask 区内肤色,将 tex_a 降低 85%。
+    skin = _detect_skin(gen.astype(np.uint8))
+    if skin.any():
+        skin_factor = 1.0 - (skin.astype(np.float32) / 255.0)[..., None] * 0.85
+        tex_a = tex_a * skin_factor
+
     textured = softlight * tex_a + gen * (1.0 - tex_a)
 
     # 步骤3: Reinhard LAB 颜色迁移(等价颜色直方图匹配)。
@@ -635,6 +732,9 @@ def reapply_garment_detail(
 
     # 步骤4: mask 羽化混合 —— 只动衣服区, 强度由 color_strength 控制。
     col_a = mask_norm * color_strength
+    # 肤色区同样抑制颜色迁移:手臂皮肤不应被拉向服装颜色。
+    if skin.any():
+        col_a = col_a * skin_factor
     out = corrected_rgb * col_a + gen * (1.0 - col_a)
 
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")

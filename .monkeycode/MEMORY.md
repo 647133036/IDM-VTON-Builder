@@ -70,3 +70,44 @@ Entries discovered by the Agent during task execution should follow this format:
     all local component loads use `local_files_only=True` to avoid HF network hangs.
   - The IP-Adapter weight dir is `app/models/sdxl/ip_adapter/`: weight file plus an
     `image_encoder/` (config.json + model.safetensors) must both exist for it to load.
+
+[Project Knowledge Summary]
+- Date: 2026-10-31
+- Context: Discovered by Agent while writing tests for v0.1.4 _detect_face_mask
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - cv2 5.0.0 removed `CascadeClassifier` and `CASCADE_SCALE_IMAGE` from the main
+    namespace. `_detect_face_mask` in `platform_presets.py` silently fails (broad
+    `except Exception` catches `AttributeError`) and returns all zeros.
+  - This means `clothing_mask`'s face subtraction was dead code — the face was never
+    excluded from the clothing replacement region.
+  - Fix applied in `clothing_mask`: when `_detect_face_mask` returns all zeros,
+    estimate face as top 18% of subject bbox and subtract from cloth mask.
+  - Tests that monkeypatch cv2 face detection must use `raising=False` on
+    `monkeypatch.setattr(cv2, "CascadeClassifier", ...)` and also patch
+    `cv2.CASCADE_SCALE_IMAGE` (both absent in cv2 5.0).
+  - cv2 5.0 has `FaceDetectorYN`/`FaceDetectorYN_create` (YuNet DNN detector) as
+    the modern replacement, but it requires a separate ONNX model download.
+
+[Project Knowledge Summary]
+- Date: 2026-11-01
+- Context: Discovered by Agent while fixing v0.1.4 胸口白块 + 手臂变白 defects
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - `force_white_background` had the SAME cv2 5.0 bug as `clothing_mask`:
+    `_detect_face_mask` returns all zeros, so `face_guard` was dead code.
+    Fixed by adding `_heuristic_face_mask` helper (subject bbox top 18%) used
+    by both `clothing_mask` and `force_white_background` when detection fails.
+  - `force_white_background` was called WITHOUT `subject_mask` in
+    `engine_sdxl.py:compose_tryon_sdxl` — light chest pixels connected to
+    background through clothing edges got pressed to white (胸口白块 root cause).
+    Fixed by computing `foreground_mask(human_img)` once and passing to both
+    `clothing_mask` and `force_white_background`.
+  - OpenCV `cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)` returns channels in order
+    [Y, Cr, Cb] — NOT [Y, Cb, Cr]. Swapping these breaks skin detection silently.
+  - `reapply_garment_detail` applies texture AND color to the entire mask=255
+    area including arm skin (手臂变白 root cause). Fixed by detecting skin via
+    YCbCr (Cb 77-127, Cr 133-173) and reducing tex_a/col_a by 85% on skin pixels.
+  - `reapply_garment_detail` final blend `out = corrected_rgb * col_a + gen * (1-col_a)`
+    means `color_strength=0` discards texture too (col_a=0 → out=gen). Tests
+    must use non-zero color_strength to verify texture effects.

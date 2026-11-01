@@ -12,7 +12,10 @@ from PIL import Image
 from platform_presets import (
     PLATFORM_PRESETS,
     PLATFORM_SET,
+    _correct_skin_tone,
     _detect_face_mask,
+    _detect_skin,
+    _heuristic_face_mask,
     apply_platform_preset,
     blend_tryon,
     center_crop_square,
@@ -761,3 +764,217 @@ def test_reapply_edge_falloff_center_stronger_than_edge(monkeypatch):
     center_gap = abs(center_falloff - center_uniform)
     edge_gap = edge_uniform - edge_falloff
     assert edge_gap > center_gap, f"edge effect {edge_gap:.1f} should > center effect {center_gap:.1f}"
+
+
+# ---------------------------------------------------------------------------
+# _detect_skin: YCbCr 肤色检测
+# ---------------------------------------------------------------------------
+
+
+def test_detect_skin_finds_skin_tone():
+    """肤色像素(Cb 77-127, Cr 133-173)被检测为 255,非肤色为 0。"""
+    arr = np.zeros((4, 4, 3), dtype=np.uint8)
+    # 典型肤色 RGB(180,140,120) → YCbCr 约 (148,105,150) → 命中
+    arr[0:2, 0:2] = (180, 140, 120)
+    # 白色背景 → 非肤色
+    arr[2:4, 2:4] = (255, 255, 255)
+    skin = _detect_skin(arr)
+    assert skin[0, 0] == 255
+    assert skin[3, 3] == 0
+
+
+def test_detect_skin_returns_zeros_on_error(monkeypatch):
+    """cv2.cvtColor 异常时返回全零(安全回退)。"""
+    import cv2
+
+    def _fail(*a, **kw):
+        raise Exception("simulated failure")
+
+    monkeypatch.setattr(cv2, "cvtColor", _fail)
+    arr = np.zeros((10, 10, 3), dtype=np.uint8)
+    skin = _detect_skin(arr)
+    assert skin.shape == (10, 10)
+    assert not skin.any()
+
+
+# ---------------------------------------------------------------------------
+# _heuristic_face_mask: subject bbox 顶部估算脸区
+# ---------------------------------------------------------------------------
+
+
+def test_heuristic_face_mask_top_18_percent():
+    """主体 bbox 顶部 18% 被标记为脸区,其余为 0。"""
+    arr = np.zeros((200, 100, 3), dtype=np.uint8)
+    subj = np.zeros((200, 100), dtype=np.uint8)
+    subj[50:190, 20:80] = 1  # subject from y=50 to y=190
+    mask = _heuristic_face_mask(arr, subj, frac=0.18)
+    # face_band = 50 + (190-50)*0.18 = 50 + 25 = 75
+    assert mask[60, 40] == 1  # within top 18% of subject
+    assert mask[80, 40] == 0  # below face band
+    assert mask[10, 40] == 0  # above subject → not face
+
+
+def test_heuristic_face_mask_none_subject():
+    """subject_mask=None 时返回全零。"""
+    arr = np.zeros((100, 100, 3), dtype=np.uint8)
+    mask = _heuristic_face_mask(arr, None)
+    assert not mask.any()
+
+
+def test_heuristic_face_mask_empty_subject():
+    """主体为空时返回全零。"""
+    arr = np.zeros((100, 100, 3), dtype=np.uint8)
+    subj = np.zeros((100, 100), dtype=np.uint8)
+    mask = _heuristic_face_mask(arr, subj)
+    assert not mask.any()
+
+
+# ---------------------------------------------------------------------------
+# force_white_background + subject_mask + heuristic face: 胸口白块修复
+# ---------------------------------------------------------------------------
+
+
+def test_force_white_background_subject_mask_protects_chest():
+    """subject_mask 保护主体:胸口浅色区域不被压白。
+
+    无 subject_mask 时,胸口浅色(亮度 200+)若与背景连通会被压白。
+    传 subject_mask 后主体区豁免,胸口原色保留。
+    """
+    # 米色背景 + 主体(深色框 + 浅色胸口区)
+    arr = np.full((200, 200, 3), (185, 168, 152), dtype=np.uint8)
+    arr[40:160, 60:140] = (80, 80, 80)  # 主体框(深色)
+    arr[60:90, 70:130] = (230, 225, 220)  # 胸口浅色区(亮度 ~225)
+    img = Image.fromarray(arr, "RGB")
+    subj = np.zeros((200, 200), dtype=np.uint8)
+    subj[40:160, 60:140] = 1  # 主体区
+
+    out_with = np.array(force_white_background(img, subject_mask=subj))
+    out_without = np.array(force_white_background(img, subject_mask=None))
+
+    # 胸口区(row 70, col 100): 有 subject_mask 时保留原色(~225)
+    chest_with = out_with[75, 100].mean()
+    chest_without = out_without[75, 100].mean()
+    # 有保护时胸口亮度应低于无保护时(无保护可能被压向 255)
+    assert chest_with <= chest_without + 5
+
+
+def test_force_white_background_heuristic_face_when_detection_fails(monkeypatch):
+    """cv2 5.0 下 _detect_face_mask 返回全零,heuristic 兜底保护脸/胸口区。"""
+    # 让 _detect_face_mask 返回全零(模拟 cv2 5.0)
+    monkeypatch.setattr(
+        "platform_presets._detect_face_mask",
+        lambda *a, **kw: np.zeros((200, 200), dtype=np.uint8),
+    )
+    arr = np.full((200, 200, 3), (190, 175, 160), dtype=np.uint8)
+    arr[40:160, 60:140] = (80, 80, 80)  # 主体框
+    arr[50:70, 70:130] = (220, 215, 210)  # 脸区(浅色,与背景亮度接近)
+    img = Image.fromarray(arr, "RGB")
+    subj = np.zeros((200, 200), dtype=np.uint8)
+    subj[40:160, 60:140] = 1
+
+    out = np.array(force_white_background(img, subject_mask=subj))
+    # 脸区(row 55, col 100): heuristic 保护 top 18% = 40+22=62,
+    # row 55 在 [40,62) 内,应被保护不被压白
+    face_region = out[55, 100].mean()
+    # 背景区(row 10, col 10): 应被压白
+    bg_region = out[10, 10].mean()
+    assert bg_region > 250  # 背景压白
+    # 脸区不被完全压白(原色 220, heuristic 保护)
+    assert face_region < 255 or face_region > 240  # 保留原色或接近
+
+
+# ---------------------------------------------------------------------------
+# _correct_skin_tone: SDXL 生成肤色校正
+# ---------------------------------------------------------------------------
+
+
+def test_correct_skin_tone_shifts_toward_original():
+    """result 肤色向 original 肤色偏移。"""
+    # original 肤色 RGB(180,140,120)
+    orig = np.full((50, 50, 3), (220, 220, 220), dtype=np.uint8)
+    orig[10:40, 10:40] = (180, 140, 120)  # 肤色区
+    # result 肤色偏白 RGB(210,190,180)
+    res = np.full((50, 50, 3), (220, 220, 220), dtype=np.uint8)
+    res[10:40, 10:40] = (210, 190, 180)  # 偏白肤色
+
+    orig_img = Image.fromarray(orig, "RGB")
+    res_img = Image.fromarray(res, "RGB")
+    out = np.array(_correct_skin_tone(orig_img, res_img))
+
+    # 肤色区应向 original 偏移: R 从 210 向 180 靠近
+    assert out[25, 25, 0] < 210, f"R should shift toward 180, got {out[25, 25, 0]}"
+    # 背景区基本不变(GaussianBlur 可能有 ±1 精度抖动)
+    assert abs(out[0, 0, 0].astype(int) - 220) <= 1
+
+
+def test_correct_skin_tone_no_skin_returns_unchanged():
+    """无肤色时原样返回。"""
+    orig = Image.fromarray(np.full((50, 50, 3), (255, 0, 0), dtype=np.uint8), "RGB")
+    res = Image.fromarray(np.full((50, 50, 3), (0, 255, 0), dtype=np.uint8), "RGB")
+    out = _correct_skin_tone(orig, res)
+    out_arr = np.array(out)
+    assert (out_arr == np.array(res)).all()
+
+
+def test_correct_skin_tone_close_match_returns_unchanged():
+    """original 与 result 肤色接近(差 < 2)时原样返回。"""
+    skin = (180, 140, 120)
+    orig = np.full((50, 50, 3), skin, dtype=np.uint8)
+    res = np.full((50, 50, 3), skin, dtype=np.uint8)
+    # 微小差异(1)
+    res[10:40, 10:40] = (181, 141, 121)
+    out = _correct_skin_tone(Image.fromarray(orig, "RGB"), Image.fromarray(res, "RGB"))
+    out_arr = np.array(out)
+    # shift < 2 → 不校正
+    assert abs(out_arr[25, 25, 0].astype(int) - 181) <= 1
+
+
+# ---------------------------------------------------------------------------
+# reapply_garment_detail: 肤色区纹理抑制
+# ---------------------------------------------------------------------------
+
+
+def test_reapply_garment_detail_reduces_texture_on_skin():
+    """mask 内肤色区纹理变化 < 非肤色区(手臂皮肤不应被贴服装纹理)。
+
+    color_strength 必须非零:reapply 的最终输出 out = corrected_rgb * col_a + gen * (1-col_a),
+    col_a=0 时 out=gen 纹理也丢失。用 color_strength=0.5 让纹理+颜色都生效。
+    """
+    rng = np.random.default_rng(42)
+    # ref 有随机高频纹理
+    ref = Image.fromarray(rng.integers(0, 256, (100, 100, 3), dtype=np.uint8), "RGB")
+    # gen 上半部分是肤色, 下半部分是服装色
+    gen_arr = np.full((100, 100, 3), 128, dtype=np.uint8)
+    # 肤色 RGB(180,140,120) → 上半
+    gen_arr[0:50, :] = (180, 140, 120)
+    # 服装色 RGB(60,60,120) → 下半
+    gen_arr[50:100, :] = (60, 60, 120)
+    gen = Image.fromarray(gen_arr, "RGB")
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[10:90, 10:90] = 255  # 整个区域都在 mask 内
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, texture_strength=1.0, color_strength=0.5))
+
+    gen_native = np.array(gen)
+    # 肤色区(row 30)纹理变化应远小于服装区(row 70)
+    skin_change = np.abs(out[25:35, 40:60].astype(int) - gen_native[25:35, 40:60].astype(int)).mean()
+    cloth_change = np.abs(out[65:75, 40:60].astype(int) - gen_native[65:75, 40:60].astype(int)).mean()
+    assert cloth_change > skin_change * 2, f"cloth change {cloth_change:.1f} should >> skin change {skin_change:.1f}"
+
+
+def test_reapply_garment_detail_skin_color_not_shifted():
+    """mask 内肤色区颜色迁移被抑制(肤色不被拉向服装颜色)。"""
+    # gen 肤色 RGB(180,140,120), ref 服装色 RGB(60,60,120)
+    gen_arr = np.full((100, 100, 3), (180, 140, 120), dtype=np.uint8)
+    gen_arr[40:60, 40:60] = (180, 140, 120)  # 全肤色
+    gen = Image.fromarray(gen_arr, "RGB")
+    ref = Image.fromarray(np.full((100, 100, 3), (60, 60, 120), dtype=np.uint8), "RGB")
+    mask = np.zeros((100, 100), dtype=np.uint8)
+    mask[20:80, 20:80] = 255
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, texture_strength=0.0, color_strength=0.85))
+
+    gen_native = np.array(gen)
+    # 肤色区颜色变化应很小(被抑制 85%)
+    color_shift = np.abs(out[40:60, 40:60].astype(int) - gen_native[40:60, 40:60].astype(int)).mean()
+    assert color_shift < 15, f"skin color shift {color_shift:.1f} should be small (<15)"

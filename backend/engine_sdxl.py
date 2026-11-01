@@ -9,10 +9,12 @@ from pathlib import Path
 
 from PIL import Image
 from platform_presets import (
+    _correct_skin_tone,
     blend_tryon,
     clothing_mask,
     detect_garment_extent,
     force_white_background,
+    foreground_mask,
     reapply_garment_detail,
 )
 
@@ -835,9 +837,20 @@ def compose_tryon_sdxl(
     # (blend_tryon 在此贴回原图像素保身份)。两者互补:reapply 管衣服保真,
     # 身份锁管人脸不走形。任一开关开启才算 mask,都关时跳过省一次推理。
     need_mask = os.environ.get("VTON_DETAIL", "1") != "0" or os.environ.get("VTON_LOCK_ID", "1") != "0"
+    # subject_mask(rembg 前景)算一次,复用给 clothing_mask 和 force_white_background:
+    # clothing_mask 用它做 cv2 5.0 启发式脸区兜底; force_white_background 用它
+    # 保护主体(含胸口/脖子)不被压白——不传时 cv2 5.0 下胸口白块根因。
+    subj_mask = foreground_mask(human_img) if need_mask or background == "white" else None
     # garment_extent 已在函数开头检测(用于 auto 推断),此处直接复用。
     shared_mask = (
-        clothing_mask(human_img, garment_type=garment_type, garment_extent=garment_extent) if need_mask else None
+        clothing_mask(
+            human_img,
+            garment_type=garment_type,
+            garment_extent=garment_extent,
+            subject_mask=subj_mask,
+        )
+        if need_mask
+        else None
     )
 
     # 商品细节回贴:AI 出骨架光影,代码保原衣纹理颜色。
@@ -860,6 +873,14 @@ def compose_tryon_sdxl(
         result = blend_tryon(human_img, result, shared_mask)
         lock_identity = True
 
+    # 肤色校正:SDXL 重画手臂皮肤常丢失原始肤色(发白发灰)。
+    # 检测 result 中肤色像素,把色调向 human_img 原始肤色偏移。
+    if lock_identity:
+        try:
+            result = _correct_skin_tone(human_img, result)
+        except Exception:  # noqa: BLE001
+            logger.debug("_correct_skin_tone failed; using raw blend result")
+
     if background == "transparent":
         result = _remove_background(result)
     elif background == "white":
@@ -870,7 +891,7 @@ def compose_tryon_sdxl(
             bg = PILImage.new("RGB", result.size, (255, 255, 255))
             bg.paste(result, mask=result.split()[-1])
             result = bg
-        result = force_white_background(result)
+        result = force_white_background(result, subject_mask=subj_mask)
 
     rw, rh = result.size
     scale = long_side / max(rw, rh)
