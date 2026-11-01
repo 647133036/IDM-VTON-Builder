@@ -1,10 +1,38 @@
-# Atelier v0.1.4
+# Atelier v0.1.5
 
 店铺后台固定底图换衣工作台。选一张模特底图，批量拖入服装平铺图，队列生成正面成品，下载或推送到商品页。界面内置中英文一键切换。
 
-## v0.1.4 更新日志
+**基本运行条件：8 核 CPU / 32GB 内存 / NVIDIA A10（24GB 显存）。** SDXL 商用管线（ControlNet + IP-Adapter + LoRA）按此规格验证；无 GPU 时自动降级合成引擎，效果有限。
 
-本轮版本解决三个出图致命缺陷：**换图案**（SDXL 不按原衣图案画）、**衣袖截断**（长袖只画到腰）、**胸口深 V / 肩膀重影**（脸区遮罩吞掉胸口、高频纹理在肩臂交界叠成重影）。同时引入商业级换衣流程的动态遮罩与无缝贴回。
+## v0.1.5 更新日志
+
+本轮把换衣后遗症当图像修复问题处理：胸口白块（领口接缝融合失败）、手臂变白（短袖 mask 把上臂当生成区、SDXL 重画丢肤色）、上衣沿裤腰齐边剪（mask 固定百分比截断）。CPU 层立刻生效；SDXL Inpainting 二次修复按需开启。
+
+### 修改了什么
+
+| 缺陷 | 根因 | 本轮改动 |
+|------|------|----------|
+| **胸口白块** | `force_white_background` 未传主体 mask；cv2 5.0 人脸检测全零，脸/脖子豁免失效；领口接缝硬拼 | 主体 mask 算一次，同时传给 `clothing_mask` 和 `force_white_background`；heuristic 脸区（主体 bbox 顶 18%）兜底；`_seam_repair` 对 mask 边界 8px 带做 Telea inpaint |
+| **手臂变白** | 短袖 mask=255 含上臂，`reapply` 把衣料纹理贴到皮肤，SDXL 重画肤色 | 短袖/无袖从主体外侧 25% 减去 YCbCr 肤色（原图手臂保留）；`reapply` 对肤色区降 85% 纹理/颜色；`_correct_skin_tone` 把生成肤色拉向原图 |
+| **上衣齐裤腰裁** | 上衣 mask 按主体高度 62% 横切，裤腰以下贴回原图 | 已看 `hem`：长款 80% 垂过裤腰；短袖齐腰仍 62%。OpenPose 腰点仍未用于裁切 |
+
+### 增加了什么
+
+- **`_heuristic_face_mask`**：cv2 5.0 去掉 `CascadeClassifier` 后，用主体 bbox 顶 18% 估脸区，`clothing_mask` 与 `force_white_background` 共用。
+- **`_detect_skin` / `_correct_skin_tone`**：YCbCr 肤色（Cb 77–127，Cr 133–173）。注意 OpenCV `COLOR_RGB2YCrCb` 通道顺序是 `[Y, Cr, Cb]`。
+- **`_seam_repair`**：`blend_tryon` 之后对 mask 边界 dilate-erode 带做 `cv2.INPAINT_TELEA`，用周边像素填接缝。
+- **`_sdxl_inpaint_repair`**：`VTON_INPAINT_REPAIR=1` 且 `models/sdxl/sdxl_inpaint/` 有权重时，用官方 inpaint 模型低降噪（0.35）局部重绘。无权重时跳过。
+- **短袖手臂保护**：`clothing_mask` 仅在 `upper`+短袖/无袖时从主体水平外侧 25% 抠肤色；长袖不抠，袖子仍可盖手臂。
+
+### 完善了什么
+
+- 管线顺序：`reapply` → `blend_tryon` → `_seam_repair` → `_correct_skin_tone` → `_sdxl_inpaint_repair` → `force_white_background(subject_mask)`。
+- 品类：前端选大类（`auto` / 上衣 / 裙装 / 下装 / 连体）；短袖/长袖/无袖、齐腰/过腰由后端 `detect_garment_extent` 从平铺图几何推断。`auto`：aspect>1.6→连衣裙，<0.7→裤子，其余→上衣。
+- 单测：239 passed / 1 skipped（新增肤色检测、heuristic 脸区、接缝 inpaint、短袖排除手臂、Inpainting 骨架）。
+
+## v0.1.4 更新日志（历史）
+
+v0.1.4 解决换图案、衣袖截断、胸口深 V / 肩膀重影，并引入动态遮罩与 SeamlessClone。Canny 按品类 0.55/0.45，IP-Adapter 0.9，texture_strength 0.70；`detect_garment_extent` + 按 hem/sleeve 裁 mask；`blend_tryon` 连通分量 SeamlessClone。
 
 ### 解决了什么问题
 
@@ -66,7 +94,8 @@ v0.1.3 引入「AI 出骨架光影，代码保商品细节」混合生成策略�
 - 成品大图预览弹窗，左右对照原图与成品
 - 界面中英文一键切换，语言偏好本地持久化
 - 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底）
-- **v0.1.4 新增**：动态袖长检测 + 动态遮罩 + SeamlessClone 无缝贴回 + Canny/IP-Adapter/texture 权重提升
+- **v0.1.5**：胸口白块 / 手臂变白修复（主体 mask 压白保护、短袖排除手臂肤色、Telea 接缝、肤色校正）；可选 SDXL Inpainting 二次修复
+- **v0.1.4**：动态袖长检测 + 动态遮罩 + SeamlessClone + Canny/IP-Adapter/texture 权重提升
 
 ## 安全
 
@@ -97,15 +126,18 @@ v0.1.3 引入「AI 出骨架光影，代码保商品细节」混合生成策略�
 
 **上传**：PNG / JPEG / WEBP，最大 20MB，任意尺寸
 
-**生成处理（v0.1.4 商业级流程）**：
-1. `detect_garment_extent` 分析衣料袖长/衣长
+**生成处理（v0.1.5 商业级流程）**：
+1. `detect_garment_extent` 分析衣料袖长/衣长；`auto` 按 aspect 推断品类
 2. `crop_garment_to_content` 裁剪主体
 3. `align_garment_to_pose` 几何对齐送 IP-Adapter
 4. ControlNet（OpenPose 0.8 + Canny 0.55 锁图案 + Depth 0.95）+ IP-Adapter 0.9
 5. SDXL 生成姿态/光影/人体
-6. `reapply_garment_detail` 边缘衰减贴回纹理 + Reinhard 颜色迁移（texture_strength 0.70）
-7. `blend_tryon` 动态 mask + SeamlessClone 无缝贴回脸/手/脚
-8. `force_white_background` 纯白底
+6. `reapply_garment_detail` 边缘衰减贴回纹理；肤色区降 85% 强度
+7. `blend_tryon` 动态 mask + SeamlessClone 贴回脸/手/脚（短袖手臂为 mask=0）
+8. `_seam_repair` Telea 填 mask 边界接缝
+9. `_correct_skin_tone` 生成肤色拉向原图
+10. `_sdxl_inpaint_repair`（可选）低降噪局部重绘
+11. `force_white_background(subject_mask)` 纯白底，主体/胸口不压白
 
 **输出**：长边 2048px，宽高比跟随底座图
 
@@ -143,6 +175,17 @@ export STORE_ADMIN_PASSWORD="your-secure-password"
 export STORE_STAFF_PASSWORD="your-secure-password"
 ```
 
+## 运行条件
+
+| 项目 | 规格 |
+|------|------|
+| CPU | 8 核 |
+| 内存 | 32GB |
+| GPU | NVIDIA A10（24GB 显存） |
+| 系统 | Linux，CUDA 驱动与 PyTorch 匹配 |
+
+A10 上 SDXL + 双 ControlNet + IP-Adapter 使用 `enable_model_cpu_offload`，VAE fp32 解码。低于此规格可跑合成引擎或关 Depth ControlNet。训练 LoRA 同样按 A10 23GB 验证（约 11 分钟 / 800 步）。
+
 ## GPU 部署（商用模式）
 
 ```bash
@@ -178,7 +221,7 @@ MODEL=lora_family bash run_train.sh  # 服装 + 人像双 LoRA
 
 ## 多店铺与推送
 
-### CSV/SKU 批量推送（v0.1.4）
+### CSV/SKU 批量推送
 
 - 任务队列页「导出 CSV+图」按钮：POST `/api/jobs/export-csv` 下载 ZIP（CSV 清单 + 成品图）
 - 店铺卡片「批量推送」按钮：上传 CSV/ZIP，POST `/api/stores/{id}/batch-push` 批量推送
@@ -199,13 +242,13 @@ MODEL=lora_family bash run_train.sh  # 服装 + 人像双 LoRA
 <iframe src="/embed.html?store=STORE_ID" style="width:100%;min-height:720px;border:0"></iframe>
 ```
 
-## SDXL 引擎环境变量（v0.1.4）
+## SDXL 引擎环境变量（v0.1.5）
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `VTON_AR` | `1` | 保宽高比 letterbox |
 | `VTON_WARP` | `1` | 几何对齐 |
-| `VTON_DETAIL` | `1` | 商品细节回贴（边缘衰减） |
+| `VTON_DETAIL` | `1` | 商品细节回贴（边缘衰减；肤色区降权） |
 | `VTON_LOCK_ID` | `1` | 身份锁（SeamlessClone） |
 | `VTON_LORA` | `0.7` | LoRA scale |
 | `VTON_IPA` | `0.9` | IP-Adapter 参考强度 |
@@ -213,11 +256,12 @@ MODEL=lora_family bash run_train.sh  # 服装 + 人像双 LoRA
 | `VTON_GUIDANCE` | `7.5` | CFG guidance scale |
 | `VTON_SEED` | `42` | 随机种子 |
 | `VTON_PROMPT_HINT` | 空 | 额外 prompt 钩子 |
+| `VTON_INPAINT_REPAIR` | `0` | 设为 `1` 且已放置 `models/sdxl/sdxl_inpaint/` 时启用 SDXL Inpainting 二次修复 |
 
 ## 测试
 
 ```bash
-# 后端（203 passed / 1 skipped）
+# 后端（239 passed / 1 skipped）
 cd backend
 python3 -m pytest tests/ -q
 
@@ -230,18 +274,18 @@ ruff check backend/ training/
 ruff format --check backend/ training/
 ```
 
-覆盖：单元（引擎/人种/CRUD/JWT/推送/worker/LoRA/并发/训练几何）、平台适配（clothing_mask/blend_tryon/reapply/detect_garment_extent）、组件（i18n/render）、集成（全 API 链路）、系统（真实 worker 出图）
+覆盖：单元（引擎/人种/CRUD/JWT/推送/worker/LoRA/并发/训练几何）、平台适配（clothing_mask/blend_tryon/reapply/detect_garment_extent/肤色/接缝 inpaint）、组件（i18n/render）、集成（全 API 链路）、系统（真实 worker 出图）
 
 ## 目录结构
 
 ```text
 backend/
   engine.py               合成引擎（CPU 兜底）
-  engine_sdxl.py           SDXL 商用引擎（几何对齐 + ControlNet + IP-Adapter + 动态遮罩 + 细节回贴 + SeamlessClone）
-  platform_presets.py      平台店规 + detect_garment_extent + clothing_mask + blend_tryon + reapply_garment_detail
+  engine_sdxl.py           SDXL 商用引擎（对齐 + ControlNet + IP-Adapter + 动态遮罩 + 接缝/肤色后处理）
+  platform_presets.py      店规 + detect_garment_extent + clothing_mask + blend_tryon + reapply + seam/skin
   export_csv.py            CSV/SKU 批量导出
   lora_io.py               LoRA 加载（PEFT 优先）
-  tests/                   pytest（203 passed）
+  tests/                   pytest（239 passed）
 src/                       前端 SPA + i18n
 training/                  SDXL LoRA / ControlNet 训练脚本
 models/sdxl/lora/          LoRA 权重（120 张训练，rank 16）
