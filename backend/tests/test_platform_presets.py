@@ -676,6 +676,29 @@ def test_estimate_waist_ratio_narrowed_detects_waist():
     assert 0.45 <= ratio <= 0.58
 
 
+def test_estimate_waist_ratio_median_fallback():
+    """宽度变化 < 5%(无明显收腰)→ 回退 0.62。"""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:60, 20:100] = 1
+    subj[60:100, 21:99] = 1
+    subj[100:140, 20:100] = 1
+    subj[140:180, 20:100] = 1
+    ratio = _estimate_waist_ratio(subj, 20, 160)
+    assert ratio == 0.62
+
+
+def test_estimate_waist_ratio_asymmetric_fallback():
+    """最窄点左右严重不对称(一侧裁切)→ 回退 0.62。"""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:60, 20:100] = 1
+    subj[60:90, 35:85] = 1
+    subj[90:110, 60:75] = 1
+    subj[110:140, 35:85] = 1
+    subj[140:180, 25:95] = 1
+    ratio = _estimate_waist_ratio(subj, 20, 160)
+    assert ratio == 0.62
+
+
 def test_clothing_mask_waist_aware_cut():
     """有收腰的主体,腰线裁切跟随实际腰线(非固定 0.62)。"""
     subj_w = np.zeros((200, 120), dtype=np.uint8)

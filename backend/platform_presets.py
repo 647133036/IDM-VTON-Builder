@@ -626,8 +626,9 @@ def detect_garment_extent(garment: Image.Image) -> dict:
 def _estimate_waist_ratio(subj: np.ndarray, y0: int, span: int) -> float:
     """从主体 mask 行宽分布估算腰线占身高的比例。
 
-    在躯干区(30%-75% 身高)找行宽最小点作为腰线。
-    无明显收腰(min/max > 0.85)时回退 0.62,与 v0.1.6 固定比例一致。
+    在躯干区(30%-75% 身高)找行宽最小点作为腰线。两层保护:
+    1. 中位宽度过近(min/median > 0.95,即 < 5% 差异)→ 无明显收腰,回退 0.62
+    2. 最窄点左右不对称(一侧被裁切/遮挡)→ 不可信,回退 0.62
     """
     h = subj.shape[0]
     torso_top = y0 + int(span * 0.30)
@@ -641,9 +642,19 @@ def _estimate_waist_ratio(subj: np.ndarray, y0: int, span: int) -> float:
     smooth = np.convolve(widths, kernel, mode="valid")
     min_idx = int(np.argmin(smooth)) + 2
     min_w = float(smooth.min())
-    max_w = float(smooth.max())
-    if max_w > 0 and min_w / max_w > 0.85:
+    median_w = float(np.median(smooth))
+    if median_w > 0 and min_w / median_w > 0.95:
         return 0.62
+    waist_row = torso_top + min_idx
+    all_cols = np.where(subj.any(axis=0))[0]
+    if len(all_cols) > 0 and 0 <= waist_row < h:
+        body_center = (float(all_cols[0]) + float(all_cols[-1])) / 2
+        waist_cols = np.where(subj[waist_row] > 0)[0]
+        if len(waist_cols) > 4:
+            left = body_center - float(waist_cols[0])
+            right = float(waist_cols[-1]) - body_center
+            if max(left, right) > 0 and abs(left - right) / max(left, right) > 0.30:
+                return 0.62
     ratio = (torso_top + min_idx - y0) / max(1, span)
     return float(np.clip(ratio, 0.45, 0.75))
 
