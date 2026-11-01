@@ -340,3 +340,26 @@ def test_align_garment_to_pose_dress_differs_from_upper():
     upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024))
     dress = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "dress", 1024))
     assert not np.array_equal(upper, dress)
+
+
+def test_align_garment_to_pose_lower_narrower_than_upper():
+    """lower 用 hem 宽度(髋宽)而非 shoulder, 结果比 upper 窄。"""
+    import engine_sdxl
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    garment = Image.new("RGBA", (500, 700), (0, 0, 0, 0))
+    d = ImageDraw.Draw(garment)
+    d.rectangle([120, 100, 380, 620], fill=(60, 140, 90, 255))
+    g = garment.convert("RGB")
+    upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024))
+    lower = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "lower", 1024))
+
+    # 非白内容列
+    upper_cols = np.where(upper.mean(axis=(0, 2)) < 240)[0]
+    lower_cols = np.where(lower.mean(axis=(0, 2)) < 240)[0]
+    assert len(upper_cols) > 0
+    assert len(lower_cols) > 0
+    upper_width = upper_cols[-1] - upper_cols[0]
+    lower_width = lower_cols[-1] - lower_cols[0]
+    assert lower_width < upper_width

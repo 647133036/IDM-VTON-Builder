@@ -47,10 +47,10 @@ def torso_box(audience: str, ethnicity: str) -> dict:
 
 
 GARMENT_BOX = {
-    "upper": dict(y=0.00, h=1.00),
-    "dress": dict(y=0.00, h=1.55),
-    "lower": dict(y=0.92, h=0.95),
-    "onesie": dict(y=0.00, h=1.35),
+    "upper": dict(y=0.00, h=1.00, w="shoulder"),
+    "dress": dict(y=0.00, h=1.55, w="shoulder"),
+    "lower": dict(y=0.92, h=0.95, w="hem"),
+    "onesie": dict(y=0.00, h=1.35, w="shoulder"),
 }
 
 # 简易 2D 变形的强度(0~1):越大越贴合模特轮廓。纯 CPU,不依赖 GPU。
@@ -329,10 +329,13 @@ def _garment_bbox(img: Image.Image, alpha_thresh: int = 35) -> tuple[int, int, i
 
 
 def fit_garment_to_body(garment: Image.Image, box: dict, tw: int, th: int) -> Image.Image:
-    """按衣料实测宽度等比缩放到模特肩宽,保留衣料真实长宽比。
+    """按衣料实测宽度等比缩放到目标体宽,保留衣料真实长宽比。
 
     解决「衣服宽、模特窄」:不再强行铺满躯干框,而是把衣料自身宽度
-    映射到肩宽,使其完美落在模特身上;窄衣料也不会被拉宽。
+    映射到目标体宽,使其完美落在模特身上;窄衣料也不会被拉宽。
+
+    目标体宽由 box["width_key"] 决定(默认 shoulder):上衣/连衣裙用肩宽,
+    下装用 hem(髋宽),避免裤子被缩放到肩宽过宽。
     """
     bbox = _garment_bbox(garment)
     if bbox is None:
@@ -342,7 +345,9 @@ def fit_garment_to_body(garment: Image.Image, box: dict, tw: int, th: int) -> Im
     gh = by1 - by0 + 1
     if gw < 4 or gh < 4:
         return fit_garment(garment, (tw, th))
-    target_w = max(1.0, box["shoulder"] * tw)
+    width_key = box.get("width_key", "shoulder")
+    width_ratio = box.get(width_key, box["shoulder"])
+    target_w = max(1.0, width_ratio * tw)
     scale = target_w / gw
     min_scale = (th * 0.55) / gh
     scale = max(min_scale, scale)
@@ -380,6 +385,7 @@ def _composite_engine(
     adj = GARMENT_BOX.get(garment_type, GARMENT_BOX["upper"])
     box["y"] = box["y"] + adj["y"] * box["h"]
     box["h"] = box["h"] * adj["h"]
+    box["width_key"] = adj.get("w", "shoulder")
 
     tx = int(box["x"] * w)
     ty = int(box["y"] * h)

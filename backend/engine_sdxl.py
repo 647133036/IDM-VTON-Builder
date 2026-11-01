@@ -412,6 +412,7 @@ def align_garment_to_pose(
     adj = GARMENT_BOX.get(garment_type, GARMENT_BOX["upper"])
     box["y"] = box["y"] + adj["y"] * box["h"]
     box["h"] = box["h"] * adj["h"]
+    box["width_key"] = adj.get("w", "shoulder")
     base_strength = GARMENT_WARP_STRENGTH.get(garment_type, 0.42)
     raw = os.environ.get("VTON_WARP_STRENGTH", "").strip()
     try:
