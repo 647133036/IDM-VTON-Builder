@@ -434,8 +434,9 @@ GET  /api/health  /api/license
 
 ## 感谢
 
-- [IDM-VTON](https://github.com/yisol/IDM-VTON) — 虚拟试衣模型（ECCV 2024）。本项目借鉴其 garment warp 思路，但未使用其权重（CC BY-NC-SA 4.0 禁止商用）
-- [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose) — 实时人体关键点检测。本项目用 RTMPose-m（COCO 17 点）做腰线 shoulder→hip 插值和 dress knee 截断，CPU 推理
+- [IDM-VTON](https://github.com/yisol/IDM-VTON) — **Improving Diversity and Accuracy of Virtual Try-On via the Body Part-Aware Pipeline**（ECCV 2024）。本项目借鉴其 garment warp 思路，但未使用其权重（CC BY-NC-SA 4.0 禁止商用）
+- [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose) — **RTMPose: Real-Time Multi-Person Pose Estimation framework based on MMPose**（arXiv:2306.06029）。本项目用 RTMPose-m（COCO 17 点）做腰线 shoulder→hip 插值和 dress knee 截断，CPU 推理
+- [PLTON](https://arxiv.org/abs/2401.11239) — **Frequency-Aware Virtual Try-On with High-Fidelity Detail Preservation**。本项目借鉴其 LF/HF 频率分离思想，在 SDXL 管线的 CPU 后处理层实现底色全强度调光 + 花纹半强度调光
 - [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) — 商用换衣管线的生成底座，ControlNet + IP-Adapter 条件注入
 - [ControlNet](https://github.com/lllyasviel/ControlNet) — 姿态引导（OpenPose 0.8）+ 图案锁定（Canny 0.55）+ 深度约束（Depth 0.95）
 - [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter) — 服装特征注入（weight 0.9），把平铺图样式带入生成结果
