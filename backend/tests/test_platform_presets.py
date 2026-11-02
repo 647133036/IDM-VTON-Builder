@@ -743,12 +743,30 @@ def test_estimate_waist_ratio_pose_low_visibility_falls_back():
 
 
 def test_estimate_waist_ratio_pose_out_of_range_falls_back():
-    """插值后 waist ratio 超出 [0.40, 0.75] → 回退轮廓法。"""
+    """插值后 waist ratio 超出 [0.45, 0.65] → 回退轮廓法。"""
     subj = np.zeros((200, 120), dtype=np.uint8)
     subj[20:180, 20:100] = 1
     # shoulder y=0.50*200=100, hip y=1.0*200=200
-    # waist = 100 + (200-100)*0.55 = 155 → ratio = (155-20)/160 = 0.844 > 0.75
+    # waist = 100 + (200-100)*0.55 = 155 → ratio = (155-20)/160 = 0.844 > 0.65
     kp = {"hip": (0.5, 1.0, 0.9), "shoulder": (0.5, 0.50, 0.9), "knee": (0.5, 0.95, 0.8)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    assert ratio == 0.62
+
+
+def test_estimate_waist_ratio_geom_hip_above_shoulder_falls_back():
+    """hip 不低于 shoulder+5% → 几何不一致, 回退轮廓法."""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    kp = {"hip": (0.5, 0.30, 1.0), "shoulder": (0.5, 0.40, 1.0), "knee": (0.5, 0.80, 1.0)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    assert ratio == 0.62
+
+
+def test_estimate_waist_ratio_geom_knee_above_hip_falls_back():
+    """knee 不高于 hip → 几何不一致, 回退轮廓法."""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    kp = {"hip": (0.5, 0.68, 1.0), "shoulder": (0.5, 0.33, 1.0), "knee": (0.5, 0.60, 1.0)}
     ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
     assert ratio == 0.62
 
@@ -800,30 +818,41 @@ def test_clothing_mask_dress_knee_keypoints(monkeypatch):
     assert int(m[172, 60]) < 40
 
 
-def test_simcc_decode_round_trip():
-    """正向编码→解码 round-trip 误差 < 1px, 锁死 crop→原图变换链."""
+def _simcc_round_trip(img_w, img_h, seed=42):
     iw, ih = _RTMPOSE_INPUT_WH
     crop_w, crop_h = iw * 2, ih * 2
-    cx0, cy0 = 100, 200
-    img_w, img_h = 1024, 1536
-
-    rng = np.random.RandomState(42)
+    cx0, cy0 = 40, 50
+    rng = np.random.RandomState(seed)
     orig_x = cx0 + rng.rand(17) * crop_w
     orig_y = cy0 + rng.rand(17) * crop_h
-
     mx = (orig_x - cx0) / crop_w * iw
     my = (orig_y - cy0) / crop_h * ih
     idx_x = np.round(mx * _RTMPOSE_SPLIT_RATIO).astype(int)
     idx_y = np.round(my * _RTMPOSE_SPLIT_RATIO).astype(int)
-
     sx = np.zeros((17, int(iw * _RTMPOSE_SPLIT_RATIO) + 8))
     sy = np.zeros((17, int(ih * _RTMPOSE_SPLIT_RATIO) + 8))
     sx[np.arange(17), idx_x] = 1.0
     sy[np.arange(17), idx_y] = 1.0
-
     kx, ky = _simcc_decode(sx, sy, (cx0, cy0, crop_w, crop_h), (img_w, img_h))
-    err = np.sqrt((kx * img_w - orig_x) ** 2 + (ky * img_h - orig_y) ** 2)
+    return np.sqrt((kx * img_w - orig_x) ** 2 + (ky * img_h - orig_y) ** 2)
+
+
+def test_simcc_decode_round_trip():
+    """正向编码→解码 round-trip 误差 < 1px, 锁死 crop→原图变换链."""
+    err = _simcc_round_trip(1024, 1536)
     assert err.max() < 1.0, f"round-trip error {err.max():.3f}px >= 1px"
+
+
+def test_simcc_decode_round_trip_portrait_3_4():
+    """3:4 竖图 x/y 独立缩放 round-trip < 1px."""
+    err = _simcc_round_trip(768, 1024, seed=1)
+    assert err.max() < 1.0, f"3:4 round-trip error {err.max():.3f}px >= 1px"
+
+
+def test_simcc_decode_round_trip_landscape_4_3():
+    """4:3 横图 x/y 独立缩放 round-trip < 1px."""
+    err = _simcc_round_trip(1024, 768, seed=2)
+    assert err.max() < 1.0, f"4:3 round-trip error {err.max():.3f}px >= 1px"
 
 
 def test_fake_deps_injection_sets_stub_modules():

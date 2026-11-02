@@ -633,6 +633,7 @@ _RTMPOSE_BACKBONE = None
 _RTMPOSE_HEAD = None
 _RTMPOSE_INPUT_WH = (192, 256)  # (W, H)
 _RTMPOSE_SPLIT_RATIO = 2.0
+_RTMPOSE_LOAD_ERROR: str | None = None
 
 # fake deps 注入: RTMPOSE_FAKE_DEPS=0 时跳过 (真实 mmcv/mmdet 已装时不需要).
 # 注入时机: 首次调用 _init_rtmpose 时, 在 mmpose import 之前.
@@ -703,14 +704,18 @@ def _inject_fake_deps() -> None:
 
 def _init_rtmpose():
     """惰性加载 RTMPose-m backbone + head. 成功返回 (backbone, head), 否则 None."""
-    global _RTMPOSE_BACKBONE, _RTMPOSE_HEAD
+    global _RTMPOSE_BACKBONE, _RTMPOSE_HEAD, _RTMPOSE_SPLIT_RATIO, _RTMPOSE_LOAD_ERROR
     if _RTMPOSE_BACKBONE is not None:
         return _RTMPOSE_BACKBONE, _RTMPOSE_HEAD
+    if _RTMPOSE_LOAD_ERROR is not None:
+        return None
+    ckpt_path = Path(_RTMPOSE_ROOT) / "rtmpose-m_coco.pth"
+    if not ckpt_path.exists():
+        return None
     try:
         _inject_fake_deps()
         if _RTMPOSE_FAKE_DEPS and not _FAKE_DEPS_INJECTED:
-            logger.warning("RTMPOSE_FAKE_DEPS=1 but injection failed; skipping RTMPose")
-            return None
+            raise ImportError("RTMPOSE_FAKE_DEPS=1 but injection failed")
         from mmengine.config import Config
         from mmpose.models.backbones.cspnext import CSPNeXt
         from mmpose.models.heads.coord_cls_heads.rtmcc_head import RTMCCHead
@@ -722,13 +727,15 @@ def _init_rtmpose():
                 "body_2d_keypoint/rtmpose/coco/rtmpose-m_8xb256-420e_coco-256x192.py"
             )
         cfg = Config.fromfile(str(cfg_path))
+        codec = cfg.get("codec", {}) if hasattr(cfg, "get") else {}
+        split = codec.get("simcc_split_ratio") if isinstance(codec, dict) else None
+        if split is None:
+            split = cfg.model.head.get("simcc_split_ratio", _RTMPOSE_SPLIT_RATIO)
+        _RTMPOSE_SPLIT_RATIO = float(split)
         _skip = {"type", "_scope_", "init_cfg"}
         backbone = CSPNeXt(**{k: v for k, v in cfg.model.backbone.items() if k not in _skip})
         head = RTMCCHead(**{k: v for k, v in cfg.model.head.items() if k not in _skip | {"loss", "decoder"}})
 
-        ckpt_path = Path(_RTMPOSE_ROOT) / "rtmpose-m_coco.pth"
-        if not ckpt_path.exists():
-            return None
         import torch as _torch
 
         ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
@@ -741,10 +748,14 @@ def _init_rtmpose():
         head.eval()
         _RTMPOSE_BACKBONE = backbone
         _RTMPOSE_HEAD = head
-        logger.info("RTMPose-m loaded for pose keypoint detection")
+        logger.info("RTMPose-m loaded (simcc_split_ratio=%.1f)", _RTMPOSE_SPLIT_RATIO)
         return backbone, head
     except Exception as e:  # noqa: BLE001
-        logger.debug("RTMPose init failed: %s", e)
+        _RTMPOSE_LOAD_ERROR = str(e)
+        logger.error(
+            "RTMPose init failed (checkpoint present); not falling back to MediaPipe: %s",
+            e,
+        )
         return None
 
 
@@ -758,9 +769,13 @@ def _detect_pose_keypoints(img: Image.Image) -> dict | None:
         {"hip": (x, y, vis), "shoulder": (x, y, vis), "knee": (x, y, vis)} 或 None.
         坐标归一化到 [0,1], vis 为 visibility 置信度.
     """
-    result = _detect_pose_rtmpose(img)
-    if result is not None:
-        return result
+    ckpt = Path(_RTMPOSE_ROOT) / "rtmpose-m_coco.pth"
+    if ckpt.exists():
+        result = _detect_pose_rtmpose(img)
+        if result is not None:
+            return result
+        # checkpoint 在但加载/推理失败: 不混用 MediaPipe, 让腰线走轮廓法
+        return None
     return _detect_pose_mediapipe(img)
 
 
@@ -919,18 +934,25 @@ def _estimate_waist_ratio(
     # 1. Pose keypoints: shoulder→hip 插值算腰线
     # COCO hip landmark 在大转子(股骨), 比服装腰线低 10-15%.
     # 腰线 = shoulder + (hip - shoulder) * 0.55, 即肩髋之间偏上.
-    # 误差权重: shoulder 0.45 / hip 0.55; 任一置信度 < 0.3 则不插值, 回退轮廓法.
+    # RTMPose vis 固定 1.0, vis 阈值只约束 MediaPipe; 真实门控是几何一致性:
+    #   hip 必须低于 shoulder (>= 5% 图高), 插值结果必须落在 [0.45, 0.65].
     kp = pose_keypoints
     if kp is None and img is not None:
         kp = _detect_pose_keypoints(img)
     pose_ratio: float | None = None
     if kp and kp["hip"][2] >= 0.3 and kp["shoulder"][2] >= 0.3:
-        hip_y_px = kp["hip"][1] * h
-        sho_y_px = kp["shoulder"][1] * h
-        waist_y_px = sho_y_px + (hip_y_px - sho_y_px) * 0.55
-        ratio = (waist_y_px - y0) / max(1, span)
-        if 0.40 <= ratio <= 0.75:
-            pose_ratio = float(ratio)
+        hip_y = kp["hip"][1]
+        sho_y = kp["shoulder"][1]
+        geom_ok = hip_y > sho_y + 0.05
+        if geom_ok and "knee" in kp and kp["knee"][2] >= 0.3:
+            geom_ok = kp["knee"][1] > hip_y
+        if geom_ok:
+            hip_y_px = hip_y * h
+            sho_y_px = sho_y * h
+            waist_y_px = sho_y_px + (hip_y_px - sho_y_px) * 0.55
+            ratio = (waist_y_px - y0) / max(1, span)
+            if 0.45 <= ratio <= 0.65:
+                pose_ratio = float(ratio)
 
     # 2. Contour method
     torso_top = y0 + int(span * 0.30)
