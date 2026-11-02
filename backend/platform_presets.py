@@ -634,6 +634,7 @@ _RTMPOSE_HEAD = None
 _RTMPOSE_INPUT_WH = (192, 256)  # (W, H)
 _RTMPOSE_SPLIT_RATIO = 2.0
 _RTMPOSE_LOAD_ERROR: str | None = None
+_WAIST_SOURCE_COUNTS: dict[str, int] = {"rtmpose": 0, "mediapipe": 0, "contour": 0, "default": 0}
 
 # fake deps 注入: RTMPOSE_FAKE_DEPS=0 时跳过 (真实 mmcv/mmdet 已装时不需要).
 # 注入时机: 首次调用 _init_rtmpose 时, 在 mmpose import 之前.
@@ -773,10 +774,14 @@ def _detect_pose_keypoints(img: Image.Image) -> dict | None:
     if ckpt.exists():
         result = _detect_pose_rtmpose(img)
         if result is not None:
+            result["_source"] = "rtmpose"
             return result
         # checkpoint 在但加载/推理失败: 不混用 MediaPipe, 让腰线走轮廓法
         return None
-    return _detect_pose_mediapipe(img)
+    result = _detect_pose_mediapipe(img)
+    if result is not None:
+        result["_source"] = "mediapipe"
+    return result
 
 
 def _simcc_decode(
@@ -934,25 +939,27 @@ def _estimate_waist_ratio(
     # 1. Pose keypoints: shoulder→hip 插值算腰线
     # COCO hip landmark 在大转子(股骨), 比服装腰线低 10-15%.
     # 腰线 = shoulder + (hip - shoulder) * 0.55, 即肩髋之间偏上.
-    # RTMPose vis 固定 1.0, vis 阈值只约束 MediaPipe; 真实门控是几何一致性:
-    #   hip 必须低于 shoulder (>= 5% 图高), 插值结果必须落在 [0.45, 0.65].
+    # 门控量纲统一为 subject span (与 waist_r / knee_r 同一坐标系):
+    #   1) hip_r > sho_r + 0.05 (身高 5%)
+    #   2) 有 knee 时 knee_r > hip_r
+    #   3) 插值结果落在 [0.45, 0.65]
+    # 短路: 前一条不过即回退, 不继续用低质量点算插值.
     kp = pose_keypoints
     if kp is None and img is not None:
         kp = _detect_pose_keypoints(img)
     pose_ratio: float | None = None
     if kp and kp["hip"][2] >= 0.3 and kp["shoulder"][2] >= 0.3:
-        hip_y = kp["hip"][1]
-        sho_y = kp["shoulder"][1]
-        geom_ok = hip_y > sho_y + 0.05
-        if geom_ok and "knee" in kp and kp["knee"][2] >= 0.3:
-            geom_ok = kp["knee"][1] > hip_y
-        if geom_ok:
-            hip_y_px = hip_y * h
-            sho_y_px = sho_y * h
-            waist_y_px = sho_y_px + (hip_y_px - sho_y_px) * 0.55
-            ratio = (waist_y_px - y0) / max(1, span)
-            if 0.45 <= ratio <= 0.65:
-                pose_ratio = float(ratio)
+        hip_r = (kp["hip"][1] * h - y0) / max(1, span)
+        sho_r = (kp["shoulder"][1] * h - y0) / max(1, span)
+        if hip_r > sho_r + 0.05:
+            knee_ok = True
+            if "knee" in kp and kp["knee"][2] >= 0.3:
+                knee_r = (kp["knee"][1] * h - y0) / max(1, span)
+                knee_ok = knee_r > hip_r
+            if knee_ok:
+                ratio = sho_r + (hip_r - sho_r) * 0.55
+                if 0.45 <= ratio <= 0.65:
+                    pose_ratio = float(ratio)
 
     # 2. Contour method
     torso_top = y0 + int(span * 0.30)
@@ -991,10 +998,28 @@ def _estimate_waist_ratio(
                     pose_ratio,
                     contour_ratio,
                 )
+        src = (kp or {}).get("_source", "rtmpose")
+        if src not in _WAIST_SOURCE_COUNTS:
+            src = "rtmpose"
+        _record_waist_source(src)
         return pose_ratio
     if contour_ratio is not None:
+        _record_waist_source("contour")
         return contour_ratio
+    _record_waist_source("default")
     return 0.62
+
+
+def _record_waist_source(src: str) -> None:
+    _WAIST_SOURCE_COUNTS[src] = _WAIST_SOURCE_COUNTS.get(src, 0) + 1
+    total = sum(_WAIST_SOURCE_COUNTS.values())
+    if total == 1 or total % 50 == 0:
+        logger.info("waist sources: %s", waist_source_summary())
+
+
+def waist_source_summary() -> str:
+    c = _WAIST_SOURCE_COUNTS
+    return f"RTMPose {c['rtmpose']} / MediaPipe {c['mediapipe']} / contour {c['contour']} / default {c['default']}"
 
 
 def clothing_mask(

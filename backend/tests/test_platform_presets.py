@@ -743,12 +743,12 @@ def test_estimate_waist_ratio_pose_low_visibility_falls_back():
 
 
 def test_estimate_waist_ratio_pose_out_of_range_falls_back():
-    """插值后 waist ratio 超出 [0.45, 0.65] → 回退轮廓法。"""
+    """几何通过但插值超出 [0.45, 0.65] → 回退轮廓法 (单独触发范围门控)."""
     subj = np.zeros((200, 120), dtype=np.uint8)
     subj[20:180, 20:100] = 1
-    # shoulder y=0.50*200=100, hip y=1.0*200=200
-    # waist = 100 + (200-100)*0.55 = 155 → ratio = (155-20)/160 = 0.844 > 0.65
-    kp = {"hip": (0.5, 1.0, 0.9), "shoulder": (0.5, 0.50, 0.9), "knee": (0.5, 0.95, 0.8)}
+    # sho_r=(0.42*200-20)/160=0.40, hip_r=(0.86*200-20)/160=0.95
+    # ratio=0.40+0.55*0.55=0.7025 > 0.65; knee_r=(0.95*200-20)/160=1.0625 > hip_r
+    kp = {"hip": (0.5, 0.86, 1.0), "shoulder": (0.5, 0.42, 1.0), "knee": (0.5, 0.95, 1.0)}
     ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
     assert ratio == 0.62
 
@@ -853,6 +853,12 @@ def test_simcc_decode_round_trip_landscape_4_3():
     """4:3 横图 x/y 独立缩放 round-trip < 1px."""
     err = _simcc_round_trip(1024, 768, seed=2)
     assert err.max() < 1.0, f"4:3 round-trip error {err.max():.3f}px >= 1px"
+
+
+def test_simcc_decode_round_trip_near_square():
+    """接近 1:1 非正方形 (1000x1024) 最容易掩盖 x/y 缩放方向错误."""
+    err = _simcc_round_trip(1000, 1024, seed=3)
+    assert err.max() < 1.0, f"near-square round-trip error {err.max():.3f}px >= 1px"
 
 
 def test_fake_deps_injection_sets_stub_modules():

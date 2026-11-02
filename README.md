@@ -54,7 +54,7 @@ v0.1.8 修复：
 
 ### 残余风险
 
-RTMPose 依赖 fake 模块注入绕过 mmpose import 链（`RTMPOSE_FAKE_DEPS=1`）。mmpose 升级可能新增 import 路径导致 fake 失效，此时静默回退 MediaPipe。安装完整 mmcv 后设 `RTMPOSE_FAKE_DEPS=0`。SimCC `split_ratio=2.0` 硬编码，换模型需同步。shoulder/hip vis < 0.3 仍约束 MediaPipe；RTMPose vis 固定 1.0，真实门控是几何一致性（hip 低于 shoulder、knee 低于 hip）+ 插值结果必须落在 `[0.45, 0.65]`。checkpoint 存在但加载失败时不混用 MediaPipe，腰线走轮廓法。
+RTMPose 依赖 fake 模块注入绕过 mmpose import 链（`RTMPOSE_FAKE_DEPS=1`）。mmpose 升级可能新增 import 路径导致 fake 失效，此时静默回退 MediaPipe。安装完整 mmcv 后设 `RTMPOSE_FAKE_DEPS=0`。SimCC `split_ratio=2.0` 硬编码，换模型需同步。门控量纲统一为 subject span（与 waist_r / knee_r 同一坐标系）：hip_r > sho_r + 0.05、knee_r > hip_r、插值落在 `[0.45, 0.65]`，短路执行。checkpoint 存在但加载失败时不混用 MediaPipe。批量跑时每 50 张打印 `waist sources: RTMPose N / MediaPipe K / contour M / default D`。
 
 ## v0.1.7 更新日志（历史）
 
