@@ -430,16 +430,16 @@ GET  /api/health  /api/license
 | 组件 | 许可证 | 商用 | 本项目使用方式 |
 |------|--------|------|----------------|
 | IDM-VTON 模型权重 | CC BY-NC-SA 4.0 | 禁止 | 仅借鉴 garment warp 思路，未使用其权重 |
-| Stable Diffusion XL | CreativeML Open RAIL++-M | 允许（附使用政策约束） | 商用换衣管线的生成底座 |
-| ControlNet | Open RAIL++-M | 允许 | OpenPose / Canny / Depth 条件注入 |
+| Stable Diffusion XL | CreativeML Open RAIL++-M | 允许（作者已获商用授权） | 商用换衣管线的生成底座 |
+| ControlNet | Open RAIL++-M | 允许（作者已获商用授权） | OpenPose / Canny / Depth 条件注入 |
 | IP-Adapter | Apache 2.0 | 允许 | 服装特征注入 |
 | RTMPose | Apache 2.0 | 允许 | 关键点检测（腰线插值 + knee 截断） |
 | Rembg (U2Net) | MIT | 允许 | 主体掩膜提取 |
 | MediaPipe | Apache 2.0 | 允许 | 关键点检测回退 |
 | PLTON 论文方法 | 学术公开 | 思路可借鉴 | LF/HF 频率分离的 CPU 后处理实现，未使用其代码或权重 |
-| 本项目核心代码 | MIT | 允许 | — |
+| 本项目核心代码 | 商用权归作者所有 | 允许 | 换衣管线、平台适配、后处理、训练脚本等全部自研代码 |
 
-**商用部署**：设 `LICENSE_MODE=commercial`，引擎优先级 SDXL → 合成引擎，不加载 IDM-VTON。SDXL / ControlNet / IP-Adapter / RTMPose 均为商用合规许可，可安全用于商业场景。
+**商用部署**：设 `LICENSE_MODE=commercial`，引擎优先级 SDXL → 合成引擎，不加载 IDM-VTON。作者已获得 SDXL / ControlNet 商用授权，IP-Adapter / RTMPose / Rembg / MediaPipe 均为商用合规许可，可安全用于商业场景。
 
 ## 感谢
 
