@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import atexit
 import io
 import logging
 import os
@@ -935,19 +936,13 @@ def _estimate_waist_ratio(
     - 最窄点左右不对称(一侧被裁切/遮挡)→ 不可信
     """
     h = subj.shape[0]
+    # y0/span 由调用方从同一份 subject mask 算出后传入, pose 插值与轮廓法共用,
+    # 禁止在本函数内重算. clothing_mask 的 knee_r 也用同一对 y0/span.
 
-    # 1. Pose keypoints: shoulder→hip 插值算腰线
-    # COCO hip landmark 在大转子(股骨), 比服装腰线低 10-15%.
-    # 腰线 = shoulder + (hip - shoulder) * 0.55, 即肩髋之间偏上.
-    # 门控量纲统一为 subject span (与 waist_r / knee_r 同一坐标系):
-    #   1) hip_r > sho_r + 0.05 (身高 5%)
-    #   2) 有 knee 时 knee_r > hip_r
-    #   3) 插值结果落在 [0.45, 0.65]
-    # 短路: 前一条不过即回退, 不继续用低质量点算插值.
+    # 1. Pose: 几何门控短路, 通过才插值并立即返回 (按最终来源计数).
     kp = pose_keypoints
     if kp is None and img is not None:
         kp = _detect_pose_keypoints(img)
-    pose_ratio: float | None = None
     if kp and kp["hip"][2] >= 0.3 and kp["shoulder"][2] >= 0.3:
         hip_r = (kp["hip"][1] * h - y0) / max(1, span)
         sho_r = (kp["shoulder"][1] * h - y0) / max(1, span)
@@ -959,12 +954,15 @@ def _estimate_waist_ratio(
             if knee_ok:
                 ratio = sho_r + (hip_r - sho_r) * 0.55
                 if 0.45 <= ratio <= 0.65:
-                    pose_ratio = float(ratio)
+                    src = kp.get("_source", "rtmpose")
+                    if src not in ("rtmpose", "mediapipe"):
+                        src = "rtmpose"
+                    _record_waist_source(src)
+                    return float(ratio)
 
-    # 2. Contour method
+    # 2. Contour: 同一 y0/span. 无明显收腰或不对称 → 不记 contour, 归 default.
     torso_top = y0 + int(span * 0.30)
     torso_bottom = min(y0 + int(span * 0.75), h)
-    contour_ratio: float | None = None
     if torso_bottom > torso_top + 5:
         widths = np.array([subj[r].sum() for r in range(torso_top, torso_bottom)], dtype=np.float32)
         if len(widths) >= 5:
@@ -973,10 +971,10 @@ def _estimate_waist_ratio(
             min_idx = int(np.argmin(smooth)) + 2
             min_w = float(smooth.min())
             median_w = float(np.median(smooth))
-            contour_ok = not (median_w > 0 and min_w / median_w > 0.95)
-            if contour_ok:
+            if not (median_w > 0 and min_w / median_w > 0.95):
                 waist_row = torso_top + min_idx
                 all_cols = np.where(subj.any(axis=0))[0]
+                symmetric = True
                 if len(all_cols) > 0 and 0 <= waist_row < h:
                     body_center = (float(all_cols[0]) + float(all_cols[-1])) / 2
                     waist_cols = np.where(subj[waist_row] > 0)[0]
@@ -984,28 +982,10 @@ def _estimate_waist_ratio(
                         left = body_center - float(waist_cols[0])
                         right = float(waist_cols[-1]) - body_center
                         if max(left, right) > 0 and abs(left - right) / max(left, right) > 0.30:
-                            contour_ok = False
-                if contour_ok:
-                    contour_ratio = float(np.clip((torso_top + min_idx - y0) / max(1, span), 0.45, 0.75))
-
-    if pose_ratio is not None:
-        if contour_ratio is not None:
-            delta = abs(pose_ratio - contour_ratio)
-            if delta > 0.05:
-                logger.debug(
-                    "waist interp vs contour delta=%.3f (interp=%.3f contour=%.3f)",
-                    delta,
-                    pose_ratio,
-                    contour_ratio,
-                )
-        src = (kp or {}).get("_source", "rtmpose")
-        if src not in _WAIST_SOURCE_COUNTS:
-            src = "rtmpose"
-        _record_waist_source(src)
-        return pose_ratio
-    if contour_ratio is not None:
-        _record_waist_source("contour")
-        return contour_ratio
+                            symmetric = False
+                if symmetric:
+                    _record_waist_source("contour")
+                    return float(np.clip((torso_top + min_idx - y0) / max(1, span), 0.45, 0.75))
     _record_waist_source("default")
     return 0.62
 
@@ -1020,6 +1000,15 @@ def _record_waist_source(src: str) -> None:
 def waist_source_summary() -> str:
     c = _WAIST_SOURCE_COUNTS
     return f"RTMPose {c['rtmpose']} / MediaPipe {c['mediapipe']} / contour {c['contour']} / default {c['default']}"
+
+
+def _log_waist_source_summary() -> None:
+    total = sum(_WAIST_SOURCE_COUNTS.values())
+    if total:
+        logger.info("waist sources final: %s", waist_source_summary())
+
+
+atexit.register(_log_waist_source_summary)
 
 
 def clothing_mask(

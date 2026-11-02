@@ -771,6 +771,19 @@ def test_estimate_waist_ratio_geom_knee_above_hip_falls_back():
     assert ratio == 0.62
 
 
+def test_estimate_waist_ratio_geom_fail_even_if_range_would_pass():
+    """几何失败时即使插值会落在 [0.45, 0.65] 也短路, 不进范围门控."""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    # hip 在 shoulder 上方: 几何失败; 若硬插值 sho=0.40 hip=0.30 → 0.355 出区间,
+    # 用 hip 略低于 shoulder 但不足 5%: sho_r=0.2875 hip_r=0.325, 差 0.0375 < 0.05
+    # 插值 = 0.2875+0.0375*0.55=0.308 出区间. 改用 vis 正常、hip 仅略低于 shoulder:
+    # sho y=0.33 hip y=0.36 → sho_r=0.2875 hip_r=0.325, 几何差 0.0375 < 0.05
+    kp = {"hip": (0.5, 0.36, 1.0), "shoulder": (0.5, 0.33, 1.0), "knee": (0.5, 0.90, 1.0)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    assert ratio == 0.62
+
+
 def test_clothing_mask_dress_excludes_neck():
     """dress 类型排除脖子区(顶部 22%): row 50(脖子)被排除, row 70(胸口)保留."""
     img, subj = _subject_img()
