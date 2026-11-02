@@ -434,9 +434,10 @@ GET  /api/health  /api/license
 
 ## 感谢
 
-- [IDM-VTON](https://github.com/yisol/IDM-VTON) - 虚拟试衣模型（ECCV 2024）
-- [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose) - 实时关键点检测
-- [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0)
-- [ControlNet](https://github.com/lllyasviel/ControlNet)
-- [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter)
-- [Rembg](https://github.com/danielgatis/rembg)
+- [IDM-VTON](https://github.com/yisol/IDM-VTON) — 虚拟试衣模型（ECCV 2024）。本项目借鉴其 garment warp 思路，但未使用其权重（CC BY-NC-SA 4.0 禁止商用）
+- [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose) — 实时人体关键点检测。本项目用 RTMPose-m（COCO 17 点）做腰线 shoulder→hip 插值和 dress knee 截断，CPU 推理
+- [Stable Diffusion XL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) — 商用换衣管线的生成底座，ControlNet + IP-Adapter 条件注入
+- [ControlNet](https://github.com/lllyasviel/ControlNet) — 姿态引导（OpenPose 0.8）+ 图案锁定（Canny 0.55）+ 深度约束（Depth 0.95）
+- [IP-Adapter](https://github.com/tencent-ailab/IP-Adapter) — 服装特征注入（weight 0.9），把平铺图样式带入生成结果
+- [Rembg](https://github.com/danielgatis/rembg) — 主体掩膜（U2Net），用于服装裁切、纯白背景压制和 dress mask 生成
+- [MediaPipe Pose](https://github.com/google-ai/mediapipe) — RTMPose 加载失败时的关键点检测回退
