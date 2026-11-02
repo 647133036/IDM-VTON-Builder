@@ -599,7 +599,7 @@ def test_clothing_mask_sleeveless_cuts_above_default():
 
 
 def test_clothing_mask_dress_long_hem_keeps_more():
-    """连衣裙长款 hem=long 比 hem=waist 保留更多:row 150 在 long 保留、waist 截断。"""
+    """连衣裙长款 hem=long 比 hem=waist 保留更多:row 168 在 long 保留、waist 截断。"""
     img, subj = _subject_img()
     m_waist = clothing_mask(
         img, garment_type="dress", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "waist"}
@@ -608,8 +608,8 @@ def test_clothing_mask_dress_long_hem_keeps_more():
         img, garment_type="dress", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "long"}
     )
     assert m_waist is not None and m_long is not None
-    # row 150: waist cut at 20+160*0.82=151 → 截断; long cut at 20+160*0.96=173 → 保留
-    assert int(m_long[150, 60]) > int(m_waist[150, 60]) + 50
+    # waist cut at 20+160*0.90=164 → row 168 截断; long cut at 20+160*0.97=175 → 保留
+    assert int(m_long[168, 60]) > int(m_waist[168, 60]) + 50
 
 
 def test_clothing_mask_onesie_does_not_fall_through():
@@ -617,7 +617,7 @@ def test_clothing_mask_onesie_does_not_fall_through():
     img, subj = _subject_img()
     m = clothing_mask(img, garment_type="onesie", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "waist"})
     assert m is not None
-    # onesie short cut at 20+160*0.82=151 → row 170 截断
+    # onesie short cut at 20+160*0.90=164 → row 170 截断
     assert int(m[170, 60]) < 40
     # row 70 保留
     assert int(m[70, 60]) > 100
@@ -715,7 +715,86 @@ def test_clothing_mask_waist_aware_cut():
     assert int(m_waist[105, 60]) < int(m_uniform[105, 60])
 
 
-# --- _detect_face_mask down_margin_frac -------------------------------------
+# --- MediaPipe Pose keypoints + dress neck/leg fix --------------------------
+
+
+def test_estimate_waist_ratio_uses_pose_keypoints():
+    """有 pose_keypoints 时用 shoulder→hip 插值算腰线, 不走轮廓法."""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    # shoulder y=0.33*200=66, hip y=0.68*200=136
+    # waist = 66 + (136-66)*0.55 = 104.5 → ratio = (104.5-20)/160 = 0.528
+    kp = {"hip": (0.5, 0.68, 0.9), "shoulder": (0.5, 0.33, 0.9), "knee": (0.5, 0.95, 0.8)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    assert 0.48 <= ratio <= 0.58
+
+
+def test_estimate_waist_ratio_pose_low_visibility_falls_back():
+    """pose hip 或 shoulder visibility < 0.3 → 回退轮廓法。"""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    kp = {"hip": (0.5, 0.68, 0.2), "shoulder": (0.5, 0.33, 0.9), "knee": (0.5, 0.95, 0.8)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    # uniform width → contour fallback → 0.62
+    assert ratio == 0.62
+
+
+def test_estimate_waist_ratio_pose_out_of_range_falls_back():
+    """插值后 waist ratio 超出 [0.40, 0.75] → 回退轮廓法。"""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    # shoulder y=0.50*200=100, hip y=1.0*200=200
+    # waist = 100 + (200-100)*0.55 = 155 → ratio = (155-20)/160 = 0.844 > 0.75
+    kp = {"hip": (0.5, 1.0, 0.9), "shoulder": (0.5, 0.50, 0.9), "knee": (0.5, 0.95, 0.8)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    assert ratio == 0.62
+
+
+def test_clothing_mask_dress_excludes_neck():
+    """dress 类型排除脖子区(顶部 22%): row 50(脖子)被排除, row 70(胸口)保留."""
+    img, subj = _subject_img()
+    m = clothing_mask(img, garment_type="dress", subject_mask=subj)
+    assert m is not None
+    # neck_end = 20 + 160*0.22 = 55 → row 50 被排除
+    assert int(m[50, 60]) < 40
+    # row 70 保留
+    assert int(m[70, 60]) > 100
+
+
+def test_clothing_mask_upper_does_not_exclude_neck():
+    """upper 类型不排除脖子(领口在衣物范围): row 35(脸区)被排除, row 50 保留."""
+    img, subj = _subject_img()
+    m = clothing_mask(img, garment_type="upper", subject_mask=subj)
+    assert m is not None
+    # upper 不做 neck 排除 → row 50 应保留(仅脸区 18% 排除到 row 48)
+    assert int(m[50, 60]) > 100
+
+
+def test_clothing_mask_dress_covers_legs():
+    """dress normal 下摆延伸到 90% 身高(覆盖腿): row 160(大腿)保留。"""
+    img, subj = _subject_img()
+    m = clothing_mask(img, garment_type="dress", subject_mask=subj)
+    assert m is not None
+    # cut at 20+160*0.90=164 → row 160 保留
+    assert int(m[160, 60]) > 100
+
+
+def test_clothing_mask_dress_knee_keypoints(monkeypatch):
+    """有膝关键点时 dress 下摆精确截断到膝部。"""
+    img, subj = _subject_img()
+    # knee at y=0.85*200=170 → knee_r = (170-20)/160 = 0.9375
+    kp = {"hip": (0.5, 0.68, 0.9), "shoulder": (0.5, 0.33, 0.9), "knee": (0.5, 0.85, 0.8)}
+
+    import platform_presets
+
+    monkeypatch.setattr(platform_presets, "_detect_pose_keypoints", lambda img: kp)
+
+    m = clothing_mask(img, garment_type="dress", subject_mask=subj)
+    assert m is not None
+    # knee_r=0.9375, normal cut = knee_r - 0.02 = 0.9175 → 20+160*0.9175=167
+    # erode(9x9)+blur(sigma=6) feathers ~8px each side → row 155 safe, row 172 cut
+    assert int(m[155, 60]) > 100
+    assert int(m[172, 60]) < 40
 
 
 def test_face_mask_down_margin_asymmetric(monkeypatch):

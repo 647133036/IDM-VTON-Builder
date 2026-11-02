@@ -17,6 +17,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 from typing import Literal
@@ -29,6 +30,8 @@ logger = logging.getLogger("atelier.platform_presets")
 # u2net(主体掩膜)模型放 NAS 持久目录, 换机不丢、免重下; 缺失才让 rembg 自动下载。
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _U2NET_ROOT = _REPO_ROOT / "models" / "seg"
+_POSE_ROOT = _REPO_ROOT / "models" / "mediapipe"
+_RTMPOSE_ROOT = _REPO_ROOT / "models" / "rtmpose"
 
 Platform = Literal["shopify", "amazon", "aliexpress"]
 
@@ -489,6 +492,9 @@ def force_white_background(
 _FG_SESSION = None
 _FG_SESSION_WARNED = False
 
+_POSE_SESSION = None
+_POSE_SESSION_WARNED = False
+
 
 def _u2net_onnx_path():
     """找本地完整 u2net.onnx(NAS 模型目录 > U2NET_HOME 两种布局 > rembg 默认缓存)。
@@ -623,14 +629,259 @@ def detect_garment_extent(garment: Image.Image) -> dict:
     return {"sleeve": sleeve, "hem": hem, "aspect": round(aspect, 2)}
 
 
-def _estimate_waist_ratio(subj: np.ndarray, y0: int, span: int) -> float:
-    """从主体 mask 行宽分布估算腰线占身高的比例。
+_RTMPOSE_BACKBONE = None
+_RTMPOSE_HEAD = None
+_RTMPOSE_INPUT_WH = (192, 256)  # (W, H)
+_RTMPOSE_SPLIT_RATIO = 2.0
 
-    在躯干区(30%-75% 身高)找行宽最小点作为腰线。两层保护:
-    1. 中位宽度过近(min/median > 0.95,即 < 5% 差异)→ 无明显收腰,回退 0.62
-    2. 最窄点左右不对称(一侧被裁切/遮挡)→ 不可信,回退 0.62
+
+def _inject_fake_deps() -> None:
+    """注入假 xtcocotools/mmdet/mmcv.ops 模块, 绕过 mmpose import 链.
+
+    mmpose 的 __init__ 导入 datasets/evaluation (需 xtcocotools 编译扩展) 和
+    hybrid_heads (需 mmdet + mmcv.ops C 扩展). 这些在推理时不需要, 只在数据集
+    加载和评估时用. 注入空壳模块让 model 组件能正常导入.
+    """
+    if "xtcocotools" in sys.modules:
+        return
+    import types as _t
+
+    class _F:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __call__(self, *a, **kw):
+            return _F()
+
+        def __getattr__(self, n):
+            return _F()
+
+    fake = _t.ModuleType("xtcocotools")
+    fake.__path__ = []
+    fake.coco = type("M", (), {"COCO": _F})
+    fake.mask = type("M", (), {"mask": lambda *a, **kw: None})
+    fake.cocoeval = type("M", (), {"COCOeval": _F})
+    sys.modules["xtcocotools"] = fake
+    sys.modules["xtcocotools.coco"] = fake.coco
+    sys.modules["xtcocotools.mask"] = fake.mask
+    sys.modules["xtcocotools.cocoeval"] = fake.cocoeval
+
+    md = _t.ModuleType("mmdet")
+    md.__path__ = []
+    md.ConfigType = dict
+    md.reduce_mean = lambda *a, **kw: None
+    sys.modules["mmdet"] = md
+    mu = _t.ModuleType("mmdet.utils")
+    mu.ConfigType = dict
+    mu.reduce_mean = lambda *a, **kw: None
+    sys.modules["mmdet.utils"] = mu
+
+    ops = _t.ModuleType("mmcv.ops")
+    ops.__path__ = []
+    ops.MultiScaleDeformableAttention = type("MSDA", (object,), {})
+    sys.modules["mmcv.ops"] = ops
+
+
+def _init_rtmpose():
+    """惰性加载 RTMPose-m backbone + head. 成功返回 (backbone, head), 否则 None."""
+    global _RTMPOSE_BACKBONE, _RTMPOSE_HEAD
+    if _RTMPOSE_BACKBONE is not None:
+        return _RTMPOSE_BACKBONE, _RTMPOSE_HEAD
+    try:
+        _inject_fake_deps()
+        from mmengine.config import Config
+        from mmpose.models.backbones.cspnext import CSPNeXt
+        from mmpose.models.heads.coord_cls_heads.rtmcc_head import RTMCCHead
+
+        cfg_path = Path(_RTMPOSE_ROOT) / "rtmpose-m_8xb256-420e_coco-256x192.py"
+        if not cfg_path.exists():
+            cfg_path = Path(
+                "/usr/local/lib/python3.11/dist-packages/mmpose/.mim/configs/"
+                "body_2d_keypoint/rtmpose/coco/rtmpose-m_8xb256-420e_coco-256x192.py"
+            )
+        cfg = Config.fromfile(str(cfg_path))
+        _skip = {"type", "_scope_", "init_cfg"}
+        backbone = CSPNeXt(**{k: v for k, v in cfg.model.backbone.items() if k not in _skip})
+        head = RTMCCHead(**{k: v for k, v in cfg.model.head.items() if k not in _skip | {"loss", "decoder"}})
+
+        ckpt_path = Path(_RTMPOSE_ROOT) / "rtmpose-m_coco.pth"
+        if not ckpt_path.exists():
+            return None
+        import torch as _torch
+
+        ckpt = _torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        sd = ckpt.get("state_dict", ckpt)
+        backbone.load_state_dict(
+            {k.replace("backbone.", ""): v for k, v in sd.items() if k.startswith("backbone.")}, strict=True
+        )
+        head.load_state_dict({k.replace("head.", ""): v for k, v in sd.items() if k.startswith("head.")}, strict=False)
+        backbone.eval()
+        head.eval()
+        _RTMPOSE_BACKBONE = backbone
+        _RTMPOSE_HEAD = head
+        logger.info("RTMPose-m loaded for pose keypoint detection")
+        return backbone, head
+    except Exception as e:  # noqa: BLE001
+        logger.debug("RTMPose init failed: %s", e)
+        return None
+
+
+def _detect_pose_keypoints(img: Image.Image) -> dict | None:
+    """关键点检测, 返回 hip/shoulder/knee 归一化坐标.
+
+    优先 RTMPose-m (COCO 17 关键点, CPU 可跑, 精度优于 MediaPipe),
+    回退 MediaPipe Pose, 再回退 None.
+
+    Returns:
+        {"hip": (x, y, vis), "shoulder": (x, y, vis), "knee": (x, y, vis)} 或 None.
+        坐标归一化到 [0,1], vis 为 visibility 置信度.
+    """
+    result = _detect_pose_rtmpose(img)
+    if result is not None:
+        return result
+    return _detect_pose_mediapipe(img)
+
+
+def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
+    """RTMPose-m 推理: bbox 裁切 → resize 256x192 → backbone → SimCC 解码."""
+    global _POSE_SESSION_WARNED
+    ret = _init_rtmpose()
+    if ret is None:
+        return None
+    backbone, head = ret
+
+    try:
+        import cv2
+
+        arr = np.array(img.convert("RGB"))
+        h, w = arr.shape[:2]
+
+        # bbox from gray threshold (no rembg needed)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        fg = (gray < 235).astype(np.uint8)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k)
+        ys, xs = np.where(fg > 0)
+        if len(ys) < 10:
+            return None
+        x0, y0, x1, y1 = int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())
+
+        # expand bbox 1.25
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        half = int(max(x1 - x0, y1 - y0) * 1.25 / 2)
+        cx_i, cy_i = int(cx), int(cy)
+        cx0, cy0, cx1, cy1 = cx_i - half, cy_i - half, cx_i + half, cy_i + half
+        pl, pt = max(0, -cx0), max(0, -cy0)
+        pr, pb = max(0, cx1 - w), max(0, cy1 - h)
+        padded = np.pad(arr, ((pt, pb), (pl, pr), (0, 0)), mode="constant")
+        crop = padded[cy0 + pt : cy1 + pt, cx0 + pl : cx1 + pl]
+        iw, ih = _RTMPOSE_INPUT_WH
+        resized = cv2.resize(crop, (iw, ih))
+        mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+        std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+        norm = (resized.astype(np.float32) - mean) / std
+        import torch as _torch
+
+        tensor = _torch.from_numpy(norm).permute(2, 0, 1).unsqueeze(0)
+
+        with _torch.no_grad():
+            feats = backbone(tensor)
+            sx, sy = head(feats)
+
+        # SimCC decode: argmax / split_ratio → model input coords
+        kx = sx.argmax(dim=-1).float().cpu().numpy()[0] / _RTMPOSE_SPLIT_RATIO
+        ky = sy.argmax(dim=-1).float().cpu().numpy()[0] / _RTMPOSE_SPLIT_RATIO
+        # map to crop → original
+        crop_w, crop_h = cx1 - cx0, cy1 - cy0
+        kx = kx / iw * crop_w + cx0
+        ky = ky / ih * crop_h + cy0
+        # normalize to [0,1]
+        kx = np.clip(kx / w, 0, 1)
+        ky = np.clip(ky / h, 0, 1)
+
+        # COCO 17: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee
+        def avg(i, j):
+            return (float((kx[i] + kx[j]) / 2), float((ky[i] + ky[j]) / 2), 1.0)
+
+        return {"hip": avg(11, 12), "shoulder": avg(5, 6), "knee": avg(13, 14)}
+    except Exception:  # noqa: BLE001
+        if not _POSE_SESSION_WARNED:
+            logger.warning("RTMPose inference failed; falling back")
+            _POSE_SESSION_WARNED = True
+        return None
+
+
+def _detect_pose_mediapipe(img: Image.Image) -> dict | None:
+    """MediaPipe Pose 回退."""
+    global _POSE_SESSION_WARNED
+    try:
+        import mediapipe as mp
+    except ImportError:
+        return None
+
+    arr = np.array(img.convert("RGB"))
+    try:
+        mp_pose = mp.solutions.pose
+        with mp_pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+            enable_segmentation=False,
+            min_detection_confidence=0.5,
+        ) as pose:
+            res = pose.process(arr)
+        if not res.pose_landmarks:
+            return None
+        lm = res.pose_landmarks.landmark
+    except Exception:  # noqa: BLE001
+        return None
+
+    def avg_lm(i, j):
+        lm_l, lm_r = lm[i], lm[j]
+        return ((lm_l.x + lm_r.x) / 2, (lm_l.y + lm_r.y) / 2, (lm_l.visibility + lm_r.visibility) / 2)
+
+    hip = avg_lm(23, 24)
+    shoulder = avg_lm(11, 12)
+    knee = avg_lm(25, 26)
+    if hip[2] < 0.3:
+        return None
+    return {"hip": hip, "shoulder": shoulder, "knee": knee}
+
+
+def _estimate_waist_ratio(
+    subj: np.ndarray,
+    y0: int,
+    span: int,
+    img: Image.Image | None = None,
+    pose_keypoints: dict | None = None,
+) -> float:
+    """估算腰线占身高的比例。
+
+    三层降级:
+    1. MediaPipe Pose 髋关键点(手插腰/手臂贴腰时轮廓法失效, 关键点直接定位)
+    2. 轮廓法行宽最窄点(躯干区 30%-75%, convolve 平滑)
+    3. 0.62 固定默认值
+
+    轮廓法两层保护:
+    - 中位宽度过近(min/median > 0.95,即 < 5% 差异)→ 无明显收腰
+    - 最窄点左右不对称(一侧被裁切/遮挡)→ 不可信
     """
     h = subj.shape[0]
+
+    # 1. Pose keypoints: shoulder→hip 插值算腰线
+    # COCO hip landmark 在大转子(股骨), 比服装腰线低 10-15%.
+    # 腰线 = shoulder + (hip - shoulder) * 0.55, 即肩髋之间偏上.
+    kp = pose_keypoints
+    if kp is None and img is not None:
+        kp = _detect_pose_keypoints(img)
+    if kp and kp["hip"][2] >= 0.3 and kp["shoulder"][2] >= 0.3:
+        hip_y_px = kp["hip"][1] * h
+        sho_y_px = kp["shoulder"][1] * h
+        waist_y_px = sho_y_px + (hip_y_px - sho_y_px) * 0.55
+        ratio = (waist_y_px - y0) / max(1, span)
+        if 0.40 <= ratio <= 0.75:
+            return float(ratio)
+
+    # 2. Contour method
     torso_top = y0 + int(span * 0.30)
     torso_bottom = min(y0 + int(span * 0.75), h)
     if torso_bottom <= torso_top + 5:
@@ -682,13 +933,15 @@ def clothing_mask(
     subj = (np.asarray(subj) > 0).astype(np.uint8)
     if subj.shape[:2] != (h, w) or float(subj.mean()) < 0.04:
         return None
+
+    # Pose keypoints — call once, reuse for waist + knee
+    pose_kp = _detect_pose_keypoints(img)
+
     face = _detect_face_mask(arr, margin_frac=face_margin, down_margin_frac=0.08)
     cloth = subj.copy()
     if face is not None and face.any():
         cloth[face > 0] = 0
     else:
-        # cv2 5.0 fallback: CascadeClassifier 被移除,_detect_face_mask 返回全零。
-        # 用主体 bbox 顶部 18% 估算脸区,保护脸/头发不被服装遮罩覆盖。
         heur = _heuristic_face_mask(arr, subj)
         if heur.any():
             cloth[heur > 0] = 0
@@ -696,10 +949,22 @@ def clothing_mask(
     y0, y1 = int(ys.min()), int(ys.max())
     span = max(1, y1 - y0)
 
+    # dress/onesie 需额外排除脖子: 脸区(顶部 ~18%)以下到 22% 是颈区,
+    # 不应被服装遮罩覆盖。上衣/下装不需此处理(领口在衣物范围内)。
+    if garment_type in ("dress", "onesie"):
+        neck_end = min(h, y0 + int(span * 0.22))
+        cloth[:neck_end] = 0
+
     sleeve = garment_extent.get("sleeve", "short") if garment_extent else "short"
     hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
 
-    waist_r = _estimate_waist_ratio(subj, y0, span)
+    waist_r = _estimate_waist_ratio(subj, y0, span, pose_keypoints=pose_kp)
+
+    # 膝关键点(若有)用于 dress/onesie 下摆精确截断
+    knee_r: float | None = None
+    if pose_kp and pose_kp["knee"][2] >= 0.3:
+        knee_y_px = pose_kp["knee"][1] * h
+        knee_r = (knee_y_px - y0) / max(1, span)
 
     if garment_type in ("upper", "auto"):
         if hem == "long":
@@ -711,17 +976,24 @@ def clothing_mask(
         else:
             cloth[y0 + int(span * waist_r) :] = 0
     elif garment_type == "dress":
-        if hem == "long":
-            cloth[y0 + int(span * (waist_r + 0.34)) :] = 0
+        if knee_r is not None and 0.75 <= knee_r <= 0.95:
+            # 有膝关键点: normal 截到膝, long 截到膝下 5%
+            cut = knee_r + 0.05 if hem == "long" else knee_r - 0.02
+            cloth[y0 + int(span * cut) :] = 0
+        elif hem == "long":
+            cloth[y0 + int(span * (waist_r + 0.35)) :] = 0
         else:
-            cloth[y0 + int(span * (waist_r + 0.20)) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.28)) :] = 0
     elif garment_type == "lower":
         cloth[: y0 + int(span * (waist_r - 0.14))] = 0
     elif garment_type == "onesie":
-        if sleeve == "long":
+        if knee_r is not None and 0.75 <= knee_r <= 0.95:
+            cut = knee_r + 0.05 if hem == "long" else knee_r - 0.02
+            cloth[y0 + int(span * cut) :] = 0
+        elif sleeve == "long":
             cloth[y0 + int(span * (waist_r + 0.33)) :] = 0
         else:
-            cloth[y0 + int(span * (waist_r + 0.20)) :] = 0
+            cloth[y0 + int(span * (waist_r + 0.28)) :] = 0
     if float(cloth.mean()) < 0.02:
         return None
 
