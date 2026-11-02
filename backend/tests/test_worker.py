@@ -131,6 +131,8 @@ def test_process_job_missing_source_fails(tmp_path, ready_base_image):
 
 def test_workflow_claim_and_fail_marks_job():
     seed_bases_if_empty()
+    while claim_next_job() is not None:
+        pass
     job = create_job({"base_id": "base_women_01", "source_name": "x.jpg"})
     claimed = claim_next_job()
     assert claimed and claimed["id"] == job["id"]

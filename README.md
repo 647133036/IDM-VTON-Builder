@@ -14,9 +14,10 @@ v0.1.8 切换为 RTMPose-m（COCO AP 75.8%，CPU 90+ FPS，侧/背面退化仅 2
 
 - **模型**：RTMPose-m（CSPNeXt backbone + RTMCCHead，SimCC 输出，输入 256x192）
 - **推理**：从灰度阈值提取 bbox → expand 1.25 → resize → ImageNet normalize → backbone → head → SimCC argmax 解码
-- **依赖绕过**：fake `xtcocotools`/`mmdet`/`mmcv.ops` 注入 `sys.modules`，绕过 mmpose import 链中对编译扩展和数据集/评估模块的依赖。推理只需要 backbone + head，不需要这些模块
+- **依赖绕过**：fake `xtcocotools`/`mmdet`/`mmcv.ops` 注入 `sys.modules`，绕过 mmpose import 链中对编译扩展和数据集/评估模块的依赖。推理只需要 backbone + head，不需要这些模块。`RTMPOSE_FAKE_DEPS=1`（默认）开启，设 `0` 关闭（真实 mmcv/mmdet 已装时）
 - **PyTorch 2.6 兼容**：`torch.load(weights_only=False)` 加载含 numpy 数组的 checkpoint
 - **MediaPipe 回退**：RTMPose 初始化或推理失败时自动降级到 MediaPipe Pose
+- **SimCC 解码**：`_simcc_decode` 独立纯函数，crop 正方形 bbox 直接 resize，x/y 独立缩放，无 letterbox padding；归一化分母为原图宽高
 
 ### 腰线插值修正：COCO hip landmark 不等于服装腰线
 
@@ -53,7 +54,7 @@ v0.1.8 修复：
 
 ### 残余风险
 
-RTMPose 依赖 fake 模块注入绕过 mmpose import 链，若将来安装完整 mmcv（含编译扩展）可去掉 fake。SimCC 解码的 `split_ratio=2.0` 硬编码在 config 中，换模型需同步更新。
+RTMPose 依赖 fake 模块注入绕过 mmpose import 链（`RTMPOSE_FAKE_DEPS=1`）。mmpose 升级可能新增 import 路径导致 fake 失效，此时静默回退 MediaPipe。安装完整 mmcv 后设 `RTMPOSE_FAKE_DEPS=0`。SimCC `split_ratio=2.0` 硬编码，换模型需同步。shoulder/hip 任一 vis < 0.3 回退轮廓法（RTMPose 路径 vis 固定 1.0，阈值只约束 MediaPipe）。
 
 ## v0.1.7 更新日志（历史）
 
@@ -356,6 +357,7 @@ MODEL=lora_family bash run_train.sh  # 服装 + 人像双 LoRA
 | `VTON_SEED` | `42` | 随机种子 |
 | `VTON_PROMPT_HINT` | 空 | 额外 prompt 钩子 |
 | `VTON_INPAINT_REPAIR` | `0` | 设为 `1` 且有权重时启用 SDXL Inpainting 二次修复 |
+| `RTMPOSE_FAKE_DEPS` | `1` | 注入空壳 xtcocotools/mmdet/mmcv.ops；真实依赖已装时设 `0` |
 
 ## 测试
 

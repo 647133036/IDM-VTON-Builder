@@ -634,6 +634,12 @@ _RTMPOSE_HEAD = None
 _RTMPOSE_INPUT_WH = (192, 256)  # (W, H)
 _RTMPOSE_SPLIT_RATIO = 2.0
 
+# fake deps 注入: RTMPOSE_FAKE_DEPS=0 时跳过 (真实 mmcv/mmdet 已装时不需要).
+# 注入时机: 首次调用 _init_rtmpose 时, 在 mmpose import 之前.
+# 升级风险: mmpose 版本变动可能新增 import 路径, 此 fake 可能失效.
+_RTMPOSE_FAKE_DEPS = os.environ.get("RTMPOSE_FAKE_DEPS", "1") == "1"
+_FAKE_DEPS_INJECTED = False
+
 
 def _inject_fake_deps() -> None:
     """注入假 xtcocotools/mmdet/mmcv.ops 模块, 绕过 mmpose import 链.
@@ -641,8 +647,15 @@ def _inject_fake_deps() -> None:
     mmpose 的 __init__ 导入 datasets/evaluation (需 xtcocotools 编译扩展) 和
     hybrid_heads (需 mmdet + mmcv.ops C 扩展). 这些在推理时不需要, 只在数据集
     加载和评估时用. 注入空壳模块让 model 组件能正常导入.
+
+    设 RTMPOSE_FAKE_DEPS=0 关闭注入 (用于真实依赖环境).
+    注入后断言确认 fake 生效.
     """
+    global _FAKE_DEPS_INJECTED
+    if _FAKE_DEPS_INJECTED or not _RTMPOSE_FAKE_DEPS:
+        return
     if "xtcocotools" in sys.modules:
+        _FAKE_DEPS_INJECTED = True
         return
     import types as _t
 
@@ -681,6 +694,12 @@ def _inject_fake_deps() -> None:
     ops.MultiScaleDeformableAttention = type("MSDA", (object,), {})
     sys.modules["mmcv.ops"] = ops
 
+    _FAKE_DEPS_INJECTED = True
+    # 断言 fake 生效
+    assert "xtcocotools" in sys.modules, "fake deps injection failed: xtcocotools"
+    assert "mmdet" in sys.modules, "fake deps injection failed: mmdet"
+    assert "mmcv.ops" in sys.modules, "fake deps injection failed: mmcv.ops"
+
 
 def _init_rtmpose():
     """惰性加载 RTMPose-m backbone + head. 成功返回 (backbone, head), 否则 None."""
@@ -689,6 +708,9 @@ def _init_rtmpose():
         return _RTMPOSE_BACKBONE, _RTMPOSE_HEAD
     try:
         _inject_fake_deps()
+        if _RTMPOSE_FAKE_DEPS and not _FAKE_DEPS_INJECTED:
+            logger.warning("RTMPOSE_FAKE_DEPS=1 but injection failed; skipping RTMPose")
+            return None
         from mmengine.config import Config
         from mmpose.models.backbones.cspnext import CSPNeXt
         from mmpose.models.heads.coord_cls_heads.rtmcc_head import RTMCCHead
@@ -742,6 +764,35 @@ def _detect_pose_keypoints(img: Image.Image) -> dict | None:
     return _detect_pose_mediapipe(img)
 
 
+def _simcc_decode(
+    sx: np.ndarray,
+    sy: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    img_wh: tuple[int, int],
+) -> tuple[np.ndarray, np.ndarray]:
+    """SimCC argmax 解码 + crop→原图坐标逆变换 + 归一化到原图 [0,1].
+
+    变换链:
+      argmax / split_ratio → 模型输入坐标 (0..iw, 0..ih)
+      → / iw * crop_w + cx0 → 原图像素坐标
+      → / img_w → 归一化 [0,1]
+
+    crop 为正方形 bbox (max(w,h)*1.25) 直接 resize 到 (iw, ih), 非 letterbox,
+    逆变换 x/y 独立缩放, 无 padding 需减除. 归一化分母为原图宽高(非 crop),
+    下游 waist_r = y_norm / H_subject 依赖这一点.
+    """
+    iw, ih = _RTMPOSE_INPUT_WH
+    cx0, cy0, crop_w, crop_h = bbox
+    w, h = img_wh
+    kx = sx.argmax(axis=-1).astype(np.float64) / _RTMPOSE_SPLIT_RATIO
+    ky = sy.argmax(axis=-1).astype(np.float64) / _RTMPOSE_SPLIT_RATIO
+    kx = kx / iw * crop_w + cx0
+    ky = ky / ih * crop_h + cy0
+    kx = np.clip(kx / w, 0.0, 1.0)
+    ky = np.clip(ky / h, 0.0, 1.0)
+    return kx, ky
+
+
 def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
     """RTMPose-m 推理: bbox 裁切 → resize 256x192 → backbone → SimCC 解码."""
     global _POSE_SESSION_WARNED
@@ -788,18 +839,16 @@ def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
             feats = backbone(tensor)
             sx, sy = head(feats)
 
-        # SimCC decode: argmax / split_ratio → model input coords
-        kx = sx.argmax(dim=-1).float().cpu().numpy()[0] / _RTMPOSE_SPLIT_RATIO
-        ky = sy.argmax(dim=-1).float().cpu().numpy()[0] / _RTMPOSE_SPLIT_RATIO
-        # map to crop → original
-        crop_w, crop_h = cx1 - cx0, cy1 - cy0
-        kx = kx / iw * crop_w + cx0
-        ky = ky / ih * crop_h + cy0
-        # normalize to [0,1]
-        kx = np.clip(kx / w, 0, 1)
-        ky = np.clip(ky / h, 0, 1)
+        kx, ky = _simcc_decode(
+            sx.cpu().numpy()[0],
+            sy.cpu().numpy()[0],
+            (cx0, cy0, cx1 - cx0, cy1 - cy0),
+            (w, h),
+        )
 
         # COCO 17: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee
+        # SimCC softmax 在 384/512 bin 上峰值 ~1e-5, 不能当 vis; RTMPose 固定 1.0.
+        # vis 阈值 0.3 只对 MediaPipe 回退路径生效.
         def avg(i, j):
             return (float((kx[i] + kx[j]) / 2), float((ky[i] + ky[j]) / 2), 1.0)
 
@@ -857,7 +906,7 @@ def _estimate_waist_ratio(
     """估算腰线占身高的比例。
 
     三层降级:
-    1. MediaPipe Pose 髋关键点(手插腰/手臂贴腰时轮廓法失效, 关键点直接定位)
+    1. Pose 关键点 shoulder→hip 插值(hip/shoulder 置信度均 >= 0.3)
     2. 轮廓法行宽最窄点(躯干区 30%-75%, convolve 平滑)
     3. 0.62 固定默认值
 
@@ -870,44 +919,60 @@ def _estimate_waist_ratio(
     # 1. Pose keypoints: shoulder→hip 插值算腰线
     # COCO hip landmark 在大转子(股骨), 比服装腰线低 10-15%.
     # 腰线 = shoulder + (hip - shoulder) * 0.55, 即肩髋之间偏上.
+    # 误差权重: shoulder 0.45 / hip 0.55; 任一置信度 < 0.3 则不插值, 回退轮廓法.
     kp = pose_keypoints
     if kp is None and img is not None:
         kp = _detect_pose_keypoints(img)
+    pose_ratio: float | None = None
     if kp and kp["hip"][2] >= 0.3 and kp["shoulder"][2] >= 0.3:
         hip_y_px = kp["hip"][1] * h
         sho_y_px = kp["shoulder"][1] * h
         waist_y_px = sho_y_px + (hip_y_px - sho_y_px) * 0.55
         ratio = (waist_y_px - y0) / max(1, span)
         if 0.40 <= ratio <= 0.75:
-            return float(ratio)
+            pose_ratio = float(ratio)
 
     # 2. Contour method
     torso_top = y0 + int(span * 0.30)
     torso_bottom = min(y0 + int(span * 0.75), h)
-    if torso_bottom <= torso_top + 5:
-        return 0.62
-    widths = np.array([subj[r].sum() for r in range(torso_top, torso_bottom)], dtype=np.float32)
-    if len(widths) < 5:
-        return 0.62
-    kernel = np.ones(5, dtype=np.float32) / 5
-    smooth = np.convolve(widths, kernel, mode="valid")
-    min_idx = int(np.argmin(smooth)) + 2
-    min_w = float(smooth.min())
-    median_w = float(np.median(smooth))
-    if median_w > 0 and min_w / median_w > 0.95:
-        return 0.62
-    waist_row = torso_top + min_idx
-    all_cols = np.where(subj.any(axis=0))[0]
-    if len(all_cols) > 0 and 0 <= waist_row < h:
-        body_center = (float(all_cols[0]) + float(all_cols[-1])) / 2
-        waist_cols = np.where(subj[waist_row] > 0)[0]
-        if len(waist_cols) > 4:
-            left = body_center - float(waist_cols[0])
-            right = float(waist_cols[-1]) - body_center
-            if max(left, right) > 0 and abs(left - right) / max(left, right) > 0.30:
-                return 0.62
-    ratio = (torso_top + min_idx - y0) / max(1, span)
-    return float(np.clip(ratio, 0.45, 0.75))
+    contour_ratio: float | None = None
+    if torso_bottom > torso_top + 5:
+        widths = np.array([subj[r].sum() for r in range(torso_top, torso_bottom)], dtype=np.float32)
+        if len(widths) >= 5:
+            kernel = np.ones(5, dtype=np.float32) / 5
+            smooth = np.convolve(widths, kernel, mode="valid")
+            min_idx = int(np.argmin(smooth)) + 2
+            min_w = float(smooth.min())
+            median_w = float(np.median(smooth))
+            contour_ok = not (median_w > 0 and min_w / median_w > 0.95)
+            if contour_ok:
+                waist_row = torso_top + min_idx
+                all_cols = np.where(subj.any(axis=0))[0]
+                if len(all_cols) > 0 and 0 <= waist_row < h:
+                    body_center = (float(all_cols[0]) + float(all_cols[-1])) / 2
+                    waist_cols = np.where(subj[waist_row] > 0)[0]
+                    if len(waist_cols) > 4:
+                        left = body_center - float(waist_cols[0])
+                        right = float(waist_cols[-1]) - body_center
+                        if max(left, right) > 0 and abs(left - right) / max(left, right) > 0.30:
+                            contour_ok = False
+                if contour_ok:
+                    contour_ratio = float(np.clip((torso_top + min_idx - y0) / max(1, span), 0.45, 0.75))
+
+    if pose_ratio is not None:
+        if contour_ratio is not None:
+            delta = abs(pose_ratio - contour_ratio)
+            if delta > 0.05:
+                logger.debug(
+                    "waist interp vs contour delta=%.3f (interp=%.3f contour=%.3f)",
+                    delta,
+                    pose_ratio,
+                    contour_ratio,
+                )
+        return pose_ratio
+    if contour_ratio is not None:
+        return contour_ratio
+    return 0.62
 
 
 def clothing_mask(
@@ -960,7 +1025,9 @@ def clothing_mask(
 
     waist_r = _estimate_waist_ratio(subj, y0, span, pose_keypoints=pose_kp)
 
-    # 膝关键点(若有)用于 dress/onesie 下摆精确截断
+    # 膝关键点(若有)用于 dress/onesie 下摆精确截断.
+    # knee_r 是相对 subject span 的归一化比例 (0-1), 不是像素坐标;
+    # 后续 cut = knee_r - 0.02 中的 0.02 ≈ 身高 2% 安全边距.
     knee_r: float | None = None
     if pose_kp and pose_kp["knee"][2] >= 0.3:
         knee_y_px = pose_kp["knee"][1] * h

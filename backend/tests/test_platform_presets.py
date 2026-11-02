@@ -10,6 +10,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 from PIL import Image
 from platform_presets import (
+    _RTMPOSE_INPUT_WH,
+    _RTMPOSE_SPLIT_RATIO,
     PLATFORM_PRESETS,
     PLATFORM_SET,
     _build_inpaint_mask,
@@ -20,6 +22,7 @@ from platform_presets import (
     _heuristic_face_mask,
     _sdxl_inpaint_repair,
     _seam_repair,
+    _simcc_decode,
     apply_platform_preset,
     blend_tryon,
     center_crop_square,
@@ -795,6 +798,58 @@ def test_clothing_mask_dress_knee_keypoints(monkeypatch):
     # erode(9x9)+blur(sigma=6) feathers ~8px each side → row 155 safe, row 172 cut
     assert int(m[155, 60]) > 100
     assert int(m[172, 60]) < 40
+
+
+def test_simcc_decode_round_trip():
+    """正向编码→解码 round-trip 误差 < 1px, 锁死 crop→原图变换链."""
+    iw, ih = _RTMPOSE_INPUT_WH
+    crop_w, crop_h = iw * 2, ih * 2
+    cx0, cy0 = 100, 200
+    img_w, img_h = 1024, 1536
+
+    rng = np.random.RandomState(42)
+    orig_x = cx0 + rng.rand(17) * crop_w
+    orig_y = cy0 + rng.rand(17) * crop_h
+
+    mx = (orig_x - cx0) / crop_w * iw
+    my = (orig_y - cy0) / crop_h * ih
+    idx_x = np.round(mx * _RTMPOSE_SPLIT_RATIO).astype(int)
+    idx_y = np.round(my * _RTMPOSE_SPLIT_RATIO).astype(int)
+
+    sx = np.zeros((17, int(iw * _RTMPOSE_SPLIT_RATIO) + 8))
+    sy = np.zeros((17, int(ih * _RTMPOSE_SPLIT_RATIO) + 8))
+    sx[np.arange(17), idx_x] = 1.0
+    sy[np.arange(17), idx_y] = 1.0
+
+    kx, ky = _simcc_decode(sx, sy, (cx0, cy0, crop_w, crop_h), (img_w, img_h))
+    err = np.sqrt((kx * img_w - orig_x) ** 2 + (ky * img_h - orig_y) ** 2)
+    assert err.max() < 1.0, f"round-trip error {err.max():.3f}px >= 1px"
+
+
+def test_fake_deps_injection_sets_stub_modules():
+    """fake deps 注入后 mmdet/xtcocotools/mmcv.ops 是空壳模块."""
+    import types
+
+    import platform_presets
+
+    if not platform_presets._RTMPOSE_FAKE_DEPS:
+        import pytest
+
+        pytest.skip("RTMPOSE_FAKE_DEPS=0")
+    platform_presets._inject_fake_deps()
+    assert platform_presets._FAKE_DEPS_INJECTED
+    assert sys.modules["mmdet"].ConfigType is dict
+    assert isinstance(sys.modules["xtcocotools"], types.ModuleType)
+    assert hasattr(sys.modules["mmcv.ops"], "MultiScaleDeformableAttention")
+
+
+def test_estimate_waist_ratio_shoulder_low_visibility_falls_back():
+    """shoulder visibility < 0.3 → 回退轮廓法, 不硬插值."""
+    subj = np.zeros((200, 120), dtype=np.uint8)
+    subj[20:180, 20:100] = 1
+    kp = {"hip": (0.5, 0.68, 0.9), "shoulder": (0.5, 0.33, 0.2), "knee": (0.5, 0.95, 0.8)}
+    ratio = _estimate_waist_ratio(subj, 20, 160, pose_keypoints=kp)
+    assert ratio == 0.62
 
 
 def test_face_mask_down_margin_asymmetric(monkeypatch):
