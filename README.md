@@ -278,6 +278,53 @@ export STORE_STAFF_PASSWORD="your-secure-password"
 
 A10 上 SDXL + 双 ControlNet + IP-Adapter 使用 `enable_model_cpu_offload`，VAE fp32 解码。低于此规格可跑合成引擎或关 Depth ControlNet。训练 LoRA 同样按 A10 23GB 验证（约 11 分钟 / 800 步）。
 
+## 已跑通的 GPU 环境（2026-11-04）
+
+换衣管线在以下机器上实测跑通（配方：`LICENSE_MODE=commercial`，`VTON_WARP=0`，`VTON_DETAIL=0`，`VTON_LOCK_ID=1`，`OMP_NUM_THREADS=8`，`HF_ENDPOINT=https://hf-mirror.com`）。
+
+### 硬件
+
+| 项目 | 实测值 |
+|------|--------|
+| GPU | NVIDIA GeForce RTX 4090 D，24564 MiB，compute 8.9 |
+| 驱动 / CUDA | Driver 580.76.05，CUDA 13.0 |
+| CPU | Intel Xeon Platinum 8481C；容器 cgroup 配额 16 核（`cpu.max=1600000 100000`），宿主机可见 192 线程 |
+| 内存 | 容器 cgroup 80GB（`memory.max=85899345920`）；宿主机约 1 TiB |
+| 磁盘 | 系统盘 overlay 30GB；数据盘 50GB |
+| 系统 | Ubuntu 22.04.3 LTS，kernel 5.15.0-94-generic |
+
+### 软件与依赖
+
+解释器：Miniconda `conda 23.7.3` + Python 3.10.12（`/root/miniconda3/bin/python`），pip 23.2.1。系统 `/usr/bin/python3` 未装这些包，跑管线必须用 conda Python。
+
+| 包 | 版本 |
+|----|------|
+| torch | 2.13.0+cu130（cudnn 9.2.0） |
+| torchvision | 0.15.2 |
+| torchaudio | 2.11.0+cu130 |
+| diffusers | 0.40.0 |
+| transformers | 5.20.2 |
+| accelerate | 1.14.0 |
+| peft | 0.20.0 |
+| safetensors | 0.8.0 |
+| huggingface_hub | 1.33.0 |
+| controlnet_aux | 0.0.10 |
+| rembg | 2.0.50 |
+| onnxruntime | 1.15.1 |
+| xformers | 0.0.21 |
+| timm | 0.9.7 |
+| Pillow | 9.4.0 |
+| numpy | 1.23.5 |
+| opencv-python | 4.8.0.76 |
+| opencv-python-headless | 4.7.0.72 |
+| scikit-image | 0.20.0 |
+| scipy | 1.11.2 |
+| einops | 0.6.1 |
+
+该环境未装 `mmcv` / `mmengine` / `mmpose` / `mediapipe` / `fastapi` / `uvicorn`。RTMPose 走 fake deps 注入；MediaPipe 回退依赖本机 `pose_landmarker_full.task`（没有则腰线走 contour/default）。`torchvision 0.15.2` 与 `torch 2.13.0` 不匹配，导入时会警告 `image.so` 加载失败，不影响当前换衣推理。
+
+复现入口见 `scripts/gpu/`（`combo.py` / `combo2.py` / `run_r6.py` / `varA.py` / `varB.py` / `varC.py`）和 `scripts/run_tryon_batch.py`。
+
 ## GPU 部署（商用模式）
 
 ```bash

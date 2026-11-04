@@ -563,7 +563,13 @@ def foreground_mask(
                 so.inter_op_num_threads = 1
             except Exception:  # noqa: BLE001
                 so = None
-            _FG_SESSION = new_session("u2net", sess_opts=so) if so is not None else new_session("u2net")
+            try:
+                _FG_SESSION = new_session("u2net", sess_opts=so) if so is not None else new_session("u2net")
+            except TypeError:
+                # 部分 rembg 版本(如 2.0.50)的 new_session 不接受 sess_opts 关键字
+                # (报 "multiple values for argument 'sess_opts'")。退回普通会话;
+                # 线程数改由运行环境 OMP_NUM_THREADS 限制。
+                _FG_SESSION = new_session("u2net")
         except Exception:  # noqa: BLE001
             if not _FG_SESSION_WARNED:
                 logger.warning("rembg u2net session 初始化失败;force_white 回退纯颜色压白")
@@ -643,6 +649,10 @@ _WAIST_SOURCE_COUNTS: dict[str, int] = {"rtmpose": 0, "mediapipe": 0, "contour":
 _RTMPOSE_FAKE_DEPS = os.environ.get("RTMPOSE_FAKE_DEPS", "1") == "1"
 _FAKE_DEPS_INJECTED = False
 
+# MediaPipe PoseLandmarker (tasks API) 单例缓存 + 加载错误短路.
+_POSE_LANDMARKER = None
+_POSE_LANDMARKER_ERROR: str | None = None
+
 
 def _inject_fake_deps() -> None:
     """注入假 xtcocotools/mmdet/mmcv.ops 模块, 绕过 mmpose import 链.
@@ -696,6 +706,34 @@ def _inject_fake_deps() -> None:
     ops.__path__ = []
     ops.MultiScaleDeformableAttention = type("MSDA", (object,), {})
     sys.modules["mmcv.ops"] = ops
+
+    # mmcv.transforms 是 mmcv 2.x 才有的子包;老环境(mmcv 1.7)缺它而 mmpose 的
+    try:
+        import mmcv.transforms  # noqa: F401
+
+        have_tfs = True
+    except Exception:  # noqa: BLE001
+        have_tfs = False
+    if not have_tfs:
+        tfs = _t.ModuleType("mmcv.transforms")
+        tfs.__path__ = []
+
+        def _tfs_getattr(n):
+            if n.startswith("__") and n.endswith("__"):
+                raise AttributeError(n)
+            return _F
+
+        tfs.__getattr__ = _tfs_getattr
+        sys.modules["mmcv.transforms"] = tfs
+        tfs_utils = _t.ModuleType("mmcv.transforms.utils")
+        tfs_utils.__path__ = []
+
+        def _ident(*a, **kw):
+            return lambda f: f
+
+        tfs_utils.cache_randomness = _ident
+        tfs_utils.avoid_cache_randomness = _ident
+        sys.modules["mmcv.transforms.utils"] = tfs_utils
 
     _FAKE_DEPS_INJECTED = True
     # 断言 fake 生效
@@ -881,33 +919,97 @@ def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
         return None
 
 
-def _detect_pose_mediapipe(img: Image.Image) -> dict | None:
-    """MediaPipe Pose 回退."""
-    global _POSE_SESSION_WARNED
+def _pose_landmarker_task_path():
+    """找本地 pose_landmarker_full.task(NAS 模型目录 > MEDIAPIPE_HOME)。
+
+    找不到返回 None → MediaPipe 回退静默降级为 None(腰线回退 contour/default)。
+    模型约 9MB, 只认 >1MB 的文件避免误用残缺下载。
+    """
+    import os as _os
+
+    home = Path(_os.environ.get("MEDIAPIPE_HOME", "~/.mediapipe")).expanduser()
+    candidates = [
+        _POSE_ROOT / "pose_landmarker_full.task",
+        home / "pose_landmarker_full.task",
+    ]
+    for c in candidates:
+        try:
+            if c.is_file() and c.stat().st_size > 1_000_000:
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def _init_pose_landmarker():
+    """惰性创建并缓存 MediaPipe PoseLandmarker(mediapipe.tasks 新版 API)。
+
+    旧版 `mp.solutions.pose.Pose()` 在本机 mediapipe(无 solutions 模块)已被移除,
+    必须用 `mediapipe.tasks.python.vision.PoseLandmarker` + 下载的 .task 模型文件。
+    """
+    global _POSE_LANDMARKER, _POSE_LANDMARKER_ERROR
+    if _POSE_LANDMARKER is not None:
+        return _POSE_LANDMARKER
+    if _POSE_LANDMARKER_ERROR is not None:
+        return None
     try:
         import mediapipe as mp
-    except ImportError:
+        from mediapipe.tasks.python import vision
+    except Exception as e:  # noqa: BLE001
+        _POSE_LANDMARKER_ERROR = f"mediapipe.tasks 不可用: {e}"
+        logger.warning("MediaPipe 回退不可用: %s", _POSE_LANDMARKER_ERROR)
+        return None
+    model_path = _pose_landmarker_task_path()
+    if model_path is None:
+        _POSE_LANDMARKER_ERROR = "未找到 pose_landmarker_full.task(放 repo/models/mediapipe/ 或 MEDIAPIPE_HOME)"
+        logger.warning("MediaPipe 回退不可用: %s", _POSE_LANDMARKER_ERROR)
+        return None
+    try:
+        opts = vision.PoseLandmarkerOptions(
+            base_options=mp.tasks.BaseOptions(model_asset_path=str(model_path)),
+            min_pose_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+        _POSE_LANDMARKER = vision.PoseLandmarker.create_from_options(opts)
+        return _POSE_LANDMARKER
+    except Exception as e:  # noqa: BLE001
+        _POSE_LANDMARKER_ERROR = str(e)
+        logger.warning("MediaPipe PoseLandmarker 初始化失败: %s", e)
+        return None
+
+
+def _detect_pose_mediapipe(img: Image.Image) -> dict | None:
+    """MediaPipe Pose 回退(新版 tasks API: PoseLandmarker)。
+
+    依赖已下载的 pose_landmarker_full.task(见 _pose_landmarker_task_path)。
+    检测失败或无模型时静默返回 None, 腰线回退 contour/default。
+    """
+    global _POSE_SESSION_WARNED
+    lk = _init_pose_landmarker()
+    if lk is None:
         return None
 
     arr = np.array(img.convert("RGB"))
     try:
-        mp_pose = mp.solutions.pose
-        with mp_pose.Pose(
-            static_image_mode=True,
-            model_complexity=1,
-            enable_segmentation=False,
-            min_detection_confidence=0.5,
-        ) as pose:
-            res = pose.process(arr)
+        import mediapipe as mp
+
+        res = lk.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=arr))
         if not res.pose_landmarks:
             return None
-        lm = res.pose_landmarks.landmark
+        lm = res.pose_landmarks[0]
     except Exception:  # noqa: BLE001
+        if not _POSE_SESSION_WARNED:
+            logger.warning("MediaPipe inference failed; falling back")
+            _POSE_SESSION_WARNED = True
         return None
 
     def avg_lm(i, j):
         lm_l, lm_r = lm[i], lm[j]
-        return ((lm_l.x + lm_r.x) / 2, (lm_l.y + lm_r.y) / 2, (lm_l.visibility + lm_r.visibility) / 2)
+        return (
+            (lm_l.x + lm_r.x) / 2,
+            (lm_l.y + lm_r.y) / 2,
+            ((getattr(lm_l, "visibility", 0) or 0) + (getattr(lm_r, "visibility", 0) or 0)) / 2,
+        )
 
     hip = avg_lm(23, 24)
     shoulder = avg_lm(11, 12)

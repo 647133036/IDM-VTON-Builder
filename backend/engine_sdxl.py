@@ -927,6 +927,16 @@ def compose_tryon_sdxl(
             bg = PILImage.new("RGB", result.size, (255, 255, 255))
             bg.paste(result, mask=result.split()[-1])
             result = bg
+        # 保护掩膜 = 基模主体 并 生成图主体:
+        #  - 透视款:结果图 u2net 漏判半透明胸口,基模主体兜住躯干
+        #  - 宽松/宽袖:生成图主体兜住超出基模轮廓的袖子
+        # 不再内缩: force_white_background 已自带 +2px 边保留,内缩会与之抵消。
+        if subj_mask is not None:
+            _sg = foreground_mask(result)
+            if _sg is not None:
+                import numpy as _np
+
+                subj_mask = _np.logical_or(subj_mask > 0, _sg > 0).astype("uint8")
         result = force_white_background(result, subject_mask=subj_mask)
 
     rw, rh = result.size
