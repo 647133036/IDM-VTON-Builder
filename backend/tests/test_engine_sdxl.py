@@ -295,9 +295,10 @@ def test_align_garment_to_pose_returns_square_rgb(monkeypatch):
 
     # VTON_WARP 默认开启;输入一张纯色平铺衣,输出应为 1024x1024 RGB。
     garment = Image.new("RGB", (600, 800), (180, 60, 60))
-    out = engine_sdxl.align_garment_to_pose(garment, "women", "east_asia", "upper", 1024)
+    out, alpha = engine_sdxl.align_garment_to_pose(garment, "women", "east_asia", "upper", 1024)
     assert out.size == (1024, 1024)
     assert out.mode == "RGB"
+    assert alpha is None or alpha.mode in ("RGBA", "RGB")
 
 
 def test_align_garment_to_pose_disabled_returns_original(monkeypatch):
@@ -306,8 +307,9 @@ def test_align_garment_to_pose_disabled_returns_original(monkeypatch):
 
     monkeypatch.setenv("VTON_WARP", "0")
     garment = Image.new("RGB", (400, 500), (90, 90, 120))
-    out = engine_sdxl.align_garment_to_pose(garment, "men", "western_europe", "upper", 1024)
+    out, alpha = engine_sdxl.align_garment_to_pose(garment, "men", "western_europe", "upper", 1024)
     assert out is garment
+    assert alpha is None
 
 
 def test_align_garment_to_pose_changes_pixels_vs_flat(monkeypatch):
@@ -320,7 +322,7 @@ def test_align_garment_to_pose_changes_pixels_vs_flat(monkeypatch):
     d = ImageDraw.Draw(garment)
     d.rectangle([120, 100, 380, 620], fill=(60, 140, 90, 255))
     flat = engine_sdxl.fit_square(garment.convert("RGB"), 1024)
-    aligned = engine_sdxl.align_garment_to_pose(garment.convert("RGB"), "women", "east_asia", "upper", 1024)
+    aligned, _alpha = engine_sdxl.align_garment_to_pose(garment.convert("RGB"), "women", "east_asia", "upper", 1024)
     a = np.asarray(flat)
     b = np.asarray(aligned)
     assert a.shape == b.shape
@@ -337,8 +339,8 @@ def test_align_garment_to_pose_dress_differs_from_upper():
     d = ImageDraw.Draw(garment)
     d.rectangle([120, 100, 380, 620], fill=(60, 140, 90, 255))
     g = garment.convert("RGB")
-    upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024))
-    dress = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "dress", 1024))
+    upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024)[0])
+    dress = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "dress", 1024)[0])
     assert not np.array_equal(upper, dress)
 
 
@@ -352,8 +354,8 @@ def test_align_garment_to_pose_lower_narrower_than_upper():
     d = ImageDraw.Draw(garment)
     d.rectangle([120, 100, 380, 620], fill=(60, 140, 90, 255))
     g = garment.convert("RGB")
-    upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024))
-    lower = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "lower", 1024))
+    upper = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "upper", 1024)[0])
+    lower = np.asarray(engine_sdxl.align_garment_to_pose(g, "women", "east_asia", "lower", 1024)[0])
 
     # 非白内容列
     upper_cols = np.where(upper.mean(axis=(0, 2)) < 240)[0]

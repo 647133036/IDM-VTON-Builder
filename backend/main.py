@@ -9,6 +9,7 @@ from engine import engine_status
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from platform_presets import PLATFORM_SET as _PLATFORM_SET
 from push import push_store
 from pydantic import BaseModel, Field
 from store import (
@@ -669,12 +670,14 @@ def api_job(job_id: str, _: dict = Depends(current_user)):
 
 
 _AUDIENCE_SET = {"women", "men", "girls", "boys", "baby", "auto"}
-_GARMENT_SET = {"upper", "lower", "dress", "onesie", "auto"}
+_GARMENT_SET = {"upper", "lower", "dress", "onesie", "tunic", "auto"}
 _BG_SET = {"white", "transparent"}
 _FMT_SET = {"jpg", "jpeg", "png"}
 
 
-def _validate_batch_params(audience: str, garment_type: str, background: str, output_format: str) -> None:
+def _validate_batch_params(
+    audience: str, garment_type: str, background: str, output_format: str, platform: str = "none"
+) -> None:
     if audience not in _AUDIENCE_SET:
         raise HTTPException(status_code=400, detail=f"Invalid audience: {audience}")
     if garment_type not in _GARMENT_SET:
@@ -683,6 +686,8 @@ def _validate_batch_params(audience: str, garment_type: str, background: str, ou
         raise HTTPException(status_code=400, detail=f"Invalid background: {background}")
     if output_format not in _FMT_SET:
         raise HTTPException(status_code=400, detail=f"Invalid output_format: {output_format}")
+    if platform not in _PLATFORM_SET:
+        raise HTTPException(status_code=400, detail=f"Invalid platform: {platform}")
 
 
 @app.post("/api/jobs/batch")
@@ -693,10 +698,11 @@ async def api_batch(
     garment_type: str = Form("auto"),
     output_format: str = Form("jpg"),
     background: str = Form("white"),
+    platform: str = Form("none"),
     bound_store_id: str = Form(""),
     _: dict = Depends(current_user),
 ):
-    _validate_batch_params(audience, garment_type, background, output_format)
+    _validate_batch_params(audience, garment_type, background, output_format, platform)
     if not files:
         raise HTTPException(status_code=400, detail="Please upload at least one garment image")
     if len(files) > _MAX_BATCH_FILES:
@@ -734,6 +740,7 @@ async def api_batch(
                 "garment_type": garment_type,
                 "output_format": output_format,
                 "background": background,
+                "platform": platform,
                 "source_name": display_name,
                 "source_url": public_url(dest),
                 "title": Path(display_name).stem,

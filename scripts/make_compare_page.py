@@ -10,7 +10,10 @@ Usage:
       --runs  /mnt/workspace/vton/market_analysis/vton_runs \
       --out   /mnt/workspace/vton/market_analysis/vton_runs/../vton_compare
 """
-import argparse, json, sys
+
+import argparse
+import json
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,11 +50,12 @@ def main():
         degraded = " ⚠degraded" if r.get("degraded") else ""
         rows.append(f"""
     <div class="card">
-      <div class="label">Pair {r.get('pair', i)}{degraded} &nbsp; <span class="meta">{(r.get('prompt') or '')[:120]}</span></div>
+      <div class="label">Pair {r.get("pair", i)}{degraded}
+        &nbsp; <span class="meta">{(r.get("prompt") or "")[:120]}</span></div>
       <div class="cols">
-        <figure><div class="cap">garment</div><img src="{rel(g_dir / g) if g else ''}"></figure>
-        <figure><div class="cap">person</div><img src="{rel(p_dir / p) if p else ''}"></figure>
-        <figure><div class="cap">try-on result</div><img src="{rel(o_path) if o_path else ''}"></figure>
+        <figure><div class="cap">garment</div><img src="{rel(g_dir / g) if g else ""}"></figure>
+        <figure><div class="cap">person</div><img src="{rel(p_dir / p) if p else ""}"></figure>
+        <figure><div class="cap">try-on result</div><img src="{rel(o_path) if o_path else ""}"></figure>
       </div>
     </div>""")
 
@@ -67,8 +71,9 @@ figure{{margin:0}} img{{width:100%;border-radius:8px;background:#000;min-height:
 </style></head><body>
 <h1>VTON try-on comparison</h1>
 <p class="note">garment (flat-lay) | person (model photo) | try-on result — 共 {len(report)} 对。
-生成于 {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}。判断标准:衣服必须"穿"在模特身上(垂坠/褶皱随身材),而非平铺贴图。</p>
-{''.join(rows)}
+生成于 {__import__("datetime").datetime.now():%Y-%m-%d %H:%M}。
+判断标准:衣服必须"穿"在模特身上(垂坠/褶皱随身材),而非平铺贴图。</p>
+{"".join(rows)}
 </body></html>"""
     dest = out / "index.html"
     dest.write_text(html)

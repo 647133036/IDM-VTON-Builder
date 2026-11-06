@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image
 from platform_presets import (
     _correct_skin_tone,
+    _detect_pose_keypoints,
     _sdxl_inpaint_repair,
     _seam_repair,
     blend_tryon,
@@ -19,6 +20,7 @@ from platform_presets import (
     foreground_mask,
     reapply_garment_detail,
 )
+from prewhiten import prewhiten_input
 
 logger = logging.getLogger("atelier.engine_sdxl")
 
@@ -30,6 +32,7 @@ _sdxl_state: dict = {
     "ip_adapter_reason": "",
     "depth_loaded": False,
     "lora_loaded": False,
+    "lora_install_failed": False,
 }
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -77,6 +80,7 @@ ETHNICITY_PROMPTS = {
 
 GARMENT_PROMPT_SUFFIX = {
     "upper": "shirt, t-shirt, blouse",
+    "tunic": "tunic top, longline blouse, mid-length shirt with hem at the hips or upper thighs",
     "dress": "dress, gown, skirt",
     "lower": "pants, trousers, shorts, jeans",
     "onesie": "onesie, romper, baby body",
@@ -191,7 +195,7 @@ def _infer_ip_adapter_input_dim(weight_path: Path) -> int | None:
                     return int(shape[0])
                 if not is_1d and len(shape) == 2:
                     return int(shape[1])
-    except Exception:
+    except Exception:  # 权重文件损坏/格式不符:跳过该候选,不阻断其它
         # 损坏/格式不符的权重文件跳过,不能让它阻断其它候选。
         logger.debug("Could not inspect IP-Adapter weight %s", weight_path, exc_info=True)
     return None
@@ -267,6 +271,50 @@ def ip_adapter_available() -> bool:
     return weight_ok and enc_ok
 
 
+_engine_status_cache: dict | None = None
+
+
+def engine_status(force: bool = False) -> dict:
+    """SDXL 引擎资产自检(纯文件系统, 不加载 GPU/不联网)。
+
+    供 download_weights.sh 校验与开机 depth P0 回归确认用。返回各关键权重
+    的在位布尔 + depth 链是否完整(controlnet_depth 模型 + dpt midas ckpt)。
+
+    进程级缓存(远端复核#5: 此前 depth 未加载时**每张图**重扫一遍磁盘):
+    权重在一次进程生命周期内不会热更, 结果稳定; CLI/独立进程每次都是新进程,
+    不受缓存影响。force=True 可显式重扫。
+    """
+    global _engine_status_cache
+    if _engine_status_cache is not None and not force:
+        return dict(_engine_status_cache)
+
+    def _has(p: Path) -> bool:
+        return p.exists()
+
+    annotators = SDXL_DIR / "annotators"
+    depth_dir = SDXL_DIR / "controlnet_depth"
+    depth_model = (depth_dir / "config.json").is_file()
+    depth_midas = (annotators / "dpt_hybrid-midas-501f0c75.pt").is_file()
+    _engine_status_cache = {
+        "engine": "sdxl",
+        "sdxl_base": _has(SDXL_DIR / "sdxl_base" / "unet"),
+        "controlnet_openpose": _has(SDXL_DIR / "controlnet_openpose" / "config.json"),
+        "controlnet_canny": _has(SDXL_DIR / "controlnet_canny" / "config.json"),
+        "controlnet_depth": depth_model,
+        "depth_midas_ckpt": depth_midas,
+        # depth 只有「ControlNet 模型 + MiDaS annotator ckpt」两者都在才真能生效;
+        # 缺任一都会静默退 pose+canny 或灰图@scale0(pipeline audit P0-5/P0-6)。
+        "depth_ready": depth_model and depth_midas,
+        "ip_adapter": ip_adapter_available(),
+        "lora": _has(SDXL_DIR / "lora" / "adapter_model.safetensors"),
+        "openpose_annotator": _has(annotators / "body_pose_model.pth"),
+        "rtmpose": _has(_REPO_ROOT / "models" / "rtmpose" / "rtmpose-m_coco.pth"),
+        "mediapipe": _has(_REPO_ROOT / "models" / "mediapipe" / "pose_landmarker_full.task"),
+        "u2net_seg": _has(_REPO_ROOT / "models" / "seg" / "u2net.onnx"),
+    }
+    return dict(_engine_status_cache)
+
+
 _pose_detector = None
 _canny_detector = None
 _depth_detector = None
@@ -314,7 +362,9 @@ def _get_depth_control(image: Image.Image) -> Image.Image:
                     _depth_detector = MidasDetector.from_pretrained(str(annotator_dir))
                 else:
                     _depth_detector = MidasDetector.from_pretrained("lllyasviel/Annotators")
-    return _depth_detector(image)
+    # 显式 1024(pipeline audit 行53):MidasDetector 默认 detect/image_resolution=512,
+    # 而 canny 用 1024 → depth 半分辨率再上采样, 贴合收益打折。与 canny 对齐到 1024。
+    return _depth_detector(image, detect_resolution=1024, image_resolution=1024)
 
 
 def _load_trained_lora(pipe, lora_dir: Path) -> str | None:
@@ -363,7 +413,7 @@ def _apply_lora_scale(pipe) -> None:
             pipe.set_adapters(["default"], adapter_weights=[scale])
             logger.info("LoRA scale -> %s (env VTON_LORA)", scale)
             return
-        except Exception:
+        except Exception:  # diffusers 版本差异:set_adapters 缺失时走 set_lora_scale
             logger.debug("pipe.set_adapters failed; trying fuse-less scale", exc_info=True)
     if hasattr(pipe, "set_lora_scale"):
         pipe.set_lora_scale(scale)
@@ -376,7 +426,9 @@ def align_garment_to_pose(
     ethnicity: str,
     garment_type: str,
     canvas: int = 1024,
-) -> Image.Image:
+    sleeve_len: str | None = None,
+    pose: dict | None = None,
+) -> tuple[Image.Image, Image.Image | None]:
     """把平铺衣"掰"到人体姿态:按目标人群肩宽/轮廓缩放并做 2D 网格变形,
     得到一张"正穿在人身上"的服装参考图,供 SDXL IP-Adapter 使用。
 
@@ -392,9 +444,14 @@ def align_garment_to_pose(
     修正仅按肩宽缩放导致的 logo/花纹垂直偏位。
 
     VTON_WARP=0 时关闭(回退原平铺图);VTON_WARP_STRENGTH 可覆盖默认强度。
+
+    返回 (白底 RGB 参考图, 带 alpha 的 RGBA 参考图或 None)。
+    第二项供 pattern-lock 贴回用:alpha=0 的画布白底区域不被贴进模特
+    (修"袖子白晕/脖子灰带"——白底参考图整块贴入 mask 内无衣料区)。
+    未 warp(回退/关闭)时第二项为 None,调用方退回白底启发式。
     """
     if os.environ.get("VTON_WARP", "1") == "0":
-        return garment
+        return garment, None
     try:
         from engine import (
             GARMENT_BOX,
@@ -402,11 +459,12 @@ def align_garment_to_pose(
             _warp_garment,
             fit_garment_to_body,
             garment_alpha,
+            refit_sleeves_to_arms,
             torso_box,
         )
     except ImportError:
         logger.debug("align_garment_to_pose: engine funcs unavailable; passthrough")
-        return garment
+        return garment, None
 
     box = torso_box(audience, ethnicity)
     adj = GARMENT_BOX.get(garment_type, GARMENT_BOX["upper"])
@@ -434,9 +492,20 @@ def align_garment_to_pose(
     if warped.mode != "RGBA":
         warped = warped.convert("RGBA")
 
+    # 长袖几何对齐: 2D warp 折不下横向摊开的袖子, 这里把平铺衣的左右袖
+    # 旋转 90° 合成到画布手臂列, 让参考图在手臂上有真实袖纹(修"长袖变无袖")。
+    # 竖直锚点用 pose 的肩/腕归一化 y(无 pose 退回全身比例), 横向按全身正面基模标定。
+    # 浅色衣 + 白底时 garment_alpha 抠不净、贴入带白底 → 可用 VTON_SLEEVE_REFIT=0
+    # 一键关闭本步(退回仅 prompt+mask 走廊保证长袖), 不改代码即可 A/B。
+    if sleeve_len == "long" and os.environ.get("VTON_SLEEVE_REFIT", "1") != "0":
+        try:
+            warped = refit_sleeves_to_arms(warped, garment, canvas, pose, sleeve_len)
+        except Exception:
+            logger.exception("refit_sleeves_to_arms failed; keeping torso-only reference")
+
     out = Image.new("RGB", (canvas, canvas), (255, 255, 255))
     out.paste(warped, (0, 0), warped)
-    return out
+    return out, warped
 
 
 def crop_garment_to_content(
@@ -618,6 +687,7 @@ def _get_sdxl_pipe(device, dtype):
 
             lora_dir = SDXL_DIR / "lora"
             lora_loaded = False
+            lora_install_failed = False
             try:
                 lora_fmt = _load_trained_lora(pipe, lora_dir)
                 if lora_fmt:
@@ -625,6 +695,15 @@ def _get_sdxl_pipe(device, dtype):
                     logger.info("Loaded trained LoRA (%s) from %s", lora_fmt, lora_dir)
             except Exception:
                 logger.exception("Failed to load trained LoRA; continuing without it")
+                # 区分"未安装"(正常态, _load_trained_lora 无权重时提前返回 None 不抛异常)
+                # 与"已安装但加载失败"(真降级)。lora_io 的 sys.path 注入发生在 _load_trained_lora
+                # 内部(异常来自 load 阶段时 import 已成功), 故此处可复检权重在位性。
+                try:
+                    from lora_io import lora_weight_path
+
+                    lora_install_failed = lora_weight_path(lora_dir) is not None
+                except Exception:  # noqa: BLE001
+                    lora_install_failed = False
 
             # 权重必须与本地 image_encoder 的输出维度配套:base(1024)在 1280 编码器上
             # 会 shape mismatch,plus/plus-face(1280)才兼容。按实际 image_proj 维度选择。
@@ -676,6 +755,7 @@ def _get_sdxl_pipe(device, dtype):
             _sdxl_state["ip_adapter_reason"] = ip_adapter_reason
             _sdxl_state["depth_loaded"] = depth_loaded
             _sdxl_state["lora_loaded"] = lora_loaded
+            _sdxl_state["lora_install_failed"] = lora_install_failed
             return pipe, ip_adapter_loaded, ip_adapter_reason
         except Exception:
             # 加载失败必须释放已占显存,否则残留半成品会持续占用 VRAM(NEW-H3)。
@@ -688,6 +768,7 @@ def _get_sdxl_pipe(device, dtype):
                 _sdxl_state["ip_adapter_reason"] = ""
                 _sdxl_state["depth_loaded"] = False
                 _sdxl_state["lora_loaded"] = False
+                _sdxl_state["lora_install_failed"] = False
             try:
                 import gc
 
@@ -719,6 +800,22 @@ def compose_tryon_sdxl(
 
     base_img = Image.open(base_path).convert("RGB")
     garment_img = Image.open(garment_path).convert("RGB")
+
+    # 强制输入步骤(pipeline audit P0-3/行4 + 守卫 行41): 四角 flood-fill 预白底,
+    # 治"灰 cyclorama → 头后灰块"。带 changed-pixel 比例 + u2net 主体交集守卫,
+    # 越界告警并回退原图(绝不静默产出灰块/被啃的图)。VTON_PREWHITEN=0 可关。
+    _pw_base_img, pw_base = prewhiten_input(base_img)
+    if pw_base.get("status") not in ("applied", "already_white", "disabled"):
+        logger.warning("base prewhiten not applied: %s", pw_base.get("reason"))
+    base_img = _pw_base_img
+    # 远端复核#4: 成衣(浅面料)预白底可被 flood-fill 啃 —— 默认开(fail-closed 守卫兜底),
+    # 但允许按资产类型单独关: VTON_PREWHITEN_GARMENT=0 → 成衣侧不预白, 底图侧不受影响。
+    if os.environ.get("VTON_PREWHITEN_GARMENT", "1") == "0":
+        _pw_g_img, pw_garment = garment_img, {"status": "disabled", "reason": "VTON_PREWHITEN_GARMENT=0"}
+    else:
+        _pw_g_img, pw_garment = prewhiten_input(garment_img)
+    garment_img = _pw_g_img
+
     if crop_garment:
         garment_img = crop_garment_to_content(garment_img)
 
@@ -740,22 +837,64 @@ def compose_tryon_sdxl(
     # 其他→upper。
     if garment_type == "auto":
         aspect = garment_extent.get("aspect", 1.0) if garment_extent else 1.0
-        if aspect > 1.6:
-            garment_type = "dress"
-        elif aspect < 0.7:
+        hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
+        if aspect < 0.7:
             garment_type = "lower"
+        elif aspect > 1.6:
+            garment_type = "dress"
+        elif hem in ("mid", "long"):
+            # 衣长过腰(髋/大腿)但没到连衣裙级: 中长款, 走 tunic(下摆→髋/大腿)。
+            # 旧逻辑全判 upper → 下摆被 warp 框钉在腰部("齐腰截断"根因之一)。
+            garment_type = "tunic"
         else:
             garment_type = "upper"
-        logger.info("auto garment_type -> %s (aspect=%s)", garment_type, aspect)
+        logger.info("auto garment_type -> %s (aspect=%s hem=%s)", garment_type, aspect, hem)
+    # 品类 vs hem 检测互校验: 不一致大声 warning(防止"各跑各的"——品类定画布/
+    # prompt, hem 定 mask 截线, 两者打架时出图必错位)。
+    _hem_x = garment_extent.get("hem", "waist") if garment_extent else "waist"
+    if (
+        (garment_type == "tunic" and _hem_x == "waist")
+        or (garment_type in ("upper", "onesie") and _hem_x in ("mid", "long"))
+        or (garment_type == "dress" and _hem_x == "waist")
+    ):
+        logger.warning(
+            "garment_type=%s conflicts with garment extent hem=%s — warp box/prompt and "
+            "mask cut line may disagree; check the garment flat-lay image or pass "
+            "garment_type explicitly",
+            garment_type,
+            _hem_x,
+        )
+
+    # mask debug tag(VTON_DEBUG_MASK 落盘区分衣物; 串行跑场景, env 共享):
+    # 在此设置, 后面 clothing_mask 的阶段图(hemcut/corridor/carve/final)可拿到。
+    os.environ["VTON_DEBUG_TAG"] = os.path.basename(str(garment_path))[:32]
 
     # 几何对齐:把平铺衣掰到目标人群姿态,作为 IP-Adapter 参考图。
     # VTON_WARP=1(默认)时,生成器看到的是"已穿在身上的衣服",而非平铺贴图,
     # 显著改善衣服在身上的位置/比例/袖长;失败或关闭时回退原平铺图。
     warp_enabled = os.environ.get("VTON_WARP", "1") != "0"
     cloth_ref = cloth_img
+    cloth_ref_alpha: Image.Image | None = None
     if warp_enabled:
         try:
-            cloth_ref = align_garment_to_pose(garment_img, audience, ethnicity, garment_type, target_w)
+            _sleeve = garment_extent.get("sleeve") if garment_extent else None
+            # 长袖几何对齐需要肩/腕竖直锚点: 用 RTMPose 定位目标模特(基图)的肩/腕。
+            # 拿不到 pose 时 refit 退回全身比例(仍安全)。
+            _pose = None
+            if _sleeve == "long":
+                try:
+                    _pose = _detect_pose_keypoints(human_img)
+                except Exception:
+                    logger.exception("pose for sleeve refit failed; refit will use full-body ratios")
+            cloth_ref, cloth_ref_alpha = align_garment_to_pose(
+                garment_img,
+                audience,
+                ethnicity,
+                garment_type,
+                target_w,
+                sleeve_len=_sleeve,
+                pose=_pose,
+            )
         except Exception:
             logger.exception("align_garment_to_pose failed; using flat cloth reference")
 
@@ -765,6 +904,18 @@ def compose_tryon_sdxl(
     garment_suffix = GARMENT_PROMPT_SUFFIX.get(garment_type, "")
     if garment_suffix:
         prompt = f"{prompt}, wearing {garment_suffix}"
+    # 袖型写入 prompt:长袖须盖到腕;短袖停在上臂;无袖露整臂。
+    # 不写时 SDXL 常把三种袖画成同一种, 后处理 mask 也救不回。
+    _sleeve_prompt = (garment_extent or {}).get("sleeve")
+    if _sleeve_prompt == "long":
+        prompt = (
+            f"{prompt}, the garment has long sleeves: sleeve fabric fully covers "
+            f"each arm down to the wrist, no bare forearms"
+        )
+    elif _sleeve_prompt == "short":
+        prompt = f"{prompt}, the garment has short sleeves ending at the upper arm, forearms and hands remain bare"
+    elif _sleeve_prompt == "sleeveless":
+        prompt = f"{prompt}, the garment is sleeveless, both arms fully bare from the shoulder down, no sleeve fabric"
     # 穿着贴合:衣服必须"穿"在模特身上——面料垂坠、褶皱随身材(不是平铺贴图)。
     prompt = f"{prompt}, {FIT_PROMPTS.get(fit, FIT_PROMPTS['regular'])}"
     # 摄影质感(防假人感):写实 dslr 质感 + 面料细节。
@@ -781,6 +932,16 @@ def compose_tryon_sdxl(
     )
 
     pipe, ip_adapter_loaded, ip_adapter_reason = _get_sdxl_pipe(device, dtype)
+
+    # 降级信号合成(pipeline audit 行8):由 IP-Adapter + depth + LoRA + mask 各环节
+    # 的失败备注共同合成, 不再只编码 IP-Adapter。每个环节失败时往这里塞原因。
+    degraded_reasons: list[str] = []
+    if ip_adapter_reason:
+        degraded_reasons.append(ip_adapter_reason)
+    # LoRA 语义(远端复核#2): 「未安装」(机器没训过权重)≠ 降级, 每张图不标;
+    # 只有「已安装但加载失败」才计入样式降级(与 L223「未安装 ≠ 降级」对齐)。
+    if _sdxl_state.get("lora_install_failed"):
+        degraded_reasons.append("trained LoRA present but failed to load (style will not match)")
 
     _ipa = os.environ.get("VTON_IPA")
     if ip_adapter_loaded and _ipa:
@@ -802,15 +963,38 @@ def compose_tryon_sdxl(
             control_images.append(_get_depth_control(human_img))
             control_scales.append(0.95)
         except Exception:
-            logger.exception("Depth control failed; continuing without it")
-            # 保底:中性灰占位图,保证与 controlnet 数量一致,避免 check_inputs 报错。
-            control_images.append(PILImage.new("RGB", (target_w, target_h), (128, 128, 128)))
+            # fail-loud(pipeline audit P0-6/行23 + 远端复核#1): 第二条 ControlNet 此时是
+            # depth 模型(L622-631)。canny 边缘图对 depth 模型是错模态输入(负贡献),
+            # 不能喂 canny@0.55 —— 改喂中性灰度图 @ scale 0.0(零贡献, 等效关掉 depth 分支),
+            # 并记录降级原因。canny@品类 scale 只用于第二条确为 canny 模型的分支(L883)。
+            logger.exception("Depth control FAILED at runtime; depth input zeroed (DEGRADED)")
+            degraded_reasons.append(
+                "depth ControlNet loaded but MiDaS depth control failed at runtime; "
+                "depth input zeroed (grayscale @ scale 0.0) — garment depth structure not enforced"
+            )
+            control_images.append(cloth_ref.convert("L"))
             control_scales.append(0.0)
     else:
+        # depth 未加载。资产其实齐(controlnet_depth 模型 + dpt midas 都在)却没加载
+        # = 真问题(P0-5): 标降级。资产本就缺 = 深度可选, 只 loud warning 不算降级。
+        if engine_status().get("depth_ready"):
+            degraded_reasons.append(
+                "depth assets present (controlnet_depth + dpt midas) but depth_loaded=False — depth silently inactive"
+            )
+            logger.error(
+                "depth assets are present but the pipeline did NOT load the depth ControlNet; "
+                "the advertised dual-ControlNet is running pose+canny. INVESTIGATE."
+            )
+        else:
+            logger.warning(
+                "depth ControlNet not available (missing models/sdxl/controlnet_depth or "
+                "annotators/dpt_hybrid-midas-501f0c75.pt); running pose+canny. See "
+                "scripts/download_weights.sh ONLY=depth to enable depth."
+            )
         control_images.append(_get_canny_control(cloth_ref))
         # 按品类自动调节 Canny 强度:实心面料(upper/dress/onesie)用 0.55 锁图案;
         # 薄纱/网眼类用 0.4 防鬼影。VTON_CANNY 显式覆盖优先级最高。
-        _canny_defaults = {"upper": 0.55, "dress": 0.55, "onesie": 0.55, "lower": 0.45}
+        _canny_defaults = {"upper": 0.55, "tunic": 0.55, "dress": 0.55, "onesie": 0.55, "lower": 0.45}
         _canny_default = _canny_defaults.get(garment_type, 0.55)
         control_scales.append(float(os.environ.get("VTON_CANNY", str(_canny_default))))
 
@@ -847,7 +1031,11 @@ def compose_tryon_sdxl(
     # mask 255=衣服区(reapply 在此贴回原衣纹理颜色),0=人脸/手/背景
     # (blend_tryon 在此贴回原图像素保身份)。两者互补:reapply 管衣服保真,
     # 身份锁管人脸不走形。任一开关开启才算 mask,都关时跳过省一次推理。
-    need_mask = os.environ.get("VTON_DETAIL", "1") != "0" or os.environ.get("VTON_LOCK_ID", "1") != "0"
+    need_mask = (
+        os.environ.get("VTON_DETAIL", "1") != "0"
+        or os.environ.get("VTON_LOCK_ID", "1") != "0"
+        or os.environ.get("VTON_PATTERN_LOCK", "1") != "0"
+    )
     # subject_mask(rembg 前景)算一次,复用给 clothing_mask 和 force_white_background:
     # clothing_mask 用它做 cv2 5.0 启发式脸区兜底; force_white_background 用它
     # 保护主体(含胸口/脖子)不被压白——不传时 cv2 5.0 下胸口白块根因。
@@ -863,19 +1051,97 @@ def compose_tryon_sdxl(
         if need_mask
         else None
     )
+    # need_mask 为真却拿不到 mask(pipeline audit 行6):detail/lock/seam/skin/inpaint
+    # 全部后处理会被静默跳过 → 返回"裸 SDXL 帧"。必须 warning + 记降级, 不静默。
+    if need_mask and shared_mask is None:
+        _mask_reason = (
+            "clothing_mask unavailable (subject mask missing or subject too small); "
+            "detail/identity-lock/seam/skin/inpaint post-processing all SKIPPED — raw SDXL frame"
+        )
+        logger.warning("DEGRADED: %s", _mask_reason)
+        degraded_reasons.append(_mask_reason)
 
-    # 商品细节回贴:VTON_PATTERN_LOCK=1(默认)时 warp 衣直接覆盖衣服区,
-    # 生成图只调褶皱光影;关闭则走高频柔光 + Reinhard 颜色迁移。
-    # VTON_DETAIL=1(默认)开启;关闭时跳过。
-    detail_applied = False
-    if os.environ.get("VTON_DETAIL", "1") != "0" and shared_mask is not None:
+    # mask 可视化(VTON_DEBUG_MASK=1, 输出到 VTON_DEBUG_DIR, 默认 .): clothing_mask
+    # 叠加基模(绿=mask 区, 红=主体非 mask 区) + warp 参考图 + extent 中央条带边界 +
+    # 肤色校正排除区红线(bbox 顶 12% = 下巴)。哪块被 mask 圈进/挖出, 直接看图;
+    # 中间各步(hemcut/corridor/carve/final)看 clothing_mask 落的 maskstage_* 阶段图。
+    if os.environ.get("VTON_DEBUG_MASK", "0") == "1" and shared_mask is not None:
         try:
-            pattern_lock = os.environ.get("VTON_PATTERN_LOCK", "1") != "0" and warp_enabled
+            import cv2 as _cvd
+            import numpy as _npd
+
+            _ddir = Path(os.environ.get("VTON_DEBUG_DIR", "."))
+            _ddir.mkdir(parents=True, exist_ok=True)
+            _tag = os.environ.get("VTON_DEBUG_TAG", "img")
+            _vis = _npd.array(human_img.convert("RGB"))
+            _cm = _npd.asarray(shared_mask, dtype=_npd.float32)
+            if _cm.shape[:2] != _vis.shape[:2]:
+                _cm = _cvd.resize(_cm, (_vis.shape[1], _vis.shape[0]), interpolation=_cvd.INTER_LINEAR)
+            _mz = _cm > 127
+            _ov = _vis.copy()
+            _g = _ov[_mz].astype(_npd.float32) * 0.55 + _npd.array([0, 190, 0], _npd.float32) * 0.45
+            _ov[_mz] = _g.astype("uint8")
+            if subj_mask is not None:
+                _sm = _npd.asarray(subj_mask)
+                if _sm.shape[:2] != _vis.shape[:2]:
+                    _sm = _cvd.resize(_sm, (_vis.shape[1], _vis.shape[0]), interpolation=_cvd.INTER_NEAREST)
+                _sz = (_sm > 0) & ~_mz
+                _r = _ov[_sz].astype(_npd.float32) * 0.55 + _npd.array([220, 0, 0], _npd.float32) * 0.45
+                _ov[_sz] = _r.astype("uint8")
+            _nw = _vis.mean(axis=2) < 240
+            if _nw.any():
+                _ysn = _npd.where(_nw.any(axis=1))[0]
+                _fb = int(_ysn[0] + (_ysn[-1] - _ysn[0]) * 0.12)
+                _cvd.line(_ov, (0, _fb), (_vis.shape[1], _fb), (0, 0, 255), 3)
+            _cvd.imwrite(
+                str(_ddir / f"maskdebug_{_tag}.jpg"),
+                _cvd.cvtColor(_ov, _cvd.COLOR_RGB2BGR),
+                [int(_cvd.IMWRITE_JPEG_QUALITY), 90],
+            )
+            _cvd.imwrite(
+                str(_ddir / f"refdebug_{_tag}.jpg"),
+                _cvd.cvtColor(_npd.array(cloth_ref.convert("RGB")), _cvd.COLOR_RGB2BGR),
+                [int(_cvd.IMWRITE_JPEG_QUALITY), 90],
+            )
+            if garment_extent:
+                _gd = _npd.array(garment_img.convert("RGB"))
+                _gw = _gd.shape[1]
+                _cvd.rectangle(_gd, (int(_gw * 0.22), 0), (int(_gw * 0.78), _gd.shape[0] - 1), (0, 128, 255), 2)
+                _cvd.putText(_gd, f"extent={garment_extent}", (8, 24), _cvd.FONT_HERSHEY_SIMPLEX, 0.6, (0, 128, 255), 2)
+                _cvd.imwrite(
+                    str(_ddir / f"extentdebug_{_tag}.jpg"),
+                    _cvd.cvtColor(_gd, _cvd.COLOR_RGB2BGR),
+                    [int(_cvd.IMWRITE_JPEG_QUALITY), 90],
+                )
+            logger.info(
+                "VTON_DEBUG_MASK dump -> %s (maskdebug/refdebug/extentdebug_%s + maskstage_* 阶段图)",
+                _ddir,
+                _tag,
+            )
+        except Exception:
+            logger.warning("VTON_DEBUG_MASK dump failed", exc_info=True)
+
+    # 商品细节回贴:VTON_PATTERN_LOCK=1 且已 warp 时, warp 衣直接覆盖衣服区,
+    # 生成图只调褶皱光影;否则走高频柔光 + Reinhard 颜色迁移。
+    # PATTERN_LOCK 与 DETAIL 解耦:关 DETAIL 仍可贴回颜色/纹理(配方 C 花纹丢失根因)。
+    # WARP=0 时几何 overlay 会对不齐, 退回 Reinhard, 不当成"已锁花纹"。
+    detail_applied = False
+    _detail_on = os.environ.get("VTON_DETAIL", "1") != "0"
+    _pattern_on = os.environ.get("VTON_PATTERN_LOCK", "1") != "0"
+    if _pattern_on and not warp_enabled:
+        logger.warning(
+            "PATTERN_LOCK=1 with VTON_WARP=0: geometric overlay skipped "
+            "(flat cloth would misalign); using Reinhard color/texture transfer"
+        )
+    if (_detail_on or _pattern_on) and shared_mask is not None:
+        try:
+            pattern_lock = _pattern_on and warp_enabled
             result = reapply_garment_detail(
                 result,
                 cloth_ref,
                 shared_mask,
                 pattern_lock=pattern_lock,
+                ref_alpha=cloth_ref_alpha,
             )
             detail_applied = True
             logger.info(
@@ -898,15 +1164,21 @@ def compose_tryon_sdxl(
         try:
             result = _seam_repair(result, shared_mask)
         except Exception:  # noqa: BLE001
-            logger.debug("_seam_repair failed; using raw blend result")
+            # pipeline audit 行21: 接缝修复正是 C 配方依赖的修缺陷, 静默 debug 会让
+            # "模型变差"掩盖"后处理没跑"。升 warning + 记降级。
+            logger.warning("_seam_repair failed; using raw blend result (DEGRADED)")
+            degraded_reasons.append("seam repair failed (chest/seam color step may show)")
 
     # 肤色校正:SDXL 重画手臂皮肤常丢失原始肤色(发白发灰)。
     # 检测 result 中肤色像素,把色调向 human_img 原始肤色偏移。
+    # 传新衣遮罩:长袖盖住原图手臂位置时,袖子像素不被"原图肤色兜底"
+    # 强拉成肤色(袖子发黄根因)。
     if lock_identity:
         try:
-            result = _correct_skin_tone(human_img, result)
+            result = _correct_skin_tone(human_img, result, cloth_mask=shared_mask)
         except Exception:  # noqa: BLE001
-            logger.debug("_correct_skin_tone failed; using raw blend result")
+            logger.warning("_correct_skin_tone failed; using raw blend result (DEGRADED)")
+            degraded_reasons.append("skin tone correction failed (arms/hands may look washed out)")
 
     # SDXL Inpainting 二次修复(可选):低降噪强度(0.35)局部重绘接缝/肤色
     # 异常区。需要 SDXL Inpainting 模型 + VTON_INPAINT_REPAIR=1。
@@ -915,7 +1187,8 @@ def compose_tryon_sdxl(
         try:
             result = _sdxl_inpaint_repair(result, shared_mask, original=human_img)
         except Exception:  # noqa: BLE001
-            logger.debug("_sdxl_inpaint_repair failed; using pre-inpaint result")
+            logger.warning("_sdxl_inpaint_repair failed; using pre-inpaint result (DEGRADED)")
+            degraded_reasons.append("SDXL inpaint repair failed")
 
     if background == "transparent":
         result = _remove_background(result)
@@ -927,10 +1200,13 @@ def compose_tryon_sdxl(
             bg = PILImage.new("RGB", result.size, (255, 255, 255))
             bg.paste(result, mask=result.split()[-1])
             result = bg
+        # force_white 坑5(v0.1.8 docstring):新版内置"主体区 + 2px 抗锯齿边保留",
+        # 边界处理交给函数内部;本地保留的是**并集掩膜**改进(对应 erode_v2 实验):
         # 保护掩膜 = 基模主体 并 生成图主体:
-        #  - 透视款:结果图 u2net 漏判半透明胸口,基模主体兜住躯干
-        #  - 宽松/宽袖:生成图主体兜住超出基模轮廓的袖子
-        # 不再内缩: force_white_background 已自带 +2px 边保留,内缩会与之抵消。
+        #  - 透视款(如 01):结果图 u2net 漏判半透明胸口, 基模主体兜住躯干;
+        #  - 宽松款(如 07 宽袖):生成图主体兜住超出基模轮廓的袖子。
+        # 不再内缩(v0.1.7 时代为避开旧版白晕环做的 2px erode):新版函数自带
+        # +2px 边保留,内缩会与之抵消,故直接用并集。
         if subj_mask is not None:
             _sg = foreground_mask(result)
             if _sg is not None:
@@ -944,11 +1220,15 @@ def compose_tryon_sdxl(
     if abs(scale - 1) > 0.01:
         result = result.resize((int(rw * scale), int(rh * scale)), PILImage.Resampling.LANCZOS)
 
-    # IP-Adapter 权重存在但加载失败时标记降级(N4-L6);「未安装」不视为降级。
-    result.info["engine_degraded"] = bool(ip_adapter_reason)
-    result.info["degraded_reason"] = ip_adapter_reason
+    # 降级信号合成(pipeline audit 行8):IP-Adapter + depth + LoRA + mask 各环节
+    # 失败备注共同 OR 进 engine_degraded。「未安装权重」不视为降级,「装了但失败/
+    # 被跳过」才算。worker.py 只透传这一对 flag, 故在此一次合成完整。
+    degraded_reason = "; ".join(degraded_reasons)
+    result.info["engine_degraded"] = bool(degraded_reason)
+    result.info["degraded_reason"] = degraded_reason
     result.info["lock_identity"] = lock_identity
     result.info["detail_applied"] = detail_applied
+    result.info["prewhiten"] = {"base": pw_base, "garment": pw_garment}
     # 出图后清空 CUDA 缓存:VAE 解码的 fp32 中间张量会留下大块显存碎片,
     # 不清会在下一任务/下一解码时放大峰值,触发 cgroup OOM。
     if device.type == "cuda":

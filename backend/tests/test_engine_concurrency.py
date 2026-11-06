@@ -71,19 +71,19 @@ def test_sdxl_ip_adapter_load_failure_marks_degraded(monkeypatch, tmp_path):
     import engine_sdxl
 
     pipe, calls = _make_sdxl_pipe(monkeypatch, ip_raises=True)
-    _install_fake_diffusers(monkeypatch, pipe)
-    monkeypatch.setattr(engine_sdxl, "_load_trained_lora", lambda p, d: None)
-
     for d in ("sdxl_base", "controlnet_openpose", "controlnet_canny"):
         (tmp_path / d).mkdir(parents=True, exist_ok=True)
     ipdir = tmp_path / "ip_adapter"
     (ipdir / "image_encoder").mkdir(parents=True)
     (ipdir / "image_encoder" / "config.json").write_text('{"projection_dim": 1024}', encoding="utf-8")
-    # 新选择逻辑会读 image_proj 维度,这里造一个与 1024 编码器配套的合法 base 权重。
+    # 必须在 fake torch 注入前落盘权重:替换 sys.modules["torch"] 后再调真
+    # torch.zeros, 其内部懒 import 会拿到 fake 缺 SymInt, AttributeError(torch 2.3)。
     save_file(
         {"image_proj.proj.weight": torch.zeros((16, 1024))},
         str(ipdir / "ip-adapter_sdxl_vit-h.safetensors"),
     )
+    _install_fake_diffusers(monkeypatch, pipe)
+    monkeypatch.setattr(engine_sdxl, "_load_trained_lora", lambda p, d: None)
 
     monkeypatch.setattr(engine_sdxl, "SDXL_DIR", tmp_path)
     monkeypatch.setattr(engine_sdxl, "_IDM_DIR", tmp_path)

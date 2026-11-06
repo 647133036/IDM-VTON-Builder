@@ -150,6 +150,7 @@ def _detect_skin(rgb: np.ndarray) -> np.ndarray:
 def _correct_skin_tone(
     original: Image.Image,
     result: Image.Image,
+    cloth_mask: np.ndarray | None = None,
 ) -> Image.Image:
     """把 result 中肤色像素的色调校正到 original 的肤色色调。
 
@@ -157,8 +158,14 @@ def _correct_skin_tone(
     找到两图的皮肤区,计算 original 肤色均值,把 result 肤色向其偏移。
     肤色掩码经 GaussianBlur 羽化,避免校正边界硬切。
 
+    cloth_mask(可选,生成图上新衣遮罩): 长袖会盖住原图手臂位置——原图那里
+    是肤色,"原图肤色位置"兜底会把袖子像素强拉成肤色(袖子发黄)。给了遮罩
+    就只在非衣服区统计与校正:袖子区域一概排除。
+
     脸区排除:SDXL 通常正确生成脸部肤色,全局平移会让脸色不自然。
-    用前景 bbox 顶部 18% 估算脸区,从校正统计和校正应用两端都排除。
+    用前景 bbox 顶部 12% 估算脸区,从校正统计和校正应用两端都排除。
+    12% ≈ 头顶到下巴(头高约占全身 ~1/8):脖子(~13-18%)纳入校正 ——
+    SDXL 重画的脖子常发白, 必须拉回原图肤色。
     """
     try:
         import cv2
@@ -175,21 +182,35 @@ def _correct_skin_tone(
 
     orig_skin = _detect_skin(orig)
     res_skin = _detect_skin(res)
-    if not orig_skin.any() or not res_skin.any():
+    if not orig_skin.any():
         return result
 
-    # 排除脸区:前景 bbox 顶部 18% 估算脸区,统计和应用两端都排除。
+    # 排除脸区:用原图前景 bbox 顶部 12% 估算(头顶~下巴)。
+    # 发白结果图常整片 >240, 用 result 估脸会得到空脸罩, 把脸也拉偏。
     h, w = res.shape[:2]
-    non_white = res.mean(axis=2) < 240
+    non_white = orig.mean(axis=2) < 240
     face_mask = np.zeros((h, w), dtype=np.uint8)
     if non_white.any():
         ys = np.where(non_white.any(axis=1))[0]
-        face_h = max(1, int((ys[-1] - ys[0]) * 0.18))
+        face_h = max(1, int((ys[-1] - ys[0]) * 0.12))
         face_mask[ys[0] : ys[0] + face_h, :] = 1
     orig_skin = orig_skin * (1 - face_mask)
     res_skin = res_skin * (1 - face_mask)
-    if not orig_skin.any() or not res_skin.any():
+    if not orig_skin.any():
         return result
+    # 发白手臂常掉出 YCbCr 窗:原图肤色位置在 result 上仍要拉回。
+    res_skin = np.maximum(res_skin, orig_skin)
+
+    # 新衣遮罩:长袖盖住原图手臂时,"原图肤色位置"兜底会把袖子像素染成
+    # 肤色(袖子发黄根因)。衣服区内不做统计也不做校正。
+    if cloth_mask is not None:
+        cm = np.asarray(cloth_mask)
+        if cm.shape[:2] != (h, w):
+            cm = np.array(Image.fromarray(cm.astype(np.uint8)).resize((w, h), Image.Resampling.BILINEAR))
+        not_cloth = ~(cm > 127)
+        res_skin = res_skin * not_cloth
+        if not res_skin.any():
+            return result
 
     orig_mean = orig[orig_skin > 0].mean(axis=0).astype(np.float32)
     res_mean = res[res_skin > 0].mean(axis=0).astype(np.float32)
@@ -492,6 +513,10 @@ def force_white_background(
 
 _FG_SESSION = None
 _FG_SESSION_WARNED = False
+# rembg 失败短路缓存(镜像 _RTMPOSE_LOAD_ERROR, pipeline audit 行34):
+# 坏掉时 _FG_SESSION 恒 None, 不短路则每张图都重进失败块重试 new_session(批量拖慢)
+# 且 warning 仅首遍。置位后直接返回 None, 不再重试。
+_FG_SESSION_ERROR: str | None = None
 
 _POSE_SESSION = None
 _POSE_SESSION_WARNED = False
@@ -534,7 +559,10 @@ def foreground_mask(
     这就是治"换白底后身体/头发被啃"的开关:把本函数返回的 mask 传给
     force_white_background(subject_mask=...),主体区就再不会被压白。
     """
-    global _FG_SESSION, _FG_SESSION_WARNED
+    global _FG_SESSION, _FG_SESSION_WARNED, _FG_SESSION_ERROR
+    # 失败短路(行34):上次 session 初始化已失败, 不再每张重试。
+    if _FG_SESSION_ERROR is not None:
+        return None
     try:
         from rembg import new_session, remove
     except Exception:  # noqa: BLE001
@@ -563,16 +591,23 @@ def foreground_mask(
                 so.inter_op_num_threads = 1
             except Exception:  # noqa: BLE001
                 so = None
-            try:
-                _FG_SESSION = new_session("u2net", sess_opts=so) if so is not None else new_session("u2net")
-            except TypeError:
-                # 部分 rembg 版本(如 2.0.50)的 new_session 不接受 sess_opts 关键字
-                # (报 "multiple values for argument 'sess_opts'")。退回普通会话;
-                # 线程数改由运行环境 OMP_NUM_THREADS 限制。
+            # 定向 TypeError 重试(行17/35): 旧报告所称的修复其实不存在——原代码是单次
+            # 带 sess_opts 调用 + 宽 except 直接放弃整个 rembg。此处仅对 sess_opts 不被
+            # 接受(TypeError)重试一次不带 kwarg 的调用; 宽 except 仍留作最后兜底。
+            if so is not None:
+                try:
+                    _FG_SESSION = new_session("u2net", sess_opts=so)
+                except TypeError:
+                    logger.warning("rembg new_session 不接受 sess_opts;重试不带该参数")
+                    _FG_SESSION = new_session("u2net")
+            else:
                 _FG_SESSION = new_session("u2net")
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            _FG_SESSION_ERROR = str(e)
             if not _FG_SESSION_WARNED:
-                logger.warning("rembg u2net session 初始化失败;force_white 回退纯颜色压白")
+                logger.warning(
+                    "rembg u2net session 初始化失败(已短路缓存, 不再逐图重试);force_white 回退纯颜色压白: %s", e
+                )
                 _FG_SESSION_WARNED = True
             return None
     try:
@@ -582,7 +617,9 @@ def foreground_mask(
         if m.mean() < min_foreground_frac:
             return None  # 几乎全前景/异常,不信任
         return m
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        # remove() 推理失败(行17): 原代码无日志完全静默。补 warning(仍回退纯颜色压白)。
+        logger.warning("rembg remove() 推理失败;本张回退纯颜色压白: %s", e)
         return None
 
 
@@ -591,8 +628,21 @@ def detect_garment_extent(garment: Image.Image) -> dict:
 
     返回:
         sleeve: "long" | "short" | "sleeveless"
-        hem: "waist" | "long" (衣长是否过腰)
+        hem: "waist" | "mid" | "long"
     用于动态 clothing_mask:长袖→mask 含手臂,短袖→只含大臂,无袖→不含手臂。
+
+    袖翼判定(逐行连通段, 含 bbox 水平中点的一段是躯干):
+    - 侧垂袖: 断开在身侧、与躯干留缝的衣料段; 段宽须 >= 12% 衣宽
+      (裹身衣的绑带/腰带只有 ~10%, 会被宽度过滤掉), 且袖尖不垂过
+      衣身下摆(躯干底行 + 容差) —— 长过下摆的段外内容是绑带/腰带。
+    - 连肩袖: 行宽超躯干宽 25% 且在衣身上半 35%(肩周加宽)。
+      A 字裙摆与躯干连成一段且在下半区, 不会被误判成袖;
+      高瘦直筒无侧翼内容 → sleeveless(旧 aspect>1.35 规则的误判源,已删)。
+    袖长基准(不能用整衣长的固定比例): 衣长从齐腰到及踝变化很大,
+    "垂过衣长 38% 即长袖"在长款上会把短袖帽误判成长袖。改按衣长分级
+    估"肩→腰"基准距(人体比例近似): waist=1.0ch, mid=0.55ch, long=0.40ch,
+    袖尖超过基准 70% 才判长袖。
+    衣长用躯干中段连通段宽(不含垂袖)算高宽比, 宽袖不压衣长。
     """
     arr = np.array(garment.convert("RGBA"))
     _h, _w = arr.shape[:2]
@@ -608,7 +658,7 @@ def detect_garment_extent(garment: Image.Image) -> dict:
 
     ys, xs = np.where(content)
     if len(ys) < 64:
-        return {"sleeve": "short", "hem": "waist"}
+        return {"sleeve": "short", "hem": "waist", "neckline": "closed"}
 
     y0, y1 = int(ys.min()), int(ys.max())
     x0, x1 = int(xs.min()), int(xs.max())
@@ -616,24 +666,88 @@ def detect_garment_extent(garment: Image.Image) -> dict:
     cw = max(1, x1 - x0)
     aspect = ch / cw
 
-    top_band = content[y0 : y0 + ch // 4, x0:x1]
-    mid_band = content[y0 + ch // 3 : y0 + 2 * ch // 3, x0:x1]
-    bot_band = content[y0 + 3 * ch // 4 : y1, x0:x1]
-    top_w = float(top_band.mean())
-    mid_w = float(mid_band.mean())
-    bot_w = float(bot_band.mean())
+    # 逐行连通段:含 bbox 水平中点的一段是躯干,段外内容是垂袖;
+    # A 字裙摆与躯干连成一段,不会被误判成袖。高瘦直筒整行是一段 → 无袖翼。
+    cx = (x0 + x1) // 2 - x0
+    n_rows = ch + 1
+    row_span = np.zeros(n_rows, dtype=np.float32)
+    central_w = np.zeros(n_rows, dtype=np.float32)
+    gap_wing = np.zeros(n_rows, dtype=bool)
+    wing_w_min = max(3.0, cw * 0.12)
+    for i in range(n_rows):
+        xs_row = np.where(content[y0 + i, x0 : x1 + 1])[0]
+        if xs_row.size == 0:
+            continue
+        row_span[i] = xs_row[-1] - xs_row[0] + 1
+        breaks = np.where(np.diff(xs_row) > 1)[0]
+        starts = np.concatenate(([0], breaks + 1))
+        ends = np.concatenate((breaks, [xs_row.size - 1]))
+        run_lo = xs_row[starts]
+        run_hi = xs_row[ends]
+        widths = run_hi - run_lo + 1
+        contains = (run_lo <= cx) & (cx <= run_hi)
+        if contains.any():
+            j = int(np.argmax(np.where(contains, widths, -1)))
+        else:
+            j = int(np.argmin(np.abs((run_lo + run_hi) * 0.5 - cx)))
+        cl = int(run_lo[j])
+        cr = int(run_hi[j])
+        central_w[i] = cr - cl + 1
+        outside = int((xs_row < cl).sum() + (xs_row > cr).sum())
+        # 段外连通段须够宽(>=12% 衣宽): 绑带/腰带只有 ~10%, 与袖筒区分。
+        outer_w = widths[(run_hi < cl) | (run_lo > cr)]
+        gap_wing[i] = outside >= 3 and (float(outer_w.max()) if outer_w.size else 0.0) >= wing_w_min
 
-    shoulder_spread = top_w / max(mid_w, 0.01)
+    # 袖尖不垂过衣身下摆: 超过躯干底行的段外内容是绑带/腰带, 一律不算袖。
+    has_central = central_w > 0
+    hem_row = int(np.where(has_central)[0][-1]) if has_central.any() else n_rows - 1
+    row_idx = np.arange(n_rows)
+    gap_wing &= row_idx <= hem_row + max(3, ch // 50)
 
-    sleeve = "short"
-    if aspect > 1.35 or bot_w > mid_w * 0.6:
-        sleeve = "long"
-    elif shoulder_spread < 1.15 or top_w < 0.15:
+    mid_lo = ch // 3
+    mid_hi = min(2 * ch // 3 + 1, n_rows)
+    seg = central_w[mid_lo:mid_hi]
+    torso_w = float(seg.max()) if seg.size else float(cw)
+    if torso_w < 1:
+        torso_w = float(cw)
+
+    # 衣身高 / 躯干宽:宽袖不再把整体 aspect 拉扁。
+    # 短款 ≈1.0-1.4, 中长款(髋/大腿)≈1.6-2.6, 裙级≈3.0+。
+    cratio = ch / max(torso_w, 1.0)
+    if cratio > 3.0 or aspect > 2.0:
+        hem = "long"
+    elif cratio >= 1.55:
+        hem = "mid"
+    else:
+        hem = "waist"
+
+    # 袖:侧垂袖(任何高度,已滤绑带)或上半区行宽超躯干 25%(连肩短袖/落肩)。
+    width_wing = (row_span > torso_w * 1.25) & (row_idx < n_rows * 0.35)
+    wing_rows = gap_wing | width_wing
+    if not wing_rows.any():
         sleeve = "sleeveless"
+        drop_px = 0.0
+        sleeve_ratio = 0.0
+    else:
+        drop_px = float(np.where(wing_rows)[0][-1])
+        # 袖长基准:肩→腰距离按衣长分级估计,袖尖过基准 70% 才算长袖。
+        ref_px = ch * {"waist": 1.0, "mid": 0.55, "long": 0.40}[hem]
+        sleeve_ratio = drop_px / max(ref_px, 1.0)
+        sleeve = "long" if sleeve_ratio >= 0.70 else "short"
 
-    hem = "long" if aspect > 1.6 else "waist"
+    # 领口开口度: 平铺图拍法(背部片垫在领口后)使 V/开口领的中央上部仍被
+    # 衣料填实, 像素级判不开口。默认 closed; 要开孔需显式传 neckline="open"。
+    neckline = "closed"
 
-    return {"sleeve": sleeve, "hem": hem, "aspect": round(aspect, 2)}
+    return {
+        "sleeve": sleeve,
+        "hem": hem,
+        "aspect": round(aspect, 2),
+        "neckline": neckline,
+        "central_ratio": round(cratio, 2),
+        "sleeve_drop": round(drop_px / max(n_rows - 1, 1), 2),
+        "sleeve_ratio": round(sleeve_ratio, 2),
+    }
 
 
 _RTMPOSE_BACKBONE = None
@@ -654,21 +768,70 @@ _POSE_LANDMARKER = None
 _POSE_LANDMARKER_ERROR: str | None = None
 
 
+def _module_importable(name: str) -> bool:
+    """逐模块在场判断(pipeline audit 行27/28): 真的能 import 就不注 stub.
+
+    用 importlib.util.find_spec 判断, 不实际执行模块(避免真 mmdet/mmcv.ops 的
+    重依赖被拉起来). name 缺失或 import 失败 → False → 才注入 stub。
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _inject_fake_deps() -> None:
-    """注入假 xtcocotools/mmdet/mmcv.ops 模块, 绕过 mmpose import 链.
+    """注入假 xtcocotools/mmdet(.utils)/mmcv.ops(/.transforms) 模块, 绕过 mmpose import 链.
 
-    mmpose 的 __init__ 导入 datasets/evaluation (需 xtcocotools 编译扩展) 和
-    hybrid_heads (需 mmdet + mmcv.ops C 扩展). 这些在推理时不需要, 只在数据集
-    加载和评估时用. 注入空壳模块让 model 组件能正常导入.
+    边界(2026-11-05 盒子实测 + mmpose 1.3.2 源码 grep 定案, 详见 box_probe_evidence.md):
+    这些 stub **只为 mmpose 的 import 链挡枪 —— 管线没有任何真实检测任务, 没有 mmdet
+    检测器**。RTMPose 是纯姿态估计(输入 bbox), 推理路径不碰 mmdet 的功能代码; mmdet
+    只在 mmpose 的模块加载时被 import(下面列出的那一处), stub 挡的是 import 时元数据/
+    模块存在性, 不是运行时调用。因此:
+      * 禁止把真 mmdet 装回来"用"——本环境 mmdet 永远卸载(装真 mmdet 会因要求 mmcv<2.2.0
+        与 mmcv-lite 2.2.0 冲突, 且真 mmdet 的模块会绕过 stub 导致 mmpose import 链连锁断)。
+      * 真 mmcv 必须装(mmcv-lite): mmpose/__init__.py 在 import 时硬断言
+        2.0.0rc4 <= mmcv.__version__ <= 3.0.0 并 import mmcv.cnn 全家桶, stub 面太大不可取。
+      * 仅 mmcv.ops(C 扩展, lite 版没编)做恒等 stub: RTMPose-m 推理路径(cspnext+rtmcc)
+        grep 确认 0 次引用 mmcv.ops, 它只在 dekr/edpose/posewarper 等其它 head 里出现。
 
-    设 RTMPOSE_FAKE_DEPS=0 关闭注入 (用于真实依赖环境).
-    注入后断言确认 fake 生效.
+    mmpose 1.3.2 源码 grep: 包内 Python 代码对 mmdet 的全部引用仅 3 处——
+      1. models/heads/hybrid_heads/rtmo_head.py:9  `from mmdet.utils import ConfigType, reduce_mean`
+         ← **唯一模块顶层硬 import**, 加载 mmpose.models 即触发, 需 stub mmdet.utils。
+      2. apis/inferencers/base_mmpose_inferencer.py `try: from mmdet.apis.det_inferencer
+         import DetInferencer except: has_mmdet=False` ← 守卫降级, mmdet 缺席时 has_mmdet=False。
+      3. utils/config_utils.py:16 `from mmdet.datasets import transforms` ← 函数内 lazy(源码注释
+         明写 "use lazy import to avoid hard dependence on mmdet"), RTMPose 路径不触发。
+    无模块加载时读取 mmdet.__version__ / mmdet.apis 存在性检查。故 stub 面 = mmdet.utils
+    {ConfigType, reduce_mean} 已是最小充分; 冒烟 `import mmpose; from mmpose.apis import
+    inference_topdown` 在 stub 下走通且 base_mmpose_inferencer.has_mmdet==False(stub 形状匹配)。
+
+    行27/28 修法: **逐模块独立判断**, 只在真实 import 不可用时才注入 stub,
+    真实 xtcocotools 在场不再短路其余 stub 的注入(旧代码检测到它就直接 return,
+    缺 mmdet 的机器上 RTMPose 静默死)。RTMPOSE_FAKE_DEPS=0 关闭注入。
+
+    2026-11-06 盒上 g4 实测修正(根因): mmcv-lite 随附**纯 Python 的 mmcv.ops 包** ——
+    find_spec("mmcv.ops") 能命中, 但其真实 __init__ → active_rotated_filter →
+    ext_loader.load_ext("_ext") → `import mmcv._ext`(C 扩展, lite 版未编译) →
+    ModuleNotFoundError。逐模块 find_spec 判断会把这种"盘上存在、import 即崩"的
+    mmcv.ops 误放行 → stub 被跳过 → mmpose.models 的 import 链(EDPoseHead 顶层
+    硬 import mmcv.ops)整体崩 → _init_rtmpose 失败 → pose 退轮廓法 → 四缺陷模式
+    (胸口压白/手臂发灰/下摆硬切/图案断裂)同时回归。
+    **定案: RTMPOSE_FAKE_DEPS=1 时对 mmdet(.utils)/mmcv.ops/mmcv._ext 三条路径
+    无条件注册 stub, 不再逐模块 find_spec; 开关关闭时保持原行为(不注入)。**
+    边界: 面已被真实模块 import 进 sys.modules 的不夺取(先到先得, 防混合态)。
+    mmcv.ops/_ext 的 stub 带 PEP 562 __getattr__ 占位, `import X` 与
+    `from X import Y` 两种引用形式同时命中(load_ext 的 hasattr 断言在占位下也过)。
+    xtcocotools / mmcv.transforms(.utils) 保持逐模块 find_spec: lite 版随附的
+    纯 Python transforms 可 import、无 _ext 地雷(2026-11-06 g4 实测 import 链
+    未在 transforms 面崩)。
+
+    注入后断言确认 fake 生效。
     """
     global _FAKE_DEPS_INJECTED
     if _FAKE_DEPS_INJECTED or not _RTMPOSE_FAKE_DEPS:
-        return
-    if "xtcocotools" in sys.modules:
-        _FAKE_DEPS_INJECTED = True
         return
     import types as _t
 
@@ -682,49 +845,99 @@ def _inject_fake_deps() -> None:
         def __getattr__(self, n):
             return _F()
 
-    fake = _t.ModuleType("xtcocotools")
-    fake.__path__ = []
-    fake.coco = type("M", (), {"COCO": _F})
-    fake.mask = type("M", (), {"mask": lambda *a, **kw: None})
-    fake.cocoeval = type("M", (), {"COCOeval": _F})
-    sys.modules["xtcocotools"] = fake
-    sys.modules["xtcocotools.coco"] = fake.coco
-    sys.modules["xtcocotools.mask"] = fake.mask
-    sys.modules["xtcocotools.cocoeval"] = fake.cocoeval
+    # --- xtcocotools: 真包在场(含编译扩展)就不注, 否则注入空壳(行28) ---
+    if not _module_importable("xtcocotools") and "xtcocotools" not in sys.modules:
+        fake = _t.ModuleType("xtcocotools")
+        fake.__path__ = []
+        fake.coco = type("M", (), {"COCO": _F})
+        fake.mask = type("M", (), {"mask": lambda *a, **kw: None})
+        fake.cocoeval = type("M", (), {"COCOeval": _F})
+        sys.modules["xtcocotools"] = fake
+        sys.modules["xtcocotools.coco"] = fake.coco
+        sys.modules["xtcocotools.mask"] = fake.mask
+        sys.modules["xtcocotools.cocoeval"] = fake.cocoeval
 
-    md = _t.ModuleType("mmdet")
-    md.__path__ = []
-    md.ConfigType = dict
-    md.reduce_mean = lambda *a, **kw: None
-    sys.modules["mmdet"] = md
-    mu = _t.ModuleType("mmdet.utils")
-    mu.ConfigType = dict
-    mu.reduce_mean = lambda *a, **kw: None
-    sys.modules["mmdet.utils"] = mu
+    # --- mmdet / mmdet.utils: 开关打开 → 无条件 stub, 不查 find_spec(2026-11-06 定案) ---
+    # 真 mmdet 已被 import 进 sys.modules 的不夺取(先到先得); 未被 import 时即使盘上有
+    # 真包也注 stub —— mmpose import 链只用 mmdet.utils{ConfigType, reduce_mean} 占位面,
+    # 管线无 mmdet 检测任务, 真/假在此面等价(box_probe_evidence.md §1)。
+    if "mmdet.utils" not in sys.modules:
+        md = sys.modules.get("mmdet")
+        if md is None:
+            md = _t.ModuleType("mmdet")
+            md.__path__ = []
+            # 测试不变式(backend/tests/test_platform_presets.py:889): ConfigType is dict
+            md.ConfigType = dict
+            md.reduce_mean = lambda *a, **kw: None
+            sys.modules["mmdet"] = md
+        elif not hasattr(md, "ConfigType"):
+            md.ConfigType = dict
+            md.reduce_mean = lambda *a, **kw: None
+        mu = _t.ModuleType("mmdet.utils")
+        mu.ConfigType = dict
+        mu.reduce_mean = lambda *a, **kw: None
+        sys.modules["mmdet.utils"] = mu
 
-    ops = _t.ModuleType("mmcv.ops")
-    ops.__path__ = []
-    ops.MultiScaleDeformableAttention = type("MSDA", (object,), {})
-    sys.modules["mmcv.ops"] = ops
+    # --- mmcv.ops: 开关打开 → 无条件 stub(2026-11-06 定案, 见 docstring 根因) ---
+    # 不再用 find_spec: mmcv-lite 的纯 Python mmcv.ops 盘上存在但 import 即崩(缺 _ext)。
+    # MSDA 是 mmpose import 链唯一模块顶层需要的名字(edpose_head L14 /
+    # deformable_detr_layers L7); DeformConv2d 等只在函数级惰性 import, RTMPose 路径
+    # 0 次调用。占位类在实例化/调用时抛 NotImplementedError(带调用栈): 若有真实计算
+    # 路径走到 stub, 立刻显式失败, 而不是拿到静默假数据(2026-11-06 定案)。
+    if "mmcv.ops" not in sys.modules:
+        ops = _t.ModuleType("mmcv.ops")
+        ops.__path__ = []
+
+        def _ops_placeholder(name: str, base=object):
+            def _raise(self, *a, **kw):
+                raise NotImplementedError(
+                    f"mmcv.ops.{name} is a no-op stub (RTMPOSE_FAKE_DEPS=1, 无 C 扩展); "
+                    f"real op was called — pipeline should not reach here"
+                )
+
+            return type(name, (base,), {"__init__": _raise, "__call__": _raise})
+
+        ops.MultiScaleDeformableAttention = _ops_placeholder("MSDA")
+
+        def _ops_getattr(n):
+            if n.startswith("__") and n.endswith("__"):
+                raise AttributeError(n)  # dunder 不走占位
+            # PEP 562: `from mmcv.ops import X` import 时命中占位类; 真被实例化才抛。
+            return _ops_placeholder(n)
+
+        ops.__getattr__ = _ops_getattr
+        sys.modules["mmcv.ops"] = ops
+
+    # --- mmcv._ext: load_ext 的 import 目标; lite 版未编译 → 无条件注册裸 stub ---
+    # 显式属性名单定案: load_ext('_ext', [funcs...]) 的 hasattr 断言只在真实 mmcv.ops
+    # 子模块被 import 时执行 —— 而 mmcv.ops 已被上面的 stub 门控, 永不执行 → 链内需要
+    # 的显式名单为空。故不做 catch-all __getattr__(会吞拼写错误), 属性访问走默认
+    # AttributeError → 任何真实使用立刻显式失败。`import mmcv._ext` /
+    # `importlib.import_module("mmcv._ext")` 走 sys.modules 查找, 命中即返回。
+    if "mmcv._ext" not in sys.modules:
+        ext = _t.ModuleType("mmcv._ext")
+        ext.__path__ = []  # 与其余 stub 一致: _is_injected_stub 识别面
+        ext.__doc__ = (
+            "no-op stub registered by platform_presets._inject_fake_deps "
+            "(RTMPOSE_FAKE_DEPS=1): mmcv-lite ships no _ext C extension."
+        )
+        sys.modules["mmcv._ext"] = ext
 
     # mmcv.transforms 是 mmcv 2.x 才有的子包;老环境(mmcv 1.7)缺它而 mmpose 的
-    try:
-        import mmcv.transforms  # noqa: F401
-
-        have_tfs = True
-    except Exception:  # noqa: BLE001
-        have_tfs = False
-    if not have_tfs:
+    # RTMPose config 链会 import 它。lite 版随附的纯 Python transforms 可 import
+    # (无 _ext 地雷, 2026-11-06 实测), 保持逐模块 find_spec 判断(行27/28)。
+    if not _module_importable("mmcv.transforms") and "mmcv.transforms" not in sys.modules:
         tfs = _t.ModuleType("mmcv.transforms")
         tfs.__path__ = []
 
         def _tfs_getattr(n):
             if n.startswith("__") and n.endswith("__"):
-                raise AttributeError(n)
-            return _F
+                raise AttributeError(n)  # dunder 不走 stub, 否则 inspect/getattr 拿到 _F
+            return _F  # PEP 562: BaseTransform/LoadImageFromFile 等
 
         tfs.__getattr__ = _tfs_getattr
         sys.modules["mmcv.transforms"] = tfs
+        # utils: cache_randomness/avoid_cache_randomness 是装饰器, 给恒等实现
         tfs_utils = _t.ModuleType("mmcv.transforms.utils")
         tfs_utils.__path__ = []
 
@@ -736,10 +949,79 @@ def _inject_fake_deps() -> None:
         sys.modules["mmcv.transforms.utils"] = tfs_utils
 
     _FAKE_DEPS_INJECTED = True
-    # 断言 fake 生效
-    assert "xtcocotools" in sys.modules, "fake deps injection failed: xtcocotools"
-    assert "mmdet" in sys.modules, "fake deps injection failed: mmdet"
-    assert "mmcv.ops" in sys.modules, "fake deps injection failed: mmcv.ops"
+    # 断言 fake 生效(2026-11-06 三条路径无条件条款): mmdet(.utils)/mmcv.ops/mmcv._ext
+    # 注入后必在 sys.modules(本轮注册的 stub, 或先导入的真实模块 —— 都算合规, 缺席即 FAIL)。
+    for _face in ("mmdet", "mmdet.utils", "mmcv.ops", "mmcv._ext"):
+        assert _face in sys.modules, f"fake deps injection failed: {_face}"
+    # 保持逐模块 find_spec 的面(xtcocotools/mmcv.transforms 家族): 真实 import 不可用时
+    # 才断言必须落进 sys.modules —— 本机(真 mmcv/真 xtcocotools)与盒子(mmcv-lite)
+    # 两类环境都成立, 且缺面的机器上仍会 fail-loud。
+    for _face in ("xtcocotools", "mmcv.transforms", "mmcv.transforms.utils"):
+        if not _module_importable(_face):
+            assert _face in sys.modules, f"fake deps injection failed: {_face}"
+
+
+def _locate_rtmpose_config() -> Path:
+    """定位 RTMPose-m 的 .mim config(pipeline audit 行13).
+
+    旧代码把回退路径硬编码成 /usr/local/lib/python3.11/dist-packages/..., GPU 机
+    (py3.10/conda env/venv)不存在 → 回退失效 → RTMPose 加载失败 → 腰线退轮廓法。
+    现按优先级动态定位:
+      1. repo: models/rtmpose/<cfg>.py(NAS 持久目录, 首选)
+      2. mmpose.__file__ 推出的 <pkg>/.mim/configs/...(pip 装的 mmpose 1.3.2 带全 configs)
+      3. importlib.util.find_spec("mmpose") 拿 submodule_search_locations 兜底
+      4. sys.prefix / site-packages 下的 glob 兜底(任意 py 版本)
+    找不到返回 repo 路径(让 Config.fromfile 抛错, 走 _RTMPOSE_LOAD_ERROR 短路)。
+    """
+    rel = Path("body_2d_keypoint/rtmpose/coco/rtmpose-m_8xb256-420e_coco-256x192.py")
+    repo_cfg = Path(_RTMPOSE_ROOT) / "rtmpose-m_8xb256-420e_coco-256x192.py"
+    if repo_cfg.exists():
+        return repo_cfg
+
+    candidates: list[Path] = []
+    try:
+        import mmpose  # 已由 _inject_fake_deps 保证可 import
+
+        pkg_dir = Path(mmpose.__file__).resolve().parent
+        candidates.append(pkg_dir / ".mim" / "configs" / rel)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("mmpose")
+        if spec is not None and spec.submodule_search_locations:
+            for loc in list(spec.submodule_search_locations):
+                candidates.append(Path(loc) / ".mim" / "configs" / rel)
+    except Exception:  # noqa: BLE001
+        pass
+
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+
+    # 最后兜底: 在已知 site 目录里 glob(不限 py3.11)。
+    roots = [Path(sys.prefix)]
+    try:
+        import site
+
+        roots.extend(Path(p) for p in site.getsitepackages())
+        roots.append(Path(site.getusersitepackages()))
+    except Exception:  # noqa: BLE001
+        pass
+    for root in roots:
+        try:
+            hits = list(root.glob(f"mmpose*/.mim/configs/{rel}"))
+        except OSError:
+            hits = []
+        if hits:
+            return hits[0]
+
+    logger.warning("RTMPose .mim config not found in %s; RTMPose will fail to load", [str(c) for c in candidates])
+    return repo_cfg
 
 
 def _init_rtmpose():
@@ -760,12 +1042,7 @@ def _init_rtmpose():
         from mmpose.models.backbones.cspnext import CSPNeXt
         from mmpose.models.heads.coord_cls_heads.rtmcc_head import RTMCCHead
 
-        cfg_path = Path(_RTMPOSE_ROOT) / "rtmpose-m_8xb256-420e_coco-256x192.py"
-        if not cfg_path.exists():
-            cfg_path = Path(
-                "/usr/local/lib/python3.11/dist-packages/mmpose/.mim/configs/"
-                "body_2d_keypoint/rtmpose/coco/rtmpose-m_8xb256-420e_coco-256x192.py"
-            )
+        cfg_path = _locate_rtmpose_config()
         cfg = Config.fromfile(str(cfg_path))
         codec = cfg.get("codec", {}) if hasattr(cfg, "get") else {}
         split = codec.get("simcc_split_ratio") if isinstance(codec, dict) else None
@@ -800,14 +1077,15 @@ def _init_rtmpose():
 
 
 def _detect_pose_keypoints(img: Image.Image) -> dict | None:
-    """关键点检测, 返回 hip/shoulder/knee 归一化坐标.
+    """关键点检测, 返回 hip/shoulder/knee/wrist 归一化坐标.
 
     优先 RTMPose-m (COCO 17 关键点, CPU 可跑, 精度优于 MediaPipe),
     回退 MediaPipe Pose, 再回退 None.
 
     Returns:
-        {"hip": (x, y, vis), "shoulder": (x, y, vis), "knee": (x, y, vis)} 或 None.
+        {"hip": (x, y, vis), "shoulder": ..., "knee": ..., "wrist": (x, y, vis)} 或 None.
         坐标归一化到 [0,1], vis 为 visibility 置信度.
+        wrist 供长袖手臂走廊用(衣袖区保留到腕部); 缺失时走廊逻辑静默跳过。
     """
     ckpt = Path(_RTMPOSE_ROOT) / "rtmpose-m_coco.pth"
     if ckpt.exists():
@@ -850,6 +1128,37 @@ def _simcc_decode(
     kx = np.clip(kx / w, 0.0, 1.0)
     ky = np.clip(ky / h, 0.0, 1.0)
     return kx, ky
+
+
+def _rtmpose_keypoints_sane(kp: dict, img_w: int, img_h: int) -> bool:
+    """RTMPose 关键点解剖学合理性校验(pipeline audit 行32).
+
+    SimCC 无 vis, 旧代码把 vis 硬编码 1.0 → 下游 vis>=0.3 门对 rtmpose 是空操作。
+    这里用几何先验替代 vis:
+      - hip/shoulder/knee 必须落在图内(0..1);
+      - 肩在下髋之上、髋在膝之上(站立姿态, 容忍小翻转);
+      - 肩-髋 与 髋-膝 都要有足够像素跨度(>= 主体高度的 3%), 否则说明检测塌成一团。
+    返回 False → 调用方拒收(返回 None), 腰线走轮廓法, 不拿错坐标切衣长。
+    """
+    min_span = 0.03
+    pts = []
+    for name in ("shoulder", "hip", "knee"):
+        x, y, _ = kp.get(name, (0.0, 0.0, 0.0))
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            return False
+        pts.append((name, x, y))
+    sy = {n: y for n, _, y in pts}
+    sx = {n: x for n, x, _ in pts}
+    if not (sy["shoulder"] < sy["hip"] < sy["knee"]):
+        return False
+    px_per_norm_y = max(1, img_h)
+    sh_hip_px = abs(sy["hip"] - sy["shoulder"]) * px_per_norm_y
+    hip_knee_px = abs(sy["knee"] - sy["hip"]) * px_per_norm_y
+    if sh_hip_px < min_span * px_per_norm_y or hip_knee_px < min_span * px_per_norm_y:
+        return False
+    # 侧面照肩宽可能塌成一条竖线, 但肩点仍须在图内(上面已查)。
+    del sx
+    return True
 
 
 def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
@@ -905,13 +1214,27 @@ def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
             (w, h),
         )
 
-        # COCO 17: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee
-        # SimCC softmax 在 384/512 bin 上峰值 ~1e-5, 不能当 vis; RTMPose 固定 1.0.
-        # vis 阈值 0.3 只对 MediaPipe 回退路径生效.
+        # COCO 17: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee,
+        # 7=L_wrist, 8=R_wrist(长袖手臂走廊用)。SimCC 无 vis, 硬编码 1.0; vis>=0.3 门
+        # 只对 MediaPipe 回退路径生效。
         def avg(i, j):
             return (float((kx[i] + kx[j]) / 2), float((ky[i] + ky[j]) / 2), 1.0)
 
-        return {"hip": avg(11, 12), "shoulder": avg(5, 6), "knee": avg(13, 14)}
+        kp = {"hip": avg(11, 12), "shoulder": avg(5, 6), "knee": avg(13, 14), "wrist": avg(7, 8)}
+        # 行32: SimCC 没有 vis, 上面硬编码 1.0 使下游 vis>=0.3 门变空操作 —— 错但落
+        # 在 [0,1] 范围内的检测会被当成"rtmpose 源"采信(比 None 更糟)。加独立解剖学
+        # 合理性校验: 关键点须在图内, 肩-髋-膝垂直有序且跨距够大; 不合理则拒收(None),
+        # 让腰线走轮廓法而非拿一个错坐标去切。
+        if not _rtmpose_keypoints_sane(kp, w, h):
+            logger.warning(
+                "RTMPose keypoints anatomically implausible (hip=%.3f,%.3f shoulder=%.3f,%.3f "
+                "knee=%.3f,%.3f); rejecting to avoid a wrong waist cut",
+                *kp["hip"][:2],
+                *kp["shoulder"][:2],
+                *kp["knee"][:2],
+            )
+            return None
+        return kp
     except Exception:  # noqa: BLE001
         if not _POSE_SESSION_WARNED:
             logger.warning("RTMPose inference failed; falling back")
@@ -923,13 +1246,14 @@ def _pose_landmarker_task_path():
     """找本地 pose_landmarker_full.task(NAS 模型目录 > MEDIAPIPE_HOME)。
 
     找不到返回 None → MediaPipe 回退静默降级为 None(腰线回退 contour/default)。
-    模型约 9MB, 只认 >1MB 的文件避免误用残缺下载。
+    模型约 9MB, 只认 >1MB 的文件避免误用残缺下载。下载地址:
+    https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task
     """
     import os as _os
 
     home = Path(_os.environ.get("MEDIAPIPE_HOME", "~/.mediapipe")).expanduser()
     candidates = [
-        _POSE_ROOT / "pose_landmarker_full.task",
+        _POSE_ROOT / "pose_landmarker_full.task",  # NAS: repo/models/mediapipe/
         home / "pose_landmarker_full.task",
     ]
     for c in candidates:
@@ -961,7 +1285,10 @@ def _init_pose_landmarker():
         return None
     model_path = _pose_landmarker_task_path()
     if model_path is None:
-        _POSE_LANDMARKER_ERROR = "未找到 pose_landmarker_full.task(放 repo/models/mediapipe/ 或 MEDIAPIPE_HOME)"
+        _POSE_LANDMARKER_ERROR = (
+            "未找到 pose_landmarker_full.task(放 repo/models/mediapipe/ 或 MEDIAPIPE_HOME; "
+            "下载见 _pose_landmarker_task_path docstring)"
+        )
         logger.warning("MediaPipe 回退不可用: %s", _POSE_LANDMARKER_ERROR)
         return None
     try:
@@ -996,7 +1323,7 @@ def _detect_pose_mediapipe(img: Image.Image) -> dict | None:
         res = lk.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=arr))
         if not res.pose_landmarks:
             return None
-        lm = res.pose_landmarks[0]
+        lm = res.pose_landmarks[0]  # 取第一人; 每个元素是 33 个 landmark 的 list
     except Exception:  # noqa: BLE001
         if not _POSE_SESSION_WARNED:
             logger.warning("MediaPipe inference failed; falling back")
@@ -1014,9 +1341,10 @@ def _detect_pose_mediapipe(img: Image.Image) -> dict | None:
     hip = avg_lm(23, 24)
     shoulder = avg_lm(11, 12)
     knee = avg_lm(25, 26)
+    wrist = avg_lm(15, 16)  # 15=L_wrist, 16=R_wrist (长袖手臂走廊用)
     if hip[2] < 0.3:
         return None
-    return {"hip": hip, "shoulder": shoulder, "knee": knee}
+    return {"hip": hip, "shoulder": shoulder, "knee": knee, "wrist": wrist}
 
 
 def _estimate_waist_ratio(
@@ -1113,6 +1441,47 @@ def _log_waist_source_summary() -> None:
 atexit.register(_log_waist_source_summary)
 
 
+def _debug_dump_mask_stage(mask_u8: np.ndarray, img: Image.Image, label: str) -> None:
+    """VTON_DEBUG_MASK=1 时, 把 clothing_mask 的阶段遮罩落盘(绿=mask 区)。
+
+    阶段序列: hemcut(截线后) → corridor(长袖手臂走廊后) → carve(领口/胸口开孔后)
+    → final(erode+blur 后)。哪一步"把皮肤圈进去 / 把衣料挖掉", 看对应阶段图即可,
+    不用猜。tag 取 VTON_DEBUG_TAG(衣物名, engine 传入), 目录取 VTON_DEBUG_DIR(默认 .)。
+    关开关时本函数零成本(一个 env 读 + 返回)。
+    """
+    if os.environ.get("VTON_DEBUG_MASK", "0") != "1":
+        return
+    try:
+        from pathlib import Path as _P
+
+        import cv2
+
+        m = np.asarray(mask_u8)
+        vis = np.array(img.convert("RGB"))
+        if m.shape[:2] != vis.shape[:2]:
+            m = cv2.resize(
+                m.astype(np.float32),
+                (vis.shape[1], vis.shape[0]),
+                interpolation=cv2.INTER_LINEAR,
+            )
+        overlay = vis.copy()
+        mz = m > 127
+        overlay[mz] = (
+            overlay[mz].astype(np.float32) * 0.55
+            + np.array([0, 190, 0], dtype=np.float32) * 0.45
+        ).astype(np.uint8)
+        tag = os.environ.get("VTON_DEBUG_TAG", "img")
+        ddir = _P(os.environ.get("VTON_DEBUG_DIR", "."))
+        ddir.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(
+            str(ddir / f"maskstage_{tag}_{label}.jpg"),
+            cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR),
+            [int(cv2.IMWRITE_JPEG_QUALITY), 88],
+        )
+    except Exception:
+        logger.debug("mask stage dump failed (%s)", label, exc_info=True)
+
+
 def clothing_mask(
     img: Image.Image,
     garment_type: str = "upper",
@@ -1123,10 +1492,14 @@ def clothing_mask(
     """服装替换区:主体减脸(及按品类+袖长动态裁切),返回 uint8 0-255;构不出则 None。
 
     这是「只换衣、锁身份」的遮罩:255=贴生成衣物,0=保留原图像素(脸/发/手/背景)。
-    garment_extent(from detect_garment_extent)控制手臂区纳入范围:
-      long sleeve → 含整条手臂(62%→88%)
-      short sleeve → 只含大臂(62%,当前默认)
-      sleeveless → 不含手臂(55%)
+    garment_extent(from detect_garment_extent)控制:
+      sleeve: long → 手臂走廊保留到腕(衣袖区); short → 只含大臂(当前默认);
+              sleeveless → 不含手臂
+      hem: waist → 截线=腰; mid(中长款) → 腰+0.22(髋/大腿, tunic 级);
+           long → tunic 腰+0.30 / upper 腰+0.18
+      neckline: open(V/scoop) → 胸口露肤区开孔保留原肤色; closed(高领) → 胸口保持衣料
+    截线优先级写死: top 品类(upper/auto/tunic)只用腰线系, 不与 knee 截断混用
+    (knee_r 只服务 dress/onesie)。
     """
     arr = np.array(img.convert("RGB"))
     h, w = arr.shape[:2]
@@ -1158,8 +1531,10 @@ def clothing_mask(
         neck_end = min(h, y0 + int(span * 0.22))
         cloth[:neck_end] = 0
 
-    sleeve = garment_extent.get("sleeve", "short") if garment_extent else "short"
+    sleeve = "short" if garment_extent is None else garment_extent.get("sleeve")
+    sleeve_eff = sleeve or "short"
     hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
+    _dbg_tag = os.environ.get("VTON_DEBUG_TAG", "img")
 
     waist_r = _estimate_waist_ratio(subj, y0, span, pose_keypoints=pose_kp)
 
@@ -1171,15 +1546,38 @@ def clothing_mask(
         knee_y_px = pose_kp["knee"][1] * h
         knee_r = (knee_y_px - y0) / max(1, span)
 
-    if garment_type in ("upper", "auto"):
-        if hem == "long":
-            cloth[y0 + int(span * (waist_r + 0.18)) :] = 0
-        elif sleeve == "sleeveless":
-            cloth[y0 + int(span * (waist_r - 0.07)) :] = 0
-        elif sleeve == "long":
-            cloth[y0 + int(span * (waist_r + 0.10)) :] = 0
+    # 截线优先级(写死, 有测试): top 品类(upper/auto/tunic) 一律腰线系, 不与 knee
+    # 截断混用 —— knee_r 只服务 dress/onesie; hem=mid(中长款) 即使品类被显式
+    # 定成 upper 也走 tunic 截线。
+    if garment_type in ("upper", "auto", "tunic"):
+        if garment_type == "tunic":
+            _off = 0.30 if hem == "long" else 0.22
+        elif hem == "mid":
+            _off = 0.22
+        elif hem == "long":
+            _off = 0.18
+        elif sleeve_eff == "sleeveless":
+            _off = -0.07
+        elif sleeve_eff == "long":
+            _off = 0.10
         else:
-            cloth[y0 + int(span * waist_r) :] = 0
+            _off = 0.0
+        cut_row = y0 + int(span * (waist_r + _off))
+        cloth[cut_row:] = 0
+        _debug_dump_mask_stage(cloth * 255, img, "hemcut")
+        logger.info(
+            "[clothing_mask:%s] hemcut: type=%s hem=%s sleeve=%s waist_r=%.3f off=%+.2f "
+            "cut_row=%d (span=%d, knee_r=%s)",
+            _dbg_tag,
+            garment_type,
+            hem,
+            sleeve_eff,
+            waist_r,
+            _off,
+            cut_row,
+            span,
+            (f"{knee_r:.3f}" if knee_r is not None else "absent"),
+        )
     elif garment_type == "dress":
         if knee_r is not None and 0.75 <= knee_r <= 0.95:
             # 有膝关键点: normal 截到膝, long 截到膝下 5%
@@ -1195,19 +1593,101 @@ def clothing_mask(
         if knee_r is not None and 0.75 <= knee_r <= 0.95:
             cut = knee_r + 0.05 if hem == "long" else knee_r - 0.02
             cloth[y0 + int(span * cut) :] = 0
-        elif sleeve == "long":
+        elif sleeve_eff == "long":
             cloth[y0 + int(span * (waist_r + 0.33)) :] = 0
         else:
             cloth[y0 + int(span * (waist_r + 0.28)) :] = 0
     if float(cloth.mean()) < 0.02:
         return None
 
+    # 长袖手臂走廊(top 品类): 下摆截线是通宽直线, 但长袖衣服的袖子要盖住整条
+    # 手臂到腕。不恢复截线到腕之间的两侧手臂列, 截线以下会被 blend_tryon
+    # 贴回基模裸臂 → 袖子齐腰被截、手臂变白。
+    # 走廊 = 主体两侧外 25% 列, 只限主体内部。腕点缺失时按身高 85% 估腕,
+    # 避免 RTMPose/MediaPipe 不可用时走廊整段跳过。
+    def _restore_arm_corridor(to_row: int) -> bool:
+        xs_all = np.where(subj.any(axis=0))[0]
+        if not len(xs_all):
+            return False
+        x0s, x1s = int(xs_all.min()), int(xs_all.max())
+        arm_w = max(8, int(max(1, x1s - x0s) * 0.25))
+        w_row = min(h, int(to_row))
+        if w_row <= cut_row + 4:
+            return False
+        for cs, ce in ((0, x0s + arm_w), (x1s - arm_w, w)):
+            cloth[cut_row:w_row, cs:ce] = (subj[cut_row:w_row, cs:ce] > 0).astype(np.uint8)
+        _debug_dump_mask_stage(cloth * 255, img, "corridor")
+        logger.info(
+            "[clothing_mask:%s] corridor ON (sleeve=%s, to_row=%d)",
+            _dbg_tag,
+            sleeve,
+            w_row,
+        )
+        return True
+
+    _want_corridor = sleeve == "long" or (sleeve is None and garment_type in ("upper", "auto", "tunic"))
+    if garment_type in ("upper", "auto", "tunic") and _want_corridor:
+        restored = False
+        if pose_kp:
+            wrist = pose_kp.get("wrist")
+            if wrist is not None and wrist[2] >= 0.3:
+                wr = (wrist[1] * h - y0) / max(1, span)
+                sr = (pose_kp["shoulder"][1] * h - y0) / max(1, span)
+                if wr > sr + 0.05:
+                    restored = _restore_arm_corridor(y0 + int(span * wr))
+        if not restored:
+            _restore_arm_corridor(y0 + int(span * 0.85))
+    else:
+        logger.info(
+            "[clothing_mask:%s] corridor OFF: sleeve=%s, type=%s (need long or auto-unknown)",
+            _dbg_tag,
+            sleeve,
+            garment_type,
+        )
+
+    # 领口/胸口肤色开孔(top 品类): 中央条带(脖子 + V 领露肤)目前在 mask 内被
+    # 生成像素贴回 —— SDXL 重画的脖子/胸口常发白发灰, 与基模原肤色不符。把
+    # "原图肤色"(dilate 15px 兜发灰边界)+ 颈区"浅色皮"(原图亮且低饱和, 兜住
+    # 皮肤检测器漏掉的近白皮)挖出 → blend_tryon 贴回原像素, 恢复模特原肤色。
+    # 判定只看原图(human_img), 不受衣物自身浅色(如白衬衫领)干扰; 开孔在最终
+    # erode 之前做, 本步不膨胀 mask, 开孔不会被形态学补回。
+    if garment_type in ("upper", "auto", "tunic"):
+        skin_o = _detect_skin(arr)
+        try:
+            import cv2
+
+            skin_d = cv2.dilate(skin_o, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)))
+        except ImportError:
+            skin_d = skin_o
+        c0, c1 = int(w * 0.30), int(w * 0.70)
+        neck_top = y0 + int(span * 0.14)
+        neck_bot = y0 + int(span * 0.22)
+        chest_bot = y0 + int(span * 0.45)
+        # 颈区: 无论领型, 露出的脖子必须是模特原肤色(领口以下才是衣料)。
+        if neck_bot > neck_top:
+            zo = arr[neck_top:neck_bot, c0:c1]
+            lum = zo.astype(np.float32).mean(axis=2)
+            sat = zo.max(axis=2).astype(np.int32) - zo.min(axis=2).astype(np.int32)
+            hit = (skin_d[neck_top:neck_bot, c0:c1] > 0) | ((lum > 195) & (sat < 45))
+            zreg = cloth[neck_top:neck_bot, c0:c1]
+            zreg[hit] = 0
+        # 胸口区: 仅开口领(领口开口度检测=open, 胸口真露皮)开孔; 高领/立领
+        # (closed) 胸口区是衣料, 保持覆盖, 否则会把衣料挖出露出基模打底衫。
+        if (
+            chest_bot > neck_bot
+            and (garment_extent.get("neckline", "closed") if garment_extent else "closed") == "open"
+        ):
+            zreg = cloth[neck_bot:chest_bot, c0:c1]
+            if zreg.any():
+                zreg[skin_d[neck_bot:chest_bot, c0:c1] > 0] = 0
+        _debug_dump_mask_stage(cloth * 255, img, "carve")
+
     # 短袖/无袖:排除手臂皮肤。检测原图肤色(YCbCr),从 mask 两侧减去
     # 皮肤像素 → 手臂皮肤标记为 0(保留原图),只有衣物区标记为 255(允许
     # 生成替换)。躯干中心不减 → 胸口 V 领露肤仍可被新衣物覆盖。
     # 长袖不减:新衣物需覆盖整条手臂,手臂皮肤应被生成结果替换。
     # 用主体水平外扩 25% 定位手臂区(而非固定图像宽度比例)。
-    if garment_type in ("upper", "auto") and sleeve in ("short", "sleeveless"):
+    if garment_type in ("upper", "auto", "tunic") and sleeve in ("short", "sleeveless"):
         skin = _detect_skin(arr)
         if skin.any():
             xs = np.where(subj.any(axis=0))[0]
@@ -1227,9 +1707,11 @@ def clothing_mask(
         cloth = cv2.erode(cloth, k, iterations=1)
         if float(cloth.mean()) < 0.015:
             return None
-        return cv2.GaussianBlur((cloth * 255).astype(np.uint8), (0, 0), 6)
+        out_mask = cv2.GaussianBlur((cloth * 255).astype(np.uint8), (0, 0), 6)
     except Exception:  # noqa: BLE001
-        return (cloth * 255).astype(np.uint8)
+        out_mask = (cloth * 255).astype(np.uint8)
+    _debug_dump_mask_stage(out_mask, img, "final")
+    return out_mask
 
 
 def blend_tryon(
@@ -1359,12 +1841,39 @@ def save_platform_result(
     return out.size[0], len(data)
 
 
+def _env_float(name: str, default: float, lo: float | None = None, hi: float | None = None) -> float:
+    """统一 env float 解析 + clamp(pipeline audit 行23/24/30).
+
+    旧代码 10 个 VTON_PATTERN_LOCK_* 与若干 VTON_* 直接 float(env) → 坏值(如
+    "0,75")在未包裹的 overlay 里抛异常 → 整步退回裸 SDXL;LIGHTING_MIN>LIGHTING_MAX
+    时 clip 把所有像素钉在 min, 图像整体偏色。这里坏值 warning + 用 default,
+    越界值 warning + clamp 进 [lo, hi]。
+    """
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        val = float(default)
+    else:
+        try:
+            val = float(str(raw).strip())
+        except (TypeError, ValueError):
+            logger.warning("Invalid %s=%r; using default %s", name, raw, default)
+            val = float(default)
+    if lo is not None and val < lo:
+        logger.warning("%s=%s below minimum %s; clamping", name, val, lo)
+        val = lo
+    if hi is not None and val > hi:
+        logger.warning("%s=%s above maximum %s; clamping", name, val, hi)
+        val = hi
+    return val
+
+
 def _pattern_lock_overlay(
     gen: np.ndarray,
     ref: np.ndarray,
     mask_f32: np.ndarray,
     skin_u8: np.ndarray,
     light_strength: float,
+    ref_alpha: Image.Image | None = None,
 ) -> Image.Image:
     """Warp 后的衣覆盖衣服区;生成图只提供褶皱光影(PLTON 频率分离)。
 
@@ -1391,24 +1900,36 @@ def _pattern_lock_overlay(
 
     import cv2
 
-    env_ls = os.environ.get("VTON_PATTERN_LOCK_LIGHT_STRENGTH")
-    ls_val = float(env_ls) if env_ls else light_strength
+    ls_val = _env_float("VTON_PATTERN_LOCK_LIGHT_STRENGTH", light_strength, 0.0, 1.0)
     ls = float(np.clip(ls_val, 0.0, 1.0))
-    lf_strength = float(os.environ.get("VTON_PATTERN_LOCK_LF_STRENGTH", "1.0"))
-    hf_strength = float(os.environ.get("VTON_PATTERN_LOCK_HF_STRENGTH", "0.5"))
-    lf_blur = float(os.environ.get("VTON_PATTERN_LOCK_LF_BLUR_SIGMA", "8.0"))
-    light_min = float(os.environ.get("VTON_PATTERN_LOCK_LIGHTING_MIN", "0.75"))
-    light_max = float(os.environ.get("VTON_PATTERN_LOCK_LIGHTING_MAX", "1.25"))
-    skin_w = float(os.environ.get("VTON_PATTERN_LOCK_SKIN_WEIGHT", "0.85"))
-    feather = float(os.environ.get("VTON_PATTERN_LOCK_FEATHER_PX", "5"))
+    lf_strength = _env_float("VTON_PATTERN_LOCK_LF_STRENGTH", 1.0, 0.0, 4.0)
+    hf_strength = _env_float("VTON_PATTERN_LOCK_HF_STRENGTH", 0.5, 0.0, 4.0)
+    lf_blur = _env_float("VTON_PATTERN_LOCK_LF_BLUR_SIGMA", 8.0, 0.0, 64.0)
+    light_min = _env_float("VTON_PATTERN_LOCK_LIGHTING_MIN", 0.75, 0.0, 4.0)
+    light_max = _env_float("VTON_PATTERN_LOCK_LIGHTING_MAX", 1.25, 0.0, 4.0)
+    if light_min > light_max:
+        # 行30: min>max 时 np.clip 把所有像素钉在 min(整体偏色)。交换并告警。
+        logger.warning(
+            "VTON_PATTERN_LOCK_LIGHTING_MIN(%s) > MAX(%s); swapping to keep lighting meaningful",
+            light_min,
+            light_max,
+        )
+        light_min, light_max = min(light_min, light_max), max(light_min, light_max)
+    skin_w = _env_float("VTON_PATTERN_LOCK_SKIN_WEIGHT", 0.85, 0.0, 1.0)
+    feather = _env_float("VTON_PATTERN_LOCK_FEATHER_PX", 5, 1.0, 64.0)
     skip_white = os.environ.get("VTON_PATTERN_LOCK_SKIP_WHITE_BG", "1") == "1"
-    white_thresh = int(os.environ.get("VTON_PATTERN_LOCK_WHITE_THRESH", "245"))
+    white_thresh = _env_float("VTON_PATTERN_LOCK_WHITE_THRESH", 245, 128, 255)
 
     if skip_white:
         ref_u8 = np.clip(ref, 0, 255).astype(np.uint8)
         near_white = (
             (ref_u8[..., 0] > white_thresh) & (ref_u8[..., 1] > white_thresh) & (ref_u8[..., 2] > white_thresh)
         ).astype(np.uint8)
+        # 行26: 只在"非衣物区"找画布白。旧代码直接对 near_white 连通域 + 触边判定,
+        # 白色/浅色衣物触到画布边就被整块当"画布白"清零 → 白衣印花锁不住被 SDXL 重画。
+        # 先与 ~mask(mask=衣物 255)求交, 白衣像素不再参与画布白判定。
+        garment = (mask_f32 > 127).astype(np.uint8)
+        near_white = near_white * (1 - garment)
         _n_labels, labels = cv2.connectedComponents(near_white, connectivity=8)
         border_ids = set(labels[0].tolist())
         border_ids.update(labels[-1].tolist())
@@ -1420,12 +1941,25 @@ def _pattern_lock_overlay(
     else:
         content = np.ones((*ref.shape[:2], 1), dtype=np.float32)
 
+    # 衣物 alpha(来自 warp 出的 RGBA 参考): alpha=0 处(画布白底/无衣料区,
+    # 如参考图没覆盖到的袖子区)不贴入 —— 否则白底整块贴到模特身上 = 袖子白晕/
+    # 脖子灰带根因。白衣 alpha=1 照常贴(比白底启发式更准, 二者相乘双保险)。
+    if ref_alpha is not None:
+        _a = np.asarray(ref_alpha.convert("L"))
+        if _a.shape[:2] != ref.shape[:2]:
+            _a = np.array(
+                Image.fromarray(_a).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
+            )
+        content = content * (_a.astype(np.float32) / 255.0)[..., None]
+
     mask_norm = (mask_f32 / 255.0)[..., None]
     edge_weight = mask_norm
     try:
         dist = cv2.distanceTransform((mask_f32 > 20).astype(np.uint8), cv2.DIST_L2, 5)
         if float(dist.max()) > 3:
-            edge_fall = np.clip(dist / feather, 0, 1)
+            # 行29: FEATHER_PX=0 → dist/0 → NaN → uint8 未定义 → 边缘黑噪点。
+            # _env_float 已把下限钉在 1.0, 这里再加 nan_to_num 双保险。
+            edge_fall = np.nan_to_num(np.clip(dist / max(feather, 1.0), 0, 1), nan=1.0, posinf=1.0, neginf=0.0)
             edge_weight = edge_fall[..., None] * mask_norm
     except Exception:  # noqa: BLE001
         pass
@@ -1446,7 +1980,7 @@ def _pattern_lock_overlay(
     lit = np.clip(lf_ref * shade_lf[..., None] + hf_ref * shade_hf[..., None], 0, 255)
 
     alpha = edge_weight * content * skin_factor
-    out = lit * alpha + gen * (1.0 - alpha)
+    out = np.nan_to_num(lit * alpha + gen * (1.0 - alpha), nan=0.0)
     return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), "RGB")
 
 
@@ -1458,12 +1992,18 @@ def reapply_garment_detail(
     color_strength: float = 0.85,
     pattern_lock: bool = False,
     light_strength: float = 1.0,
+    ref_alpha: Image.Image | None = None,
 ) -> Image.Image:
     """AI 出骨架光影,代码保商品纹理颜色。
 
     pattern_lock=True: warp 后的 garment_ref 直接覆盖衣服区(锁死花纹/logo),
     生成图只按亮度比调制褶皱光影;mask 边缘仍衰减,接缝交给生成像素。
     pattern_lock=False: 高频柔光 + Reinhard 颜色迁移(旧路径)。
+
+    ref_alpha(warp 出的 RGBA 参考, 可 None): 贴回与 Reinhard source 统计都按
+    alpha 取"衣物内容"——alpha=0 的画布白底/无衣料区不贴入模特(修袖子白晕/
+    脖子灰带), 也不进 LAB 颜色统计; alpha=1 的白衣照常贴(保护白衣印花)。
+    None 时退回白底连通域启发式(非近白像素=内容, 阈值 245)。
 
     四步纯 CPU 后处理(SDXL 生成之后、身份锁之前执行):
 
@@ -1472,7 +2012,9 @@ def reapply_garment_detail(
     2. **柔光混合贴回**: 把高频以 softlight 模式叠加到 generated 的衣服区,
        加回 SDXL 丢失的面料纹理/花纹细节(128 无影响,>128 提亮,<128 压暗)。
     3. **Reinhard LAB 颜色迁移**: 把生成图衣服区的颜色分布(LAB 均值/方差)
-       拉到原衣的颜色统计 —— 等价颜色直方图匹配,强制颜色一致。
+        拉到原衣的颜色统计 —— 等价颜色直方图匹配,强制颜色一致。
+        两侧都用衣物区统计:target 取 mask 区,source 取衣料内容区
+        (ref_alpha 或白底阈值),画布白不进统计。
     4. **mask 羽化混合**: 只动衣服区(mask 255),人脸/背景/手保持生成图原样;
        texture/color 各有独立强度,mask 边缘平滑过渡无硬边。
 
@@ -1502,7 +2044,12 @@ def reapply_garment_detail(
     skin = _detect_skin(gen.astype(np.uint8))
 
     if pattern_lock:
-        return _pattern_lock_overlay(gen, ref, mask, skin, light_strength)
+        # 行29: overlay 调用无守卫, 坏 env 值崩了 → 整步退回裸 SDXL(静默丢商品纹理)。
+        # 上游已 fail-loud log, 这里保底回退到高频柔光路径而非裸生成图。
+        try:
+            return _pattern_lock_overlay(gen, ref, mask, skin, light_strength, ref_alpha=ref_alpha)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("pattern_lock overlay failed (%s); falling back to softlight path", exc)
 
     edge_weight = mask_norm
     try:
@@ -1518,8 +2065,29 @@ def reapply_garment_detail(
     if skin.any():
         skin_factor = 1.0 - (skin.astype(np.float32) / 255.0)[..., None] * 0.85
 
+    # 平铺参考图的"衣料内容"区:Reinhard source 统计与高频只取衣物本体。
+    # 白画布(常多于衣料像素)进 LAB 均值/方差会把整次颜色迁移拉白、失真;
+    # 画布与衣料边界的高频梯度贴入模特会出白边晕染。
+    if ref_alpha is not None:
+        _a = np.asarray(ref_alpha.convert("L"))
+        if _a.shape[:2] != (h, w):
+            _a = np.array(Image.fromarray(_a).resize((w, h), Image.Resampling.BILINEAR))
+        src_content = _a > 127
+    else:
+        _ref_u8 = np.clip(ref, 0, 255).astype(np.uint8)
+        # 245 同 pattern_lock 白画布阈值;白衣需走 ref_alpha 通路区分。
+        src_content = _ref_u8.min(axis=2) < 245
+    if float(src_content.mean()) < 0.05:
+        src_content = np.ones((h, w), dtype=bool)
+    try:
+        _k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        content_dil = cv2.dilate(src_content.astype(np.uint8), _k) > 0
+    except Exception:  # noqa: BLE001
+        content_dil = src_content
+
     low_freq = cv2.GaussianBlur(ref, (0, 0), 4.0)
     high_freq = ref - low_freq + 128.0
+    high_freq[~content_dil] = 128.0
 
     softlight = gen + (high_freq - 128.0) / 128.0 * gen * (255.0 - gen) / 255.0
     softlight = np.clip(softlight, 0, 255)
@@ -1542,7 +2110,10 @@ def reapply_garment_detail(
         flat = target_lab.reshape(-1, 3)
         t_mean = flat.mean(axis=0)
         t_std = flat.std(axis=0) + 1e-6
-    s_flat = source_lab.reshape(-1, 3)
+    # source 统计只在衣料内容区:整图统计会被画布白拉偏(白底占大半时尤甚)。
+    s_flat = source_lab[src_content]
+    if s_flat.shape[0] < 16:
+        s_flat = source_lab.reshape(-1, 3)
     s_mean = s_flat.mean(axis=0)
     s_std = s_flat.std(axis=0) + 1e-6
 

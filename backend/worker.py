@@ -79,10 +79,24 @@ def process_job(job: dict, bases: list[dict]) -> None:
 
     ext = "png" if job.get("output_format") == "png" or background == "transparent" else "jpg"
     out_path = RESULTS / f"{job['id']}.{ext}"
-    if ext == "png":
+    platform = job.get("platform", "none")
+    if ext == "png" and platform == "none":
         result.save(out_path, "PNG")
     else:
-        result.convert("RGB").save(out_path, "JPEG", quality=94, optimize=True)
+        # 平台模板(shopify/amazon/aliexpress):1:1 居中裁剪 + 平台尺寸 + 纯白底 + JPEG 限体积。
+        from platform_presets import PLATFORM_PRESETS, save_platform_result
+
+        out_jpg = RESULTS / f"{job['id']}.jpg"
+        if platform in PLATFORM_PRESETS:
+            _, nbytes = save_platform_result(result, platform, out_jpg)
+            out_path = out_jpg
+            ext = "jpg"
+            if nbytes:
+                patch_job(job["id"], {"message": f"Done ({platform} template, {nbytes // (1024 * 1024)}MB)"})
+        else:
+            result.convert("RGB").save(out_jpg, "JPEG", quality=94, optimize=True)
+            out_path = out_jpg
+            ext = "jpg"
     preview = RESULTS / f"{job['id']}_preview.jpg"
     thumb = result.convert("RGB")
     thumb.thumbnail((640, 860))

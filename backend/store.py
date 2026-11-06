@@ -304,6 +304,7 @@ def create_job(payload: dict) -> dict:
             "garment_type": payload.get("garment_type", "upper"),
             "output_format": payload.get("output_format", "jpg"),
             "background": payload.get("background", state["settings"]["background"]),
+            "platform": payload.get("platform", "none"),
             "sku": payload.get("sku", ""),
             "title": payload.get("title", ""),
             "prompt": payload.get("prompt", ""),
@@ -473,3 +474,23 @@ def stats() -> dict[str, Any]:
         "failed": sum(1 for j in jobs if j["status"] == "failed"),
         "bases": len(list_bases()),
     }
+
+
+def _recover_stuck_jobs() -> None:
+    """启动恢复:上次进程异常退出(被 kill/OOM/崩溃)时,running 任务会永久卡死。
+
+    - running → failed(附中断原因),用户可重新提交;
+    - queued 保持不动,worker 启动后照常 claim 重跑。
+    """
+
+    def _mark(state: dict) -> None:
+        for job in state["jobs"]:
+            if job.get("status") == "running":
+                job["status"] = "failed"
+                job["updated_at"] = _now()
+                job["message"] = "Interrupted: backend restarted before completion"
+
+    with_state(_mark)
+
+
+_recover_stuck_jobs()

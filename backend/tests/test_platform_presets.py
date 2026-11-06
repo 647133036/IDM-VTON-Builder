@@ -18,6 +18,7 @@ from platform_presets import (
     _correct_skin_tone,
     _detect_face_mask,
     _detect_skin,
+    _env_float,
     _estimate_waist_ratio,
     _heuristic_face_mask,
     _sdxl_inpaint_repair,
@@ -464,6 +465,42 @@ def test_reapply_garment_detail_color_matches_source():
     assert out_arr[..., 2].mean() < 140  # B 下降
 
 
+def test_reapply_garment_detail_ignores_canvas_white_in_stats():
+    """平铺图带白画布:LAB source 统计只取衣料内容,衣服区拉向红衣而非白。"""
+    from PIL import ImageDraw
+
+    # 生成图整幅紫色(非肤色);参考图白画布 + 小块红衣(衣料远少于画布白)
+    gen_arr = np.full((64, 64, 3), (150, 60, 180), dtype=np.uint8)
+    gen = Image.fromarray(gen_arr, "RGB")
+    ref = Image.new("RGB", (64, 64), (255, 255, 255))
+    d = ImageDraw.Draw(ref)
+    d.rectangle([24, 24, 40, 40], fill=(200, 50, 50))
+    mask = np.full((64, 64), 255, dtype=np.uint8)
+
+    out = np.array(reapply_garment_detail(gen, ref, mask, texture_strength=0.0, color_strength=1.0))
+    # 画布白约 3800px 远多于红衣约 300px:整图统计会把均值拉向白(灰紫);
+    # 内容区统计后衣服区应显著趋红。
+    assert out[32, 32, 0] > 170  # R 高
+    assert out[32, 32, 2] < 90  # B 低
+
+    # ref_alpha 通路(白衣/无白底启发式时用)同样只统计衣料内容
+    ref_rgba = Image.new("RGBA", (64, 64), (255, 255, 255, 0))
+    d2 = ImageDraw.Draw(ref_rgba)
+    d2.rectangle([24, 24, 40, 40], fill=(200, 50, 50, 255))
+    out2 = np.array(
+        reapply_garment_detail(
+            gen,
+            ref_rgba.convert("RGB"),
+            mask,
+            texture_strength=0.0,
+            color_strength=1.0,
+            ref_alpha=ref_rgba.split()[3],
+        )
+    )
+    assert out2[32, 32, 0] > 170
+    assert out2[32, 32, 2] < 90
+
+
 # ---------------------------------------------------------------------------
 # v0.1.4: detect_garment_extent / 动态 clothing_mask / seamlessClone / 边缘衰减
 # ---------------------------------------------------------------------------
@@ -492,11 +529,14 @@ def _transparent_with_shapes(size, shapes):
 # --- detect_garment_extent --------------------------------------------------
 
 
-def test_detect_garment_extent_long_sleeve_by_aspect():
-    """高瘦矩形(aspect>1.35)→ sleeve=long, hem=long。"""
+def test_detect_garment_extent_tall_column_is_sleeveless_long_hem():
+    """高瘦直筒(无侧翼内容)→ sleeve=sleeveless;衣长仍判 long。
+
+    旧规则 aspect>1.35 直接判长袖:高瘦无袖连衣裙/直筒外套全部躺枪。
+    """
     img = _transparent_with_shapes((100, 250), [("rect", (10, 25, 90, 225))])
     ext = detect_garment_extent(img)
-    assert ext["sleeve"] == "long"
+    assert ext["sleeve"] == "sleeveless"
     assert ext["hem"] == "long"
 
 
@@ -539,15 +579,108 @@ def test_detect_garment_extent_tiny_content_defaults():
 
 
 def test_detect_garment_extent_opaque_background():
-    """不透明图(无 alpha 通道)走角部差分通路,仍能检测。"""
+    """不透明图(无 alpha 通道)走角部差分通路,仍能检测(直筒→无袖+长)。"""
     from PIL import ImageDraw
 
     img = Image.new("RGB", (100, 250), (128, 128, 128))
     d = ImageDraw.Draw(img)
     d.rectangle((10, 25, 90, 225), fill=(200, 50, 50))
     ext = detect_garment_extent(img)
-    assert ext["sleeve"] == "long"
+    assert ext["sleeve"] == "sleeveless"
     assert ext["hem"] == "long"
+
+
+def test_detect_garment_extent_boxy_short_sleeve_not_long():
+    """直筒短袖(肩宽、身侧无下垂袖)不得因 bot≈mid 误判成长袖。"""
+    img = _transparent_with_shapes(
+        (200, 200),
+        [
+            ("rect", (20, 40, 180, 70)),
+            ("rect", (60, 70, 140, 150)),
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "short"
+    assert ext["hem"] == "waist"
+
+
+def test_detect_garment_extent_side_drop_is_long_sleeve():
+    """身侧衣料垂过中段 → 长袖。"""
+    img = _transparent_with_shapes(
+        (200, 220),
+        [
+            ("rect", (20, 30, 180, 60)),
+            ("rect", (20, 60, 50, 170)),
+            ("rect", (150, 60, 180, 170)),
+            ("rect", (60, 60, 140, 150)),
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "long"
+
+
+def test_detect_garment_extent_long_coat_short_cap_not_long():
+    """长款外套短袖帽:袖尖只垂到衣长 15%,不得按整衣长比例误判成长袖。
+
+    暗坑:袖长基准必须随衣长分级(肩→腰估计),固定"垂过衣长 38%"在长款上失效。
+    """
+    img = _transparent_with_shapes(
+        (200, 300),
+        [
+            ("rect", (55, 20, 145, 280)),  # 衣身到大腿
+            ("rect", (10, 20, 45, 60)),  # 左短袖帽
+            ("rect", (155, 20, 190, 60)),  # 右短袖帽
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "short"
+    assert ext["hem"] == "mid"
+
+
+def test_detect_garment_extent_long_coat_draped_sleeve_is_long():
+    """同款外套、袖垂到大腿根(超肩→腰基准 70%)→ 长袖。"""
+    img = _transparent_with_shapes(
+        (200, 300),
+        [
+            ("rect", (55, 20, 145, 280)),
+            ("rect", (10, 20, 45, 180)),  # 左袖垂到 y180
+            ("rect", (155, 20, 190, 180)),
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "long"
+    assert ext["hem"] == "mid"
+
+
+def test_detect_garment_extent_wrap_tie_not_counted_as_sleeve():
+    """裹身衣垂下的窄绑带不得当袖子:真实案例 04469(短袖丝绒裹身衣,
+    右侧绑带垂过下摆 ~60px≈10% 衣宽)被旧逻辑判成长袖。"""
+    img = _transparent_with_shapes(
+        (200, 300),
+        [
+            ("rect", (60, 20, 140, 180)),  # 衣身
+            ("rect", (20, 20, 50, 70)),  # 左短袖
+            ("rect", (150, 20, 180, 70)),  # 右短袖
+            ("rect", (150, 110, 164, 260)),  # 窄绑带:身侧 15px(9% 衣宽), 垂过下摆
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["sleeve"] == "short"
+    assert ext["hem"] == "mid"
+
+
+def test_detect_garment_extent_tunic_mid_hem_by_torso_ratio():
+    """衣身相对躯干宽足够高 → hem=mid(中长款),不被宽袖拉成腰线。"""
+    img = _transparent_with_shapes(
+        (220, 280),
+        [
+            ("rect", (10, 20, 210, 70)),
+            ("rect", (70, 70, 150, 250)),
+        ],
+    )
+    ext = detect_garment_extent(img)
+    assert ext["hem"] == "mid"
+    assert ext["sleeve"] == "short"
 
 
 # --- clothing_mask with garment_extent --------------------------------------
@@ -572,6 +705,31 @@ def test_clothing_mask_long_sleeve_extends_below_default():
     # default cut at 20+160*0.62=119; long cut at 20+160*0.72=135
     # row 125: default 截断, long 保留
     assert int(m_long[125, 60]) > int(m_default[125, 60]) + 50
+
+
+def test_clothing_mask_upper_mid_hem_below_waist():
+    """中长款 hem=mid 比 waist 多留髋部:row 140 在 mid 保留、waist 截断。"""
+    img, subj = _subject_img()
+    m_waist = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "waist"}
+    )
+    m_mid = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "short", "hem": "mid"}
+    )
+    assert m_waist is not None and m_mid is not None
+    assert int(m_mid[140, 60]) > int(m_waist[140, 60]) + 50
+
+
+def test_clothing_mask_long_sleeve_corridor_without_pose(monkeypatch):
+    """无腕关键点时,长袖仍恢复两侧手臂走廊,中央躯干保持腰线截断。"""
+    import platform_presets
+
+    monkeypatch.setattr(platform_presets, "_detect_pose_keypoints", lambda *a, **kw: None)
+    img, subj = _subject_img()
+    m = clothing_mask(img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "long", "hem": "waist"})
+    assert m is not None
+    assert int(m[145, 30]) > 50
+    assert int(m[145, 60]) < 40
 
 
 def test_clothing_mask_upper_long_hem_drapes_over_pants():
@@ -875,7 +1033,15 @@ def test_simcc_decode_round_trip_near_square():
 
 
 def test_fake_deps_injection_sets_stub_modules():
-    """fake deps 注入后 mmdet/xtcocotools/mmcv.ops 是空壳模块."""
+    """fake deps 注入后 mmdet(.utils)/mmcv.ops/mmcv._ext/mmcv.transforms(.utils) 落进
+    sys.modules(空壳 stub 或先导入的真实模块)。
+
+    2026-11-06 定案: RTMPOSE_FAKE_DEPS=1 时三条路径 mmdet/mmcv.ops/mmcv._ext **无条件**
+    注册 stub(不再逐模块 find_spec —— lite 纯 Python mmcv.ops 盘上存在但 import 即崩,
+    find_spec 会误放行); 面已被真实模块先导入则不夺取(先到先得)。
+    xtcocotools/mmcv.transforms 家族保持逐模块 find_spec 条件断言 —— 本机(真 mmcv)与
+    盒子(mmcv-lite)两类环境都成立。
+    """
     import types
 
     import platform_presets
@@ -886,9 +1052,99 @@ def test_fake_deps_injection_sets_stub_modules():
         pytest.skip("RTMPOSE_FAKE_DEPS=0")
     platform_presets._inject_fake_deps()
     assert platform_presets._FAKE_DEPS_INJECTED
-    assert sys.modules["mmdet"].ConfigType is dict
-    assert isinstance(sys.modules["xtcocotools"], types.ModuleType)
+    # mmdet: 开关打开 → 无条件 stub(2026-11-06 定案); 真 mmdet 已被先导入则不夺取
+    # (先到先得), 此时只断言 utils 面在场。
+    _m = sys.modules.get("mmdet")
+    if _m is not None and not _is_injected_stub(_m):
+        assert "mmdet.utils" in sys.modules  # 真 mmdet 先导入: 未被夺取
+    else:
+        assert _is_injected_stub(sys.modules["mmdet"])
+        assert sys.modules["mmdet"].ConfigType is dict
+        assert sys.modules["mmdet.utils"].reduce_mean is not None
+    # mmcv.ops: 开关打开 → 无条件 stub(find_spec 命中盘上包 —— 即使是 lite 纯 Python 版
+    # import 即崩 —— 也不再放行); 真 mmcv.ops 先导入则不夺取 —— 真包也有 MSDA 属性,
+    # 两种情况下断言都成立。
     assert hasattr(sys.modules["mmcv.ops"], "MultiScaleDeformableAttention")
+    # mmcv._ext: 三条路径条款(2026-11-06) —— 注入后必在 sys.modules(stub 或先导入)。
+    assert "mmcv._ext" in sys.modules
+    # mmcv.transforms: mmcv 2.x 才有的子包;注入后(缺真包时)必须落进 sys.modules。
+    if not platform_presets._module_importable("mmcv.transforms"):
+        assert isinstance(sys.modules["mmcv.transforms"], types.ModuleType)
+        assert isinstance(sys.modules["mmcv.transforms.utils"], types.ModuleType)
+        assert sys.modules["mmcv.transforms.utils"].cache_randomness.__call__  # 装饰器恒等实现
+
+
+def _is_injected_stub(mod) -> bool:
+    """区分 platform_presets 注入的空壳 stub 与真实包: stub 的 __path__ 恒为 []."""
+    return getattr(mod, "__path__", None) == []
+
+
+def test_fake_deps_unconditional_stub_even_when_find_spec_hits(monkeypatch):
+    """2026-11-06 回归测试(mmcv-lite g4 事故): find_spec("mmcv.ops") 能命中盘上真包,
+    但真 __init__ → load_ext → `import mmcv._ext` 在 lite 版缺 C 扩展时崩 ——
+    RTMPOSE_FAKE_DEPS=1 下无条件注册的 stub 仍必须生效, 防止判断逻辑退回逐模块
+    find_spec、把"盘上存在、import 即崩"的 mmcv.ops 误放行(那次放行让 RTMPose 静默
+    退化到轮廓法, g4 四缺陷模式全回归)。
+
+    本测试只在真 mmcv.ops 盘上存在的环境有意义(盒 mmcv-lite 与 DSW mmcv-full 都满足);
+    find_spec 缺席时跳过。
+    """
+    import importlib.util
+
+    import platform_presets
+
+    if not platform_presets._RTMPOSE_FAKE_DEPS:
+        import pytest
+
+        pytest.skip("RTMPOSE_FAKE_DEPS=0")
+    # 前提用父包 mmcv 判(盘上无 mmcv 才跳过; 不查 mmcv.ops 子面 —— 前序测试
+    # 可能已把 spec=None 的 stub 放进 sys.modules["mmcv.ops"], find_spec 子面会抛
+    # ValueError, 与测试顺序耦合)。
+    if importlib.util.find_spec("mmcv") is None:
+        import pytest
+
+        pytest.skip("未装 mmcv, find_spec 误放行前提不成立")
+    # 先到先得: 清掉 sys.modules 里可能先导入的模块, 观察本轮 stub 注册
+    # (monkeypatch 测试结束自动还原)。
+    for _k in ("mmcv.ops", "mmcv._ext"):
+        monkeypatch.delitem(sys.modules, _k, raising=False)
+    monkeypatch.setattr(platform_presets, "_FAKE_DEPS_INJECTED", False)
+    platform_presets._inject_fake_deps()
+    # find_spec 命中前提下 stub 仍生效(回归关键断言):
+    assert _is_injected_stub(sys.modules["mmcv.ops"])
+    assert hasattr(sys.modules["mmcv.ops"], "MultiScaleDeformableAttention")
+    assert _is_injected_stub(sys.modules["mmcv._ext"])
+    # import 链实际走通: EDPoseHead 面不再崩在 mmcv._ext(DSW 无 mmpose → 该段
+    # 在盒上跑; mmpose 缺席时 stub 注册断言已覆盖回归关键路径)。
+    if importlib.util.find_spec("mmpose") is not None:
+        try:
+            from mmpose.models.heads import EDPoseHead  # noqa: F401
+        except ValueError as exc:
+            import pytest
+
+            pytest.skip(f"xtcocotools/numpy ABI mismatch: {exc}")
+
+
+def test_fake_deps_real_xtcocotools_not_stubbed(monkeypatch):
+    """真 xtcocotools 在场 → 不注入 stub(行28: 逐模块独立判断, 不再短路其余 stub)."""
+    import platform_presets
+
+    if not platform_presets._RTMPOSE_FAKE_DEPS:
+        import pytest
+
+        pytest.skip("RTMPOSE_FAKE_DEPS=0")
+    # 强制"xtcocotools 可 import"分支, 其余面仍按真实情况判断。
+    monkeypatch.setattr(platform_presets, "_module_importable", lambda name: name == "xtcocotools")
+    monkeypatch.setattr(platform_presets, "_FAKE_DEPS_INJECTED", False)
+    # 清掉可能已存在的注入痕迹, 观察本次注入是否给 xtcocotools 塞 stub。
+    for _k in ("xtcocotools", "xtcocotools.coco", "xtcocotools.mask", "xtcocotools.cocoeval"):
+        sys.modules.pop(_k, None)
+    platform_presets._inject_fake_deps()
+    # 真 xtcocotools 可 import → 本次注入不得为它创建 stub 模块。
+    assert "xtcocotools" not in sys.modules
+    # 但其余不可用的面仍要注入(逐模块独立, 不被 xtcocotools 短路)。
+    assert "mmdet" in sys.modules and sys.modules["mmdet"].ConfigType is dict
+    assert "mmdet.utils" in sys.modules
 
 
 def test_estimate_waist_ratio_shoulder_low_visibility_falls_back():
@@ -1182,8 +1438,18 @@ def test_detect_skin_morphology_removes_noise():
     assert skin[12, 12] == 255
 
 
+def test_correct_skin_tone_washes_out_still_shifts():
+    """result 手臂发白掉出 YCbCr 窗时,仍按原图肤色位置拉回。"""
+    orig = np.full((80, 80, 3), (241, 241, 241), dtype=np.uint8)
+    orig[30:70, 20:60] = (180, 140, 120)
+    res = np.full((80, 80, 3), (241, 241, 241), dtype=np.uint8)
+    res[30:70, 20:60] = (236, 232, 228)
+    out = np.array(_correct_skin_tone(Image.fromarray(orig, "RGB"), Image.fromarray(res, "RGB")))
+    assert int(out[50, 40, 0]) < 220
+
+
 def test_correct_skin_tone_excludes_face_region():
-    """脸区(前景顶部 18%)不被校正,手臂区被校正。"""
+    """脸区(前景顶部 12%)不被校正,手臂区被校正。"""
     skin = (180, 140, 120)
     light = (210, 190, 180)
     orig = np.full((100, 100, 3), (241, 241, 241), dtype=np.uint8)
@@ -1196,6 +1462,30 @@ def test_correct_skin_tone_excludes_face_region():
     face_delta = abs(out[15, 50, 0].astype(int) - 210)
     arm_delta = abs(out[70, 20, 0].astype(int) - 210)
     assert arm_delta > face_delta
+
+
+def test_correct_skin_tone_skips_garment_covered_positions():
+    """长袖盖住原图手臂位置:袖子像素不被"原图肤色兜底"染成肤色。
+
+    原图右半是裸臂肤色,生成图右半被蓝袖子盖住。兜底(max(res_skin, orig_skin))
+    会把袖子位置算进校正区 → 袖子被拉成肤色发黄;传 cloth_mask 后袖子保持原色。
+    """
+    skin = (180, 140, 120)
+    washed = (220, 205, 195)  # 发白手臂(YCbCr 仍在肤色窗内)
+    sleeve = (60, 80, 200)  # 蓝袖子(非肤色)
+    orig = np.full((60, 60, 3), skin, dtype=np.uint8)
+    res = np.full((60, 60, 3), washed, dtype=np.uint8)
+    res[:, 30:60] = sleeve  # 右半:原图裸臂位置被长袖盖住
+    cloth = np.zeros((60, 60), dtype=np.uint8)
+    cloth[:, 30:60] = 255
+
+    out = np.array(_correct_skin_tone(Image.fromarray(orig, "RGB"), Image.fromarray(res, "RGB"), cloth_mask=cloth))
+    # 袖子区不被染色:RGB 与输入袖子几乎一致
+    assert abs(int(out[30, 45, 0]) - sleeve[0]) < 10
+    assert abs(int(out[30, 45, 2]) - sleeve[2]) < 10
+    # 裸臂区仍被拉回原肤色
+    assert abs(int(out[30, 15, 0]) - skin[0]) < 12
+    assert abs(int(out[30, 15, 1]) - skin[1]) < 12
 
 
 # ---------------------------------------------------------------------------
@@ -1456,13 +1746,19 @@ def test_pattern_lock_center_matches_ref_pattern():
 
 
 def test_pattern_lock_skips_white_background():
-    """cloth_ref 白底不得覆盖生成图像素。"""
+    """cloth_ref 白底不得覆盖生成图像素。
+
+    setup 语义(2026-11-05 定案): mask = 衣物区(生产 shared_mask 语义), 白底角区
+    **不在衣物区** → 角区 mask=0。旧版测试用全 255 掩膜(衣物铺满全图)与行 26 求交
+    语义(near_white ∩ 非衣物)矛盾: 全掩膜下白角全被归入衣物 → 无可跳区 → 白被压上。
+    """
     gen_arr = np.full((64, 64, 3), (30, 80, 160), dtype=np.uint8)
     gen = Image.fromarray(gen_arr, "RGB")
     ref_arr = np.full((64, 64, 3), 255, dtype=np.uint8)
     ref_arr[16:48, 16:48] = (200, 40, 40)
     ref = Image.fromarray(ref_arr, "RGB")
-    mask = np.full((64, 64), 255, dtype=np.uint8)
+    mask = np.zeros((64, 64), dtype=np.uint8)
+    mask[16:48, 16:48] = 255  # 衣物内容区(红方块); 白底角区 mask=0
 
     out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
     # 白底区(角)保持生成图蓝
@@ -1510,3 +1806,130 @@ def test_pattern_lock_frequency_separation_preserves_pattern():
     out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=1.0))
     center = out[30:50, 30:50]
     assert center.std() > 15, f"high-freq pattern should survive strong lighting: std={center.std():.1f}"
+
+
+# ── env 坏值 / feather=0 / rembg 重试 (audit 行17/24/29/34/35 补缺口单测) ──────────────
+
+
+def test_env_float_bad_value_falls_back_default(monkeypatch):
+    """行23/24: env float 坏值("0,75"/非数字)→ warning + 用 default, 不炸整步。"""
+    monkeypatch.setenv("VTON_TEST_BAD_FLOAT", "0,75")
+    assert _env_float("VTON_TEST_BAD_FLOAT", 2.5, 0.0, 4.0) == 2.5
+    monkeypatch.setenv("VTON_TEST_BAD_FLOAT", "not-a-number")
+    assert _env_float("VTON_TEST_BAD_FLOAT", 2.5, 0.0, 4.0) == 2.5
+    monkeypatch.setenv("VTON_TEST_BAD_FLOAT", "")
+    assert _env_float("VTON_TEST_BAD_FLOAT", 2.5, 0.0, 4.0) == 2.5
+
+
+def test_env_float_out_of_range_clamped(monkeypatch):
+    """行30: 越界值 clamp 进 [lo, hi](feather=0 → 1.0, 不产生 NaN)。"""
+    monkeypatch.setenv("VTON_TEST_RANGE", "999")
+    assert _env_float("VTON_TEST_RANGE", 5.0, 1.0, 64.0) == 64.0
+    monkeypatch.setenv("VTON_TEST_RANGE", "-3")
+    assert _env_float("VTON_TEST_RANGE", 5.0, 1.0, 64.0) == 1.0
+
+
+def test_pattern_lock_lighting_min_gt_max_swaps_no_crash(monkeypatch):
+    """行24: LIGHTING_MIN>MAX 时交换+告警(旧 np.clip 会把所有像素钉在 min → 整体偏色)。"""
+    monkeypatch.setenv("VTON_PATTERN_LOCK_LIGHTING_MIN", "2.0")
+    monkeypatch.setenv("VTON_PATTERN_LOCK_LIGHTING_MAX", "0.5")
+    gen = Image.new("RGB", (64, 64), (100, 150, 200))
+    ref = Image.new("RGB", (64, 64), (200, 100, 50))
+    mask = np.full((64, 64), 255, dtype=np.uint8)
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
+    assert out.shape == (64, 64, 3)
+    assert not np.isnan(out.astype(float)).any()
+
+
+def test_pattern_lock_feather_zero_no_nan(monkeypatch):
+    """行29: FEATHER_PX=0 被 _env_float 钉在 1.0 + 双保险 nan_to_num, 边缘无黑噪点/NaN。"""
+    monkeypatch.setenv("VTON_PATTERN_LOCK_FEATHER_PX", "0")
+    gen = Image.new("RGB", (64, 64), (100, 150, 200))
+    ref = Image.new("RGB", (64, 64), (200, 100, 50))
+    mask = np.full((64, 64), 255, dtype=np.uint8)
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
+    assert not np.isnan(out.astype(float)).any()
+    assert (out >= 0).all() and (out <= 255).all()
+
+
+def _install_fake_rembg(monkeypatch, calls, new_session_impl, remove_impl):
+    """注入假 rembg(DSW 无 rembg 包), 让 foreground_mask 的函数级 import 命中假实现。"""
+    import types
+
+    import platform_presets
+
+    fake = types.ModuleType("rembg")
+    fake.new_session = lambda *a, **k: new_session_impl(a, k)
+    fake.remove = lambda *a, **k: remove_impl(a, k)
+    monkeypatch.setitem(sys.modules, "rembg", fake)
+    # 保证 sess_opts 分支(onnxruntime.SessionOptions 在场)在任何环境都走到。
+    try:
+        import onnxruntime  # noqa: F401
+    except ImportError:
+        _ort = types.ModuleType("onnxruntime")
+        _ort.SessionOptions = lambda: object()
+        monkeypatch.setitem(sys.modules, "onnxruntime", _ort)
+    # 重置会话缓存
+    monkeypatch.setattr(platform_presets, "_FG_SESSION", None)
+    monkeypatch.setattr(platform_presets, "_FG_SESSION_ERROR", None)
+    monkeypatch.setattr(platform_presets, "_FG_SESSION_WARNED", False)
+    return platform_presets
+
+
+def test_rembg_new_session_typeerror_targeted_retry(monkeypatch, tmp_path):
+    """行17/35: new_session 不接受 sess_opts(TypeError)→ 重试一次不带该 kwarg, 会话缓存。"""
+    import types
+
+    pp = _install_fake_rembg(monkeypatch, [], None, None)
+    calls = []
+
+    def _ns(a, k):
+        calls.append(k)
+        if "sess_opts" in k:
+            raise TypeError("new_session() got an unexpected keyword argument 'sess_opts'")
+        return object()
+
+    fake = types.ModuleType("rembg")
+    fake.new_session = lambda *a, **k: _ns(a, k)
+    fake.remove = lambda *a, **k: Image.new("RGBA", (64, 64), (0, 0, 0, 255))
+    monkeypatch.setitem(sys.modules, "rembg", fake)
+    model = tmp_path / "u2net.onnx"
+    model.write_bytes(b"x" * 11_000_000)  # _u2net_onnx_path 只认 >10MB
+    monkeypatch.setattr(pp, "_u2net_onnx_path", lambda: model)
+
+    img = Image.new("RGB", (64, 64), (10, 20, 30))
+    assert pp.foreground_mask(img) is not None
+    # 第一次带 sess_opts → TypeError → 第二次不带; 之后复用会话(不再调 new_session)
+    assert len(calls) == 2 and "sess_opts" in calls[0] and "sess_opts" not in calls[1]
+    assert pp.foreground_mask(img) is not None
+    assert len(calls) == 2
+
+
+def test_rembg_session_failure_short_circuit(monkeypatch, tmp_path):
+    """行34: session 初始化失败缓存 _FG_SESSION_ERROR, 后续调用短路, 不逐张重试。"""
+    import types
+
+    pp = _install_fake_rembg(monkeypatch, [], None, None)
+    calls = []
+
+    def _ns(a, k):
+        calls.append(k)
+        raise RuntimeError("u2net load failed (simulated)")
+
+    def _remove_fail(a, k):
+        raise AssertionError("remove 不应被调用")
+
+    fake = types.ModuleType("rembg")
+    fake.new_session = lambda *a, **k: _ns(a, k)
+    fake.remove = lambda *a, **k: _remove_fail(a, k)
+    monkeypatch.setitem(sys.modules, "rembg", fake)
+    model = tmp_path / "u2net.onnx"
+    model.write_bytes(b"x" * 11_000_000)
+    monkeypatch.setattr(pp, "_u2net_onnx_path", lambda: model)
+
+    img = Image.new("RGB", (64, 64), (10, 20, 30))
+    assert pp.foreground_mask(img) is None
+    assert len(calls) == 1 and pp._FG_SESSION_ERROR is not None
+    # 第二张: 短路, 不再调 new_session
+    assert pp.foreground_mask(img) is None
+    assert len(calls) == 1

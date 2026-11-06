@@ -30,8 +30,18 @@ import worker as worker_mod  # noqa: E402
 
 worker_mod.start_worker = lambda *a, **k: None
 
-from fastapi.testclient import TestClient  # noqa: E402
-from main import app  # noqa: E402
+# Web 栈(main/jwt): DSW 的 CPU 子集环境可能缺 jwt 等依赖。import 失败 → 标记不可用,
+# web 夹具(client/auth_headers/seeded_client)运行时 skip, 但 CPU 子集
+# (test_platform_presets 等)的 collect 不再被 conftest 阻塞(pipeline audit 第 11 条 conftest 拆分)。
+try:
+    from fastapi.testclient import TestClient
+    from main import app
+
+    _WEB_STACK_OK = True
+except Exception:  # noqa: BLE001 - 有意宽捕获: web 栈任何 import 失败(缺 jwt/缺驱动等)都降级, 不阻塞 CPU 子集
+    TestClient = None
+    app = None
+    _WEB_STACK_OK = False
 
 
 def _reset_filesystem():
@@ -72,6 +82,8 @@ def clean_state():
 
 @pytest.fixture(scope="session")
 def client():
+    if not _WEB_STACK_OK:
+        pytest.skip("web stack 本环境不可用(main/jwt 缺依赖)")
     return TestClient(app)
 
 

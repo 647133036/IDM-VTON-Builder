@@ -48,6 +48,7 @@ def torso_box(audience: str, ethnicity: str) -> dict:
 
 GARMENT_BOX = {
     "upper": dict(y=0.00, h=1.00, w="shoulder"),
+    "tunic": dict(y=0.00, h=1.30, w="shoulder"),
     "dress": dict(y=0.00, h=1.55, w="shoulder"),
     "lower": dict(y=0.92, h=0.95, w="hem"),
     "onesie": dict(y=0.00, h=1.35, w="shoulder"),
@@ -56,6 +57,7 @@ GARMENT_BOX = {
 # 简易 2D 变形的强度(0~1):越大越贴合模特轮廓。纯 CPU,不依赖 GPU。
 GARMENT_WARP_STRENGTH = {
     "upper": 0.42,
+    "tunic": 0.45,
     "dress": 0.48,
     "onesie": 0.42,
     "lower": 0.28,
@@ -63,6 +65,7 @@ GARMENT_WARP_STRENGTH = {
 
 GARMENT_PROMPTS = {
     "upper": "a model wearing this shirt",
+    "tunic": "a model wearing this tunic top",
     "dress": "a model wearing this dress",
     "lower": "a model wearing these pants",
     "onesie": "a model wearing this onesie",
@@ -363,6 +366,106 @@ def fit_garment_to_body(garment: Image.Image, box: dict, tw: int, th: int) -> Im
     return canvas
 
 
+def refit_sleeves_to_arms(
+    warped: Image.Image,
+    garment: Image.Image,
+    canvas: int,
+    pose: dict | None = None,
+    sleeve_len: str = "long",
+) -> Image.Image:
+    """长袖几何对齐: 把平铺衣左右袖旋转 90° 合成到目标画布的手臂位置。
+
+    2D warp 只把衣身"充气"包到躯干框, 折不下横向摊开的袖子 → 长袖衣的参考图
+    在手臂位置没有袖料(alpha=0) → 生成模型只能画裸臂、pattern-lock 无袖可贴
+    → 出图长袖变短袖/无袖。本函数从原平铺图裁出左右袖, 旋转到竖直(袖口朝下),
+    缩放到手臂宽/长, 合成到画布肩→腕的外侧手臂列, 让 IP-Adapter/pattern-lock
+    在手臂上有真实袖纹。纯 CPU。
+
+    竖直范围用 pose 的肩/腕归一化 y(无 pose 时用全身比例 0.20/0.62); 横向从
+    warped 躯干行实测半宽、贴到躯干外侧。任何一步算不出合法手臂列则原样返回
+    (退回旧行为, 不破坏已有结果)。sleeve_len 仅 "long" 生效。
+    """
+    if sleeve_len != "long":
+        return warped
+    out = warped.convert("RGBA").copy()
+    cw, ch = out.size
+    cx = cw / 2.0
+
+    # ---- 竖直锚点: pose 肩/腕 y, 无 pose 用全身比例 ----
+    if pose:
+        sh = pose.get("shoulder")
+        wr = pose.get("wrist")
+        shoulder_y = int(sh[1] * ch) if sh and sh[2] >= 0.3 else int(ch * 0.20)
+        wrist_y = int(wr[1] * ch) if wr and wr[2] >= 0.3 else int(ch * 0.62)
+    else:
+        shoulder_y, wrist_y = int(ch * 0.20), int(ch * 0.62)
+    if wrist_y - shoulder_y < ch * 0.08:
+        return out
+    arm_len = wrist_y - shoulder_y
+
+    # ---- 横向: 全身正面基模标定的画布比例(手臂列在躯干外侧) ----
+    # 基模(全身正面 1024)躯干半宽≈0.145c, 手臂悬在躯干外侧, 手臂宽≈0.05c:
+    # 左手臂列=[cx-0.20c, cx-0.15c], 右手臂列=[cx+0.15c, cx+0.20c]。
+    arm_w = int(max(10, 0.05 * cw))
+    px_l = int(cx - 0.20 * cw)  # 左臂外缘(袖外侧)
+    px_r = int(cx + 0.15 * cw)  # 右臂内缘(向外出到 0.20c)
+    if px_l < 0:
+        px_l = 0
+    if px_r + arm_w > cw:
+        px_r = cw - arm_w
+    if px_l + arm_w > px_r:  # 两臂列重叠, 放不下
+        return out
+
+    # ---- 从原平铺图裁左右袖 ----
+    g = garment.convert("RGBA")
+    ga = np.asarray(g.getchannel("A"))
+    if int(ga.min()) >= 240:
+        ga = np.asarray(garment_alpha(g))
+    content = ga > 40
+    xs = np.where(content)[1]
+    if len(xs) < 64:
+        return out
+    gx0, gx1 = int(xs.min()), int(xs.max())
+    gcw = max(1, gx1 - gx0 + 1)
+    tc0 = gx0 + int(gcw * 0.22)
+    tc1 = gx0 + int(gcw * 0.78)
+
+    def _sleeve_crop(side: str) -> Image.Image | None:
+        band_c = content[:, :tc0] if side == "L" else content[:, tc1:]
+        yy, xx = np.where(band_c)
+        if len(xx) < max(32, gcw * ch // 400):
+            return None
+        sx0 = int(xx.min())
+        sx1 = int(xx.max()) + 1
+        if side == "R":
+            sx0 -= tc1
+            sx1 -= tc1
+        sy0 = int(yy.min())
+        sy1 = int(yy.max()) + 1
+        crop = g.crop((sx0, sy0, sx1, sy1))
+        # 袖口朝外: 左袖袖口在裁片左缘 → 90° CCW 袖口朝下; 右袖镜像 → 90° CW。
+        rot = crop.transpose(Image.Transpose.ROTATE_90) if side == "L" else crop.transpose(Image.Transpose.ROTATE_270)
+        return rot
+
+    from PIL import ImageFilter
+
+    for side, px in (("L", px_l), ("R", px_r)):
+        sl = _sleeve_crop(side)
+        if sl is None:
+            continue
+        sl = sl.resize((arm_w, arm_len), Image.Resampling.LANCZOS)
+        # 去白底: alpha 太低的像素(背景/抠图残边)置 0, 避免贴进白晕。
+        arr = np.array(sl)  # copy: np.asarray 返回只读视图, 无法写回
+        al = arr[:, :, 3].astype(np.uint8)
+        al[al < 60] = 0
+        arr[:, :, 3] = al
+        sl = Image.fromarray(arr, "RGBA")
+        # 羽化: 只模糊 alpha 通道(不动 RGB), 消掉硬矩形边缘。
+        sl.putalpha(sl.getchannel("A").filter(ImageFilter.GaussianBlur(2)))
+        out.paste(sl, (px, shoulder_y), sl)
+    return out
+
+
 def _composite_engine(
     base_path: Path,
     garment_path: Path,
@@ -594,9 +697,30 @@ def _idm_vton_engine(
     result = output.images[0] if hasattr(output, "images") else output
 
     if background == "white":
-        bg = PILImage.new("RGB", result.size, (255, 255, 255))
-        bg.paste(result, mask=result.split()[-1] if result.mode == "RGBA" else None)
-        result = bg
+        # 电商主图硬性要求:背景必须纯白 RGB(255,255,255),边缘连通近白区压白。
+        from platform_presets import force_white_background, foreground_mask
+
+        if result.mode == "RGBA":
+            bg = PILImage.new("RGB", result.size, (255, 255, 255))
+            bg.paste(result, mask=result.split()[-1])
+            result = bg
+        else:
+            result = result.convert("RGB")
+        # pipeline audit 行36 + 远端复核#3: legacy IDM-VTON 路径原来直接 force_white_background(result)
+        # 不传 subject_mask → 胸口白块 union 修复被绕过(生产默认走 SDXL, legacy 仍可被选)。
+        # 保护掩膜 = 基模主体 并 生成图主体(注释承诺的并集, 此前漏了基模一侧):
+        # 基模主体保住"原本是人体的区域", 生成图主体保住"生成后仍是衣物的区域",
+        # 两者并集外(纯背景)才压白。任一侧取不到掩膜则用另一侧; 都取不到 = 原行为。
+        _legacy_subj = None
+        _base_subj = foreground_mask(human_img)
+        _res_subj = foreground_mask(result)
+        if _base_subj is not None and _res_subj is not None:
+            _legacy_subj = _base_subj | _res_subj
+        elif _base_subj is not None:
+            _legacy_subj = _base_subj
+        elif _res_subj is not None:
+            _legacy_subj = _res_subj
+        result = force_white_background(result, subject_mask=_legacy_subj)
 
     rw, rh = result.size
     scale = long_side / max(rw, rh)
@@ -750,6 +874,8 @@ def guess_garment_type(filename: str) -> str:
     name = filename.lower()
     if any(k in name for k in ("dress", "gown", "skirt")):
         return "dress"
+    if any(k in name for k in ("tunic", "longline")):
+        return "tunic"
     if any(k in name for k in ("pant", "trouser", "short", "jean")):
         return "lower"
     if any(k in name for k in ("onesie", "romper", "body")):

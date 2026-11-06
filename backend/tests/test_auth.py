@@ -1,11 +1,14 @@
 import importlib
 import time
 
-import auth
-import jwt
 import pytest
-from auth import JWT_ALG, JWT_SECRET, decode_token, issue_token
-from fastapi import HTTPException
+
+# DSW/无 GPU 环境可能没装 PyJWT(认证只在 web 服务上用) — 缺依赖时干净跳过, 不炸收集
+jwt = pytest.importorskip("jwt", reason="PyJWT not installed (web auth optional on CPU-only env)")
+
+import auth  # noqa: E402
+from auth import JWT_ALG, JWT_SECRET, decode_token, issue_token  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 
 
 def test_issue_and_decode_roundtrip():

@@ -105,7 +105,9 @@ def test_crop_real_flatlay_guarded():
     ]:
         candidates += glob.glob(base + "/**/*.jpg", recursive=True)
     candidates += glob.glob(base + "/*.png")
-    candidates = [c for c in candidates if c and Path(c).stat().st_size > 0]
+    candidates = [
+        c for c in candidates if c and Path(c).is_file() and Path(c).stat().st_size > 0
+    ]
     if not candidates:
         return  # 无素材,跳过
     for c in candidates:

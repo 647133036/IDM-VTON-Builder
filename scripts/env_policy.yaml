@@ -1,0 +1,74 @@
+# env_policy.yaml — vton 依赖护栏单一事实源 (banned + whitelist 合成一份可执行规格)
+# 消费方: scripts/gpu_dep_install_guard.sh (环境重建/装机校验) + RUNBOOK 开机第 2 步。
+#
+# 设计: "什么不能装 (banned)" 与 "装了哪些 (whitelist)" 合成本文件, 让 guard 一次同时
+# 验证 "禁用的没装" 和 "预期的装了"。本文件是约定, 不是靠记忆 —— 下次重建环境直接 diff 它。
+#
+# 证据来源: archive_20261104_combo_women01/box_probe_evidence.md (盒子实测 + 源码 grep 定案)。
+
+provenance:
+  generated: "2026-11-05"
+  python: "3.10.12 (miniconda, /root/miniconda3)"
+  pip: "23.2.1"
+  # 装机校验基线 freeze 的 sha256 (real_freeze_20261105_gpu.txt, 作废 10-30 旧 freeze 判读)
+  freeze_baseline_sha256: "d7665d08b18eeecd791376983b9590c605042bd17e826a5f56adaee7434f38f9"
+  freeze_baseline_file: "archive_20261104_combo_women01/real_freeze_20261105_gpu.txt"
+
+# ── 禁装项 (可执行检查, 不只是文档约定) ─────────────────────────────
+banned:
+  mmdet:
+    # guard 里做可执行断言: 两条都过才算合规
+    checks:
+      - "pip show mmdet 必须为空 (包层不存在)"
+      - "python -c 'import mmdet' 必须失败 (或进程内是 fake-deps 注入的 stub, 非磁盘真包)"
+    on_violation: "FAIL: 真 mmdet 已装 → 绕过 fake-deps stub + 自身 import mmcv.ops 双杀 mmpose。回滚: pip uninstall mmdet -y"
+    rationale: >
+      双杀机制: (1) mmpose 的 `from mmdet.utils import ...` 会命中真 mmdet 包、绕过 fake-deps stub;
+      (2) 真 mmdet 自身 `import mmcv.ops`, 而本环境 mmcv 是 lite 版(无 ops C 扩展) → 二次崩溃。
+      将来要跑 mmdet 检测任务 → 独立 conda env (mmcv<2.2.0 完整版 + mmdet), 禁止混装进本环境。
+      管线内没有任何检测任务需要真 mmdet (pose=RTMPose 灰度阈值 bbox, 检测=rembg/onnx, 回退=mediapipe)。
+    ref: "box_probe_evidence.md §1/§4"
+
+# ── 预期新增白名单 (装后 freeze diff 唯一允许的新增; 现有包任何变动 → FAIL+回滚) ──────────
+whitelist:
+  # 基线实测 (2026-11-05 无卡盒): CHANGED={} REMOVED=[], 新增恰为下面 5 个
+  packages:
+    - mmpose
+    - mmcv-lite
+    - mmengine-lite
+    - json_tricks
+    - xtcocotools
+  versions:
+    mmpose: "1.3.2"
+    mmcv-lite: "2.2.0"
+    mmengine-lite: "0.10.7"
+  diff_rules:
+    changed_existing: "必须为空 (既有包升/降/补版本 = FAIL + 打印回滚指令)"
+    removed: "必须为空"
+    added_not_in_packages: "FAIL + 报警 (超出白名单的新增)"
+  # lite 版是刻意选择: 不含 mmcv.ops C 扩展, 正是 fake-deps 需 stub mmcv.ops 的原因;
+  # mmpose import 时版本断言 (2.0.0rc4 <= mmcv.__version__ <= 3.0.0) 由 lite 满足。
+  # 禁止把 lite 换成完整版 mmcv "补全功能": 完整版引入 mmcv.ops 真实实现与 fake-deps 冲突,
+  # 且完整版依赖链会撞上 banned.mmdet 双杀链。要 ops 能力只能用 fake-deps 恒等 stub。
+  lite_rationale: "deliberate; do not substitute full mmcv"
+
+# ── 可选 (缺 = WARN 级, 不阻塞装机, 当前配方无场景用到) ─────────────────
+optional:
+  mediapipe:
+    status: "故意不装; guard 里缺失打印 'OPT_SKIP mediapipe (allowed, 非阻塞)', 不计 FAIL"
+    effective_fallback: "本环境实际 pose 链 = RTMPose → contour/default; mediapipe 只是名义备选"
+    rationale: >
+      主流程不依赖 mediapipe: pose 主路径是 RTMPose (rtmpose-m_coco.pth 在场则回退路径不可达;
+      RTMPose 失败也不混用 mediapipe, 直接 None → 腰线走 contour 法)。_detect_pose_mediapipe 全惰性
+      import + try/except, 缺失时 warning + 静默降级, 非致命。repo 代码已迁移 Tasks API
+      (mediapipe.tasks.python.vision.PoseLandmarker, 非旧 mp.solutions); .task 模型文件已预置
+      (repo/models/mediapipe/pose_landmarker_full.task, 9398198B)。
+    future_activation: "pip install mediapipe (>=0.10 tasks 版, wheel 需与 numpy 1.26.4 兼容) + .task 已就位"
+
+# ── guard 冒烟段必带 (盒子 cgroup 事实, 见 TASK 事实 6/7) ─────────────────
+runtime_env:
+  omp_thread_cap: 8   # OMP/MKL/TORCH_NUM_THREADS=8; 无卡 0.5 核配额下不限线程会 CFS thrashing
+  with_gpu_preflight:
+    - "cat /sys/fs/cgroup/memory.max (>= 8GiB 才 SDXL 出图, 否则 WARN)"
+    - "nvidia-smi 确认 4090 在位 + torch.cuda.is_available()"
+    - "有卡开机先跑 preflight 等价段, 全 OK 才 run_b1"

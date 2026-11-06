@@ -31,7 +31,6 @@ def _job_file(tmp_path):
 
 @pytest.fixture()
 def done_job(tmp_path, monkeypatch):
-
     png = tmp_path / "job_done.png"
     from PIL import Image
 
