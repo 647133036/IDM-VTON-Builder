@@ -31,6 +31,7 @@ from platform_presets import (
     detect_garment_extent,
     encode_jpeg_within,
     force_white_background,
+    limit_mask_to_subject,
     reapply_garment_detail,
     save_platform_result,
 )
@@ -681,6 +682,69 @@ def test_detect_garment_extent_tunic_mid_hem_by_torso_ratio():
     ext = detect_garment_extent(img)
     assert ext["hem"] == "mid"
     assert ext["sleeve"] == "short"
+
+
+def test_detect_garment_extent_center_tie_does_not_inflate_hem():
+    """挂在 bbox 中心的窄绑带不撑高衣长:真实案例 04469(短袖丝绒裹身衣,
+    缠绕布料+垂带垂到 bbox 底且横跨中心线, 中心段逐行存在)。
+
+    旧逻辑用整 bbox 高算 cratio: 绑带把 ch 撑大 → 假中长款 → auto 推断
+    tunic → 过髋幽灵长衫。衣身本体行数(中心段宽 >=45% 躯干宽)不受绑带影响。
+    """
+    img = _transparent_with_shapes(
+        (200, 300),
+        [
+            ("rect", (60, 20, 140, 130)),  # 衣身(80 宽, 齐腰短款)
+            ("rect", (95, 130, 105, 290)),  # 中心绑带(11px, 垂到 bbox 底)
+        ],
+    )
+    ext = detect_garment_extent(img)
+    # 旧 cratio = 270/80 = 3.4 → long; 新: 衣身本体 111 行 → 1.39 → waist
+    assert ext["hem"] == "waist"
+    # 中心绑带不是袖(无段外内容), 也不是加宽行 → sleeveless
+    assert ext["sleeve"] == "sleeveless"
+    assert ext["central_ratio"] < 1.55
+    assert ext["body_ratio"] < 0.5
+
+
+def test_detect_garment_extent_body_ratio_present_for_real_tunic():
+    """真中长款(衣身宽到底)body_ratio=1.0 —— auto 推断的 tunic 门槛数据。"""
+    img = _transparent_with_shapes((200, 300), [("rect", (60, 20, 140, 280))])
+    ext = detect_garment_extent(img)
+    assert ext["body_ratio"] == 1.0
+    assert ext["hem"] in ("mid", "long")
+
+
+def test_limit_mask_to_subject_cuts_gen_background_regions():
+    """几何 mask ∩ 生成图主体: 生成器没画出的走廊区域(生成图白背景)被剔掉,
+    不再被 blend/reapply 半透明盖到原图(09290 髋部粉块 + 黑矩形根因)。"""
+    mask = Image.new("L", (100, 100), 255)
+    arr = np.zeros((100, 100), dtype="uint8")
+    arr[:, :50] = 255  # 生成图主体: 左半边画出了内容, 右半边是白背景
+    out = np.asarray(limit_mask_to_subject(mask, Image.fromarray(arr)))
+    assert (out[:, :50] == 255).all()
+    assert (out[:, 53:] == 0).all()  # dilate 3px 后主体外全归零
+
+
+def test_limit_mask_to_subject_fails_open():
+    """u2net 缺结果/尺寸不齐/交集为空 → 原样返回几何 mask(fail-open)。"""
+    mask = Image.new("L", (10, 10), 255)
+    assert limit_mask_to_subject(None, mask) is None
+    assert limit_mask_to_subject(mask, None) is mask
+    out = limit_mask_to_subject(mask, Image.new("L", (5, 5), 255))
+    assert np.asarray(out).shape == (10, 10)
+    # 生成图主体为空(u2net 失灵) → 交集空 → 回退几何 mask
+    out = limit_mask_to_subject(mask, Image.new("L", (10, 10), 0))
+    assert float(np.asarray(out).mean()) == 255.0
+
+
+def test_limit_mask_to_subject_keeps_feather_inside_subject():
+    """羽化带(0-255 渐变)在主体内原样保留, 只在主体外归零 —— 不切出硬边。"""
+    arr = np.zeros((10, 10), dtype="uint8")
+    arr[2:8, 2:8] = 128
+    out = np.asarray(limit_mask_to_subject(Image.fromarray(arr), Image.new("L", (10, 10), 255)))
+    assert out[4, 4] == 128
+    assert out[0, 0] == 0
 
 
 # --- clothing_mask with garment_extent --------------------------------------

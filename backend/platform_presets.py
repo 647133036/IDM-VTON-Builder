@@ -711,10 +711,20 @@ def detect_garment_extent(garment: Image.Image) -> dict:
     if torso_w < 1:
         torso_w = float(cw)
 
+    # 衣身高用"衣身本体"行数: 中心段宽 >= 45% 躯干宽的最后一行 + 1。
+    # 整 bbox 高会被垂到底的细长内容撑大 —— 裹身衣垂带/长腰带挂在 bbox
+    # 中心附近时, 逐行中心段一直存在(04469 实测: 绑带把 ch 撑到躯干宽的
+    # 2.1 倍 → 中长款误判); 宽袖/裙摆不受影响(那些段本身够宽)。
+    # 一行都不达阈值时按整 bbox 高兜底(高瘦直筒整行一段, 等价旧行为)。
+    _body_wide = central_w >= torso_w * 0.45
+    body_rows = int(np.where(_body_wide)[0][-1]) + 1 if _body_wide.any() else n_rows
+    body_ratio = body_rows / float(n_rows)
+
     # 衣身高 / 躯干宽:宽袖不再把整体 aspect 拉扁。
     # 短款 ≈1.0-1.4, 中长款(髋/大腿)≈1.6-2.6, 裙级≈3.0+。
-    cratio = ch / max(torso_w, 1.0)
-    if cratio > 3.0 or aspect > 2.0:
+    # long 旁路同改 body_rows(垂带把 aspect 撑过 2 的假"长款"不再触发)。
+    cratio = body_rows / max(torso_w, 1.0)
+    if cratio > 3.0 or body_rows > 2.0 * max(cw, 1):
         hem = "long"
     elif cratio >= 1.55:
         hem = "mid"
@@ -747,6 +757,9 @@ def detect_garment_extent(garment: Image.Image) -> dict:
         "central_ratio": round(cratio, 2),
         "sleeve_drop": round(drop_px / max(n_rows - 1, 1), 2),
         "sleeve_ratio": round(sleeve_ratio, 2),
+        # 衣身本体行占 bbox 高比例: auto 类型推断用它区分"真中长款"(衣身
+        # 宽到底)和"垂带撑高的短款"(04469: 0.84)。
+        "body_ratio": round(body_ratio, 2),
     }
 
 
@@ -1466,10 +1479,9 @@ def _debug_dump_mask_stage(mask_u8: np.ndarray, img: Image.Image, label: str) ->
             )
         overlay = vis.copy()
         mz = m > 127
-        overlay[mz] = (
-            overlay[mz].astype(np.float32) * 0.55
-            + np.array([0, 190, 0], dtype=np.float32) * 0.45
-        ).astype(np.uint8)
+        overlay[mz] = (overlay[mz].astype(np.float32) * 0.55 + np.array([0, 190, 0], dtype=np.float32) * 0.45).astype(
+            np.uint8
+        )
         tag = os.environ.get("VTON_DEBUG_TAG", "img")
         ddir = _P(os.environ.get("VTON_DEBUG_DIR", "."))
         ddir.mkdir(parents=True, exist_ok=True)
@@ -1714,6 +1726,46 @@ def clothing_mask(
     return out_mask
 
 
+def limit_mask_to_subject(
+    mask: Image.Image | None,
+    subject: Image.Image | None,
+    dilate_px: int = 3,
+) -> Image.Image | None:
+    """几何 mask 与生成图主体求交, 只保留"生成器真画出来的内容"区域。
+
+    clothing_mask 是几何外推(长袖走廊 85% 兜底/下摆截线), 生成器实际没画满
+    的地方残留生成图白背景 —— blend 直接用几何 mask 会把白背景(被 Reinhard
+    染成衣色)半透明盖到原图上(09290 髋部粉块 + 黑矩形根因)。与生成图
+    u2net 主体求交后, 走廊内没画出的区域保持原图像素。
+
+    - dilate_px: u2net 边界偏保守, 主体外扩几像素, 避免新衣边缘被切硬边。
+    - subject 为 None/尺寸不齐/交集为空 → 原样返回 mask(fail-open:
+      u2net 挂掉时退回旧行为, 不让整条后处理链断掉)。
+    - mask 的羽化带(0-255 渐变)在主体内原样保留, 只在主体外归零。
+    """
+    if mask is None:
+        return None
+    if subject is None:
+        return mask
+    m = np.asarray(mask.convert("L"))
+    s = np.asarray(subject.convert("L"))
+    if s.shape[:2] != m.shape[:2]:
+        return mask
+    s_bin = s > 0
+    if dilate_px > 0:
+        try:
+            import cv2
+
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_px * 2 + 1, dilate_px * 2 + 1))
+            s_bin = cv2.dilate(s_bin.astype("uint8"), k, iterations=1) > 0
+        except Exception:  # noqa: BLE001
+            pass
+    out = np.where(s_bin, m, 0)
+    if not (out > 0).any():
+        return mask
+    return Image.fromarray(out.astype("uint8"))
+
+
 def blend_tryon(
     original: Image.Image,
     generated: Image.Image,
@@ -1947,9 +1999,7 @@ def _pattern_lock_overlay(
     if ref_alpha is not None:
         _a = np.asarray(ref_alpha.convert("L"))
         if _a.shape[:2] != ref.shape[:2]:
-            _a = np.array(
-                Image.fromarray(_a).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
-            )
+            _a = np.array(Image.fromarray(_a).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR))
         content = content * (_a.astype(np.float32) / 255.0)[..., None]
 
     mask_norm = (mask_f32 / 255.0)[..., None]

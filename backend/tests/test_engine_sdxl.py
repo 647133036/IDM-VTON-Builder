@@ -365,3 +365,55 @@ def test_align_garment_to_pose_lower_narrower_than_upper():
     upper_width = upper_cols[-1] - upper_cols[0]
     lower_width = lower_cols[-1] - lower_cols[0]
     assert lower_width < upper_width
+
+
+# --- auto 品类推断 + 袖型反向约束 ------------------------------------------------
+
+
+def test_infer_auto_garment_type_body_ratio_gates_tunic_and_dress():
+    """body_ratio 门槛挡"垂带撑高的短款": 裹身衣垂带把 bbox 撑高, hem/aspect
+    像中长款, 但衣身本体只到 ~0.8(04469 实测 0.84) —— 按 tunic 出图会画成
+    过髋幽灵长衫, 必须挡回 upper。真中长款(衣身宽到底)不受影响。"""
+    import engine_sdxl
+
+    infer = engine_sdxl.infer_auto_garment_type
+    # 04469 实测几何: hem=mid 但 body_ratio 0.84 → upper
+    assert infer({"aspect": 1.36, "hem": "mid", "body_ratio": 0.84}) == "upper"
+    # 真中长款: 衣身宽到底 → tunic
+    assert infer({"aspect": 1.2, "hem": "mid", "body_ratio": 1.0}) == "tunic"
+    # hem=long + 衣身宽到底 → tunic
+    assert infer({"aspect": 1.1, "hem": "long", "body_ratio": 0.95}) == "tunic"
+    # 垂带撑高的"假连衣裙": 高瘦 + 衣身本体短 → upper, 不按 dress 出图
+    assert infer({"aspect": 1.8, "hem": "mid", "body_ratio": 0.6}) == "upper"
+    # 真连衣裙: 高瘦 + 衣身长 → dress
+    assert infer({"aspect": 1.8, "hem": "long", "body_ratio": 1.0}) == "dress"
+    # 矮宽 → lower
+    assert infer({"aspect": 0.5, "hem": "waist", "body_ratio": 1.0}) == "lower"
+    # 无 extent → upper
+    assert infer(None) == "upper"
+
+
+def test_infer_auto_garment_type_missing_body_ratio_keeps_legacy_behavior():
+    """extent 缺 body_ratio 键(旧调用方/手工构造 dict)→ 默认 1.0, 门槛
+    等价旧逻辑: 高瘦→dress、hem 过腰→tunic 不回退。"""
+    import engine_sdxl
+
+    infer = engine_sdxl.infer_auto_garment_type
+    assert infer({"aspect": 1.8}) == "dress"
+    assert infer({"hem": "mid"}) == "tunic"
+    assert infer({}) == "upper"
+
+
+def test_sleeve_negative_prompts_pin_opposite_sleeve_terms():
+    """袖型反向约束表: 每个袖型类都有对立袖型压制词(04469 短袖被画无袖、
+    09290 长袖被画肘部截断的实测修复), 词表被意外清空/改名时报警。"""
+    import engine_sdxl
+
+    table = engine_sdxl.SLEEVE_NEGATIVE_PROMPTS
+    assert set(table) == {"long", "short", "sleeveless"}
+    # 长袖: 必须压"露小臂/短袖/无袖"
+    assert "bare forearms" in table["long"] and "short sleeves" in table["long"]
+    # 短袖: 必须压"长袖/无袖"
+    assert "long sleeves" in table["short"] and "sleeveless" in table["short"]
+    # 无袖: 必须压"长袖/短袖"
+    assert "long sleeves" in table["sleeveless"] and "short sleeves" in table["sleeveless"]

@@ -18,6 +18,7 @@ from platform_presets import (
     detect_garment_extent,
     force_white_background,
     foreground_mask,
+    limit_mask_to_subject,
     reapply_garment_detail,
 )
 from prewhiten import prewhiten_input
@@ -85,6 +86,41 @@ GARMENT_PROMPT_SUFFIX = {
     "lower": "pants, trousers, shorts, jeans",
     "onesie": "onesie, romper, baby body",
 }
+
+# 袖型反向约束: SDXL 对正向袖型描述跟随弱(09290 长袖平铺被画成肘部
+# 截断), negative 按检测袖型压掉对立袖型, 比正向描述收敛快。
+SLEEVE_NEGATIVE_PROMPTS = {
+    "long": "bare forearms, short sleeves, three-quarter sleeves, sleeveless",
+    "short": "long sleeves, sleeveless top, bare shoulders",
+    "sleeveless": "long sleeves, short sleeves, sleeve fabric",
+}
+
+
+def infer_auto_garment_type(extent: dict | None) -> str:
+    """auto 品类推断: 平铺衣料几何 → 覆盖范围。
+
+    - aspect<0.7(矮宽) → lower(裤子平铺宽矮);
+    - aspect>1.6(高瘦)且衣身本体够长 → dress(一体式覆盖躯干+腿);
+    - hem 过腰(mid/long)且衣身本体宽到底 → tunic(中长款, 下摆→髋/大腿。
+      旧逻辑全判 upper → 下摆被 warp 框钉在腰部, "齐腰截断"根因之一);
+    - 其他 → upper。
+
+    body_ratio 门槛挡"垂带撑高的短款": 裹身衣垂带/长腰带挂在 bbox 中心
+    附近时把 bbox 撑高, hem/aspect 看着像中长款, 但衣身本体只到 ~0.8
+    (04469 实测 0.84) —— 按 tunic 出图会画成过髋幽灵长衫, 挡回 upper。
+    extent 缺 body_ratio 键(旧调用方/手工构造)时默认 1.0, 门槛等价旧行为。
+    """
+    aspect = (extent or {}).get("aspect", 1.0)
+    hem = (extent or {}).get("hem", "waist")
+    body_ratio = (extent or {}).get("body_ratio", 1.0)
+    if aspect < 0.7:
+        return "lower"
+    if aspect > 1.6 and body_ratio >= 0.75:
+        return "dress"
+    if hem in ("mid", "long") and body_ratio >= 0.9:
+        return "tunic"
+    return "upper"
+
 
 # 穿着贴合层:让衣服"穿在身上"而非"贴在身上"——面料随身材垂坠、起褶皱。
 FIT_PROMPTS = {
@@ -834,21 +870,16 @@ def compose_tryon_sdxl(
     # auto 类型推断:从平铺衣料宽高比判断覆盖范围。
     # aspect>1.6(高瘦)→dress(一体式覆盖躯干+腿);
     # aspect<0.7(矮宽)→lower(裤子平铺宽矮);
-    # 其他→upper。
+    # 其他→upper;hem 过腰且衣身宽到底→tunic(见 infer_auto_garment_type)。
     if garment_type == "auto":
-        aspect = garment_extent.get("aspect", 1.0) if garment_extent else 1.0
-        hem = garment_extent.get("hem", "waist") if garment_extent else "waist"
-        if aspect < 0.7:
-            garment_type = "lower"
-        elif aspect > 1.6:
-            garment_type = "dress"
-        elif hem in ("mid", "long"):
-            # 衣长过腰(髋/大腿)但没到连衣裙级: 中长款, 走 tunic(下摆→髋/大腿)。
-            # 旧逻辑全判 upper → 下摆被 warp 框钉在腰部("齐腰截断"根因之一)。
-            garment_type = "tunic"
-        else:
-            garment_type = "upper"
-        logger.info("auto garment_type -> %s (aspect=%s hem=%s)", garment_type, aspect, hem)
+        garment_type = infer_auto_garment_type(garment_extent)
+        logger.info(
+            "auto garment_type -> %s (aspect=%s hem=%s body_ratio=%s)",
+            garment_type,
+            (garment_extent or {}).get("aspect"),
+            (garment_extent or {}).get("hem"),
+            (garment_extent or {}).get("body_ratio"),
+        )
     # 品类 vs hem 检测互校验: 不一致大声 warning(防止"各跑各的"——品类定画布/
     # prompt, hem 定 mask 截线, 两者打架时出图必错位)。
     _hem_x = garment_extent.get("hem", "waist") if garment_extent else "waist"
@@ -930,6 +961,11 @@ def compose_tryon_sdxl(
     negative_prompt = (
         f"{AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE['women'])}, {FIT_NEGATIVE}, {COMMON_NEGATIVE}"
     )
+    # 袖型反向约束: 检测到袖型时压掉对立袖型(04469 短袖被画成无袖、
+    # 09290 长袖被画成肘部截断的实测根因之一 —— 正向袖型词跟随弱)。
+    _neg_sleeve = SLEEVE_NEGATIVE_PROMPTS.get(_sleeve_prompt or "")
+    if _neg_sleeve:
+        negative_prompt = f"{negative_prompt}, {_neg_sleeve}"
 
     pipe, ip_adapter_loaded, ip_adapter_reason = _get_sdxl_pipe(device, dtype)
 
@@ -1061,6 +1097,20 @@ def compose_tryon_sdxl(
         logger.warning("DEGRADED: %s", _mask_reason)
         degraded_reasons.append(_mask_reason)
 
+    # 应用 mask = 几何 mask ∩ 生成图主体: clothing_mask 是几何外推(长袖
+    # 走廊 85% 兜底/下摆截线), 生成器没画满的走廊里是生成图白背景;
+    # 不求交就会把白底(被 Reinhard 染成衣色)半透明盖到原图上 ——
+    # 09290 髋部粉块 + 黑矩形根因。reapply/blend/seam/inpaint 都用应用
+    # mask; _correct_skin_tone 仍用几何 mask(超集排除, 走廊里保留下来的
+    # 原图皮肤/裤子像素本就是原图色, 不需要肤色兜底去动它们)。
+    # 此处 result 还是裸 SDXL 帧(未染色), u2net 判主体最可靠。
+    apply_mask = limit_mask_to_subject(shared_mask, foreground_mask(result)) if shared_mask is not None else None
+    if shared_mask is not None and apply_mask is not None:
+        import numpy as _npa
+
+        _cov = float(_npa.asarray(apply_mask).mean()) / max(float(_npa.asarray(shared_mask).mean()), 1.0)
+        logger.info("apply_mask(gen-subject intersect): %.0f%% of shared_mask", _cov * 100)
+
     # mask 可视化(VTON_DEBUG_MASK=1, 输出到 VTON_DEBUG_DIR, 默认 .): clothing_mask
     # 叠加基模(绿=mask 区, 红=主体非 mask 区) + warp 参考图 + extent 中央条带边界 +
     # 肤色校正排除区红线(bbox 顶 12% = 下巴)。哪块被 mask 圈进/挖出, 直接看图;
@@ -1098,6 +1148,24 @@ def compose_tryon_sdxl(
                 _cvd.cvtColor(_ov, _cvd.COLOR_RGB2BGR),
                 [int(_cvd.IMWRITE_JPEG_QUALITY), 90],
             )
+            # 应用 mask(几何∩生成主体)叠加图: 红 = 几何 mask 有、但生成图
+            # 没画出内容的区域(走廊白底, 被交集剔除, 不再贴到原图)。
+            if apply_mask is not None:
+                _am = _npd.asarray(apply_mask, dtype=_npd.float32)
+                if _am.shape[:2] != _vis.shape[:2]:
+                    _am = _cvd.resize(_am, (_vis.shape[1], _vis.shape[0]), interpolation=_cvd.INTER_LINEAR)
+                _az = _am > 127
+                _ov2 = _vis.copy()
+                _g2 = _ov2[_az].astype(_npd.float32) * 0.55 + _npd.array([0, 190, 0], _npd.float32) * 0.45
+                _ov2[_az] = _g2.astype("uint8")
+                _dz = _mz & ~_az
+                _r2 = _ov2[_dz].astype(_npd.float32) * 0.55 + _npd.array([220, 0, 0], _npd.float32) * 0.45
+                _ov2[_dz] = _r2.astype("uint8")
+                _cvd.imwrite(
+                    str(_ddir / f"applymaskdebug_{_tag}.jpg"),
+                    _cvd.cvtColor(_ov2, _cvd.COLOR_RGB2BGR),
+                    [int(_cvd.IMWRITE_JPEG_QUALITY), 90],
+                )
             _cvd.imwrite(
                 str(_ddir / f"refdebug_{_tag}.jpg"),
                 _cvd.cvtColor(_npd.array(cloth_ref.convert("RGB")), _cvd.COLOR_RGB2BGR),
@@ -1114,7 +1182,7 @@ def compose_tryon_sdxl(
                     [int(_cvd.IMWRITE_JPEG_QUALITY), 90],
                 )
             logger.info(
-                "VTON_DEBUG_MASK dump -> %s (maskdebug/refdebug/extentdebug_%s + maskstage_* 阶段图)",
+                "VTON_DEBUG_MASK dump -> %s (maskdebug/applymaskdebug/refdebug/extentdebug_%s + maskstage_* 阶段图)",
                 _ddir,
                 _tag,
             )
@@ -1139,7 +1207,7 @@ def compose_tryon_sdxl(
             result = reapply_garment_detail(
                 result,
                 cloth_ref,
-                shared_mask,
+                apply_mask,
                 pattern_lock=pattern_lock,
                 ref_alpha=cloth_ref_alpha,
             )
@@ -1155,14 +1223,14 @@ def compose_tryon_sdxl(
     # mask 内保留 reapply 修正后的衣服(不被覆盖)。VTON_LOCK_ID=1(默认)开启。
     lock_identity = False
     if os.environ.get("VTON_LOCK_ID", "1") != "0" and shared_mask is not None:
-        result = blend_tryon(human_img, result, shared_mask)
+        result = blend_tryon(human_img, result, apply_mask)
         lock_identity = True
 
     # 接缝修复:blend_tryon 后 mask 边界处原图与生成像素的接缝可能有色阶
     # 断层(胸口白块/领口硬边)。用 cv2.inpaint Telea 以周边像素平滑过渡。
     if lock_identity:
         try:
-            result = _seam_repair(result, shared_mask)
+            result = _seam_repair(result, apply_mask)
         except Exception:  # noqa: BLE001
             # pipeline audit 行21: 接缝修复正是 C 配方依赖的修缺陷, 静默 debug 会让
             # "模型变差"掩盖"后处理没跑"。升 warning + 记降级。
@@ -1185,7 +1253,7 @@ def compose_tryon_sdxl(
     # 未安装时原样返回(CPU 层已处理大部分问题)。
     if lock_identity:
         try:
-            result = _sdxl_inpaint_repair(result, shared_mask, original=human_img)
+            result = _sdxl_inpaint_repair(result, apply_mask, original=human_img)
         except Exception:  # noqa: BLE001
             logger.warning("_sdxl_inpaint_repair failed; using pre-inpaint result (DEGRADED)")
             degraded_reasons.append("SDXL inpaint repair failed")
