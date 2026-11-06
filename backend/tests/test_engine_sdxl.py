@@ -450,3 +450,71 @@ def test_negative_assembly_fits_clip_budget_with_sleeve_first():
             assert text.startswith(sv.split(",")[0].strip() + ","), f"{aud}/{sl}: sleeve terms not first"
             assert len(phrases) == len({p.lower() for p in phrases}), f"{aud}/{sl}: dup phrases"
             assert all(phrases), f"{aud}/{sl}: empty phrase"
+
+
+# ---- intersect_mask_with_garment_alpha: 贴回 mask ∩ warp 衣料形 ----
+def _intersect_fixture():
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    # 应用 mask(中央大块) + 衣料形(其内 RGBA 方块), 贴近生产覆盖率
+    mask = np.zeros((512, 512), dtype=np.uint8)
+    mask[50:462, 150:362] = 255
+    alpha = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    d = ImageDraw.Draw(alpha)
+    d.rectangle((200, 100, 311, 400), fill=(255, 128, 128, 255))
+    return mask, alpha
+
+
+def test_intersect_mask_trims_outside_garment_shape():
+    import engine_sdxl as eng
+    import numpy as np
+
+    mask, alpha = _intersect_fixture()
+    out, kept = eng.intersect_mask_with_garment_alpha(mask, alpha)
+    assert kept is not None and kept > 0.3
+    arr = np.asarray(out)
+    assert arr[50, 50] == 0, "形外区域应被剔除(裤子/肚皮不贴回)"
+    assert arr[250, 250] == 255, "形内应保留"
+    # 膨胀余量: 形边外 ~15px 仍有值(袖列横移容差), 远处为 0
+    assert arr[250, 190] > 0, "形边缘膨胀带被整段砍掉"
+    assert arr[250, 120] == 0, "远离衣料形的 mask 区应被剔除"
+
+
+def test_intersect_mask_skips_on_low_coverage():
+    import engine_sdxl as eng
+    import numpy as np
+    from PIL import Image, ImageDraw
+
+    mask = np.full((512, 512), 255, dtype=np.uint8)
+    alpha = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+    ImageDraw.Draw(alpha).rectangle((240, 240, 260, 260), fill=(255, 0, 0, 255))
+    out, kept = eng.intersect_mask_with_garment_alpha(mask, alpha)
+    assert kept is None, "覆盖率过低(形与 mask 错位)应跳过"
+    assert np.asarray(out).mean() == 255, "跳过时原样返回"
+
+
+def test_intersect_mask_env_switch_and_none_passthrough(monkeypatch):
+    import engine_sdxl as eng
+
+    mask, alpha = _intersect_fixture()
+    monkeypatch.setenv("VTON_MASK_ALPHA_INTERSECT", "0")
+    out, kept = eng.intersect_mask_with_garment_alpha(mask, alpha)
+    assert kept is None and out is mask
+    monkeypatch.setenv("VTON_MASK_ALPHA_INTERSECT", "1")
+    out, kept = eng.intersect_mask_with_garment_alpha(mask, None)
+    assert kept is None and out is mask
+    out, kept = eng.intersect_mask_with_garment_alpha(None, alpha)
+    assert kept is None and out is None
+
+
+def test_intersect_mask_preserves_input_type():
+    import engine_sdxl as eng
+    from PIL import Image
+
+    mask, alpha = _intersect_fixture()
+    pil_mask = Image.fromarray(mask)
+    out_pil, kept = eng.intersect_mask_with_garment_alpha(pil_mask, alpha)
+    assert kept is not None and isinstance(out_pil, Image.Image)
+    out_arr, kept2 = eng.intersect_mask_with_garment_alpha(mask, alpha)
+    assert kept2 is not None and not isinstance(out_arr, Image.Image)

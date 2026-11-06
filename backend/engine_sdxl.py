@@ -6,6 +6,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PIL import Image
 from platform_presets import (
@@ -22,6 +23,9 @@ from platform_presets import (
     reapply_garment_detail,
 )
 from prewhiten import prewhiten_input
+
+if TYPE_CHECKING:
+    import numpy as np
 
 logger = logging.getLogger("atelier.engine_sdxl")
 
@@ -144,6 +148,59 @@ def infer_auto_garment_type(extent: dict | None) -> str:
     if hem in ("mid", "long") and body_ratio >= 0.9:
         return "tunic"
     return "upper"
+
+
+def intersect_mask_with_garment_alpha(
+    apply_mask: Image.Image | np.ndarray | None,
+    ref_alpha: Image.Image | None,
+    min_keep: float = 0.4,
+) -> tuple[Image.Image | np.ndarray | None, float | None]:
+    """贴回 mask ∩ warp 衣料形(膨胀余量): 形外生成内容不贴回原图。
+
+    几何 mask 是超集: 长袖手臂走廊兜底到身高 85%、hem 截线放宽到腰下
+    0.28 span —— SDXL 会在超集里重画裤子/肚皮/髋部并被 blend 贴回原图
+    (裤子变色/漏肚脐)。warp 参考图的衣料 alpha(衣身+袖条)是"衣服该在
+    哪"的形状; 膨胀余量后与 apply_mask 求交, 形外的走廊尾巴/hem 尾巴
+    不再贴回, 保留原图像素(裤子/肚皮)。
+
+    - 椭圆核 (0.055w, 0.025h): 横向错位来自袖条列(画布基模比例)与真人
+      手臂列(u2net 主体外 25%)的坐标系差, 需大横余量; 纵向锚点(肩/腕/
+      hem)两侧同源, 小余量即可。
+    - kept < min_keep(形与 mask 明显错位)/alpha 缺失/cv2 缺失 → 原样返回
+      (fail-open); VTON_MASK_ALPHA_INTERSECT=0 一键关闭(A/B 用)。
+    - 类型透传: PIL 进 PIL 出, ndarray 进 ndarray 出(下游按 ndarray 消费)。
+
+    返回 (mask, kept); kept=None 表示未应用。
+    """
+    if apply_mask is None or ref_alpha is None:
+        return apply_mask, None
+    if os.environ.get("VTON_MASK_ALPHA_INTERSECT", "1") == "0":
+        return apply_mask, None
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        return apply_mask, None
+    was_pil = isinstance(apply_mask, Image.Image)
+    m = np.asarray(apply_mask.convert("L")) if was_pil else np.asarray(apply_mask)
+    if m.ndim == 3:
+        m = m[..., 0]
+    h, w = m.shape
+    ra_src = ref_alpha.getchannel("A") if ref_alpha.mode == "RGBA" else ref_alpha.convert("L")
+    ra = np.asarray(ra_src, dtype=np.uint8)
+    if ra.shape != m.shape:
+        ra = cv2.resize(ra, (w, h), interpolation=cv2.INTER_LINEAR)
+    kx = max(9, int(0.055 * w) | 1)
+    ky = max(5, int(0.025 * h) | 1)
+    ra = cv2.dilate(ra, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky)))
+    out = np.minimum(m.astype(np.uint8), ra)
+    denom = max(float(m.mean()), 1.0)
+    kept = float(out.mean()) / denom
+    if kept < min_keep:
+        return apply_mask, None
+    if was_pil:
+        return Image.fromarray(out), kept
+    return out, kept
 
 
 # 穿着贴合层:让衣服"穿在身上"而非"贴在身上"——面料随身材垂坠、起褶皱。
@@ -552,12 +609,12 @@ def align_garment_to_pose(
     if warped.mode != "RGBA":
         warped = warped.convert("RGBA")
 
-    # 长袖几何对齐: 2D warp 折不下横向摊开的袖子, 这里把平铺衣的左右袖
-    # 旋转 90° 合成到画布手臂列, 让参考图在手臂上有真实袖纹(修"长袖变无袖")。
-    # 竖直锚点用 pose 的肩/腕归一化 y(无 pose 退回全身比例), 横向按全身正面基模标定。
-    # 浅色衣 + 白底时 garment_alpha 抠不净、贴入带白底 → 可用 VTON_SLEEVE_REFIT=0
-    # 一键关闭本步(退回仅 prompt+mask 走廊保证长袖), 不改代码即可 A/B。
-    if sleeve_len == "long" and os.environ.get("VTON_SLEEVE_REFIT", "1") != "0":
+    # 袖几何对齐: 2D warp 折不下袖子, 这里把平铺衣的左右袖(横向摊开/向下
+    # 折放自适应, 短袖只贴肘上段)合成到画布手臂列, 让参考图在手臂上有真实
+    # 袖纹(修"长袖变无袖/短袖无袖")。竖直锚点用 pose 的肩/腕归一化 y(无 pose
+    # 退回全身比例), 横向按全身正面基模标定; RGB 平铺图先补 garment_alpha,
+    # 白底不整块贴入。VTON_SLEEVE_REFIT=0 一键关闭本步(A/B 用)。
+    if sleeve_len in ("long", "short") and os.environ.get("VTON_SLEEVE_REFIT", "1") != "0":
         try:
             warped = refit_sleeves_to_arms(warped, garment, canvas, pose, sleeve_len)
         except Exception:
@@ -1136,6 +1193,11 @@ def compose_tryon_sdxl(
     # 原图皮肤/裤子像素本就是原图色, 不需要肤色兜底去动它们)。
     # 此处 result 还是裸 SDXL 帧(未染色), u2net 判主体最可靠。
     apply_mask = limit_mask_to_subject(shared_mask, foreground_mask(result)) if shared_mask is not None else None
+    # 贴回 mask ∩ warp 衣料形: 走廊/hem 尾巴里的裤子/肚皮重画不贴回原图
+    # (裤子变色/漏肚脐); 形错位(fail-open)或 warp 关闭时保持完整 mask。
+    apply_mask, _alpha_kept = intersect_mask_with_garment_alpha(apply_mask, cloth_ref_alpha)
+    if _alpha_kept is not None:
+        logger.info("apply_mask ∩ warp-garment-alpha: %.0f%% of apply_mask kept", _alpha_kept * 100)
     if shared_mask is not None and apply_mask is not None:
         import numpy as _npa
 

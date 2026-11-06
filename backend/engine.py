@@ -373,19 +373,26 @@ def refit_sleeves_to_arms(
     pose: dict | None = None,
     sleeve_len: str = "long",
 ) -> Image.Image:
-    """长袖几何对齐: 把平铺衣左右袖旋转 90° 合成到目标画布的手臂位置。
+    """袖几何对齐: 把平铺衣的左右袖合成到目标画布的手臂列。
 
-    2D warp 只把衣身"充气"包到躯干框, 折不下横向摊开的袖子 → 长袖衣的参考图
-    在手臂位置没有袖料(alpha=0) → 生成模型只能画裸臂、pattern-lock 无袖可贴
-    → 出图长袖变短袖/无袖。本函数从原平铺图裁出左右袖, 旋转到竖直(袖口朝下),
-    缩放到手臂宽/长, 合成到画布肩→腕的外侧手臂列, 让 IP-Adapter/pattern-lock
-    在手臂上有真实袖纹。纯 CPU。
+    2D warp 只把衣身"充气"包到躯干框, 折不下袖子 → 参考图手臂位置没有袖料
+    (alpha=0) → 生成模型只能画裸臂 → 出图长袖变短袖/无袖。本函数从原平铺图
+    裁出左右袖, 转成竖直(袖口朝下), 缩放到手臂宽/长, 合成到画布肩→腕的外侧
+    手臂列, 让 IP-Adapter/pattern-lock 在手臂上有真实袖纹。纯 CPU。
 
-    竖直范围用 pose 的肩/腕归一化 y(无 pose 时用全身比例 0.20/0.62); 横向从
-    warped 躯干行实测半宽、贴到躯干外侧。任何一步算不出合法手臂列则原样返回
-    (退回旧行为, 不破坏已有结果)。sleeve_len 仅 "long" 生效。
+    袖子摆放按裁片横宽比自适应:
+    - 横向摊开(宽>1.25x高): 旋转 90° 袖口朝下(左袖 CCW, 右袖 CW);
+    - 向下折放(高≥宽, 肩端在上袖口在下): 不转, 直接贴。
+    外侧袖带若混入不连肩的低位散段(A 字衣摆侧缘), 按"取最靠上(连肩线)的
+    连续行段"只保留袖段。RGB 平铺图先补 garment_alpha 再裁, 白底像素
+    alpha=0 贴合时为 no-op(修"袖子贴成白块, 模型看不见袖料")。右袖裁片
+    坐标从切片相对坐标换回全图坐标需 +tc1。
+
+    竖直范围用 pose 的肩/腕归一化 y(无 pose 时用全身比例 0.20/0.62); 横向按
+    全身正面基模标定。短袖只贴肩下 0.40 臂长(肘上)。任何一步算不出合法手臂列
+    则原样返回(退回旧行为, 不破坏已有结果)。sleeve_len 为 "long"/"short"。
     """
-    if sleeve_len != "long":
+    if sleeve_len not in ("long", "short"):
         return warped
     out = warped.convert("RGBA").copy()
     cw, ch = out.size
@@ -402,6 +409,7 @@ def refit_sleeves_to_arms(
     if wrist_y - shoulder_y < ch * 0.08:
         return out
     arm_len = wrist_y - shoulder_y
+    strip_h = arm_len if sleeve_len == "long" else max(int(ch * 0.05), int(arm_len * 0.40))
 
     # ---- 横向: 全身正面基模标定的画布比例(手臂列在躯干外侧) ----
     # 基模(全身正面 1024)躯干半宽≈0.145c, 手臂悬在躯干外侧, 手臂宽≈0.05c:
@@ -420,7 +428,10 @@ def refit_sleeves_to_arms(
     g = garment.convert("RGBA")
     ga = np.asarray(g.getchannel("A"))
     if int(ga.min()) >= 240:
-        ga = np.asarray(garment_alpha(g))
+        # 不透明(RGB/JPEG)输入: 补估计 alpha, 让裁片自带真实前景
+        # (白底 alpha≈0 → 贴合时背景 no-op, 不再整块贴白)。
+        g.putalpha(garment_alpha(garment))
+        ga = np.asarray(g.getchannel("A"))
     content = ga > 40
     xs = np.where(content)[1]
     if len(xs) < 64:
@@ -430,30 +441,49 @@ def refit_sleeves_to_arms(
     tc0 = gx0 + int(gcw * 0.22)
     tc1 = gx0 + int(gcw * 0.78)
 
-    def _sleeve_crop(side: str) -> Image.Image | None:
+    def _sleeve_strip(side: str) -> Image.Image | None:
         band_c = content[:, :tc0] if side == "L" else content[:, tc1:]
-        yy, xx = np.where(band_c)
+        rows = np.where(band_c.any(axis=1))[0]
+        if len(rows) == 0:
+            return None
+        # 连续行段(行间空隙>30px 断开); 取起始行最小(连着肩线)的一段=袖,
+        # 丢弃衣摆侧缘/散开下摆等不连肩的低位段。
+        segs = []
+        start = prev = int(rows[0])
+        for r in rows[1:]:
+            r = int(r)
+            if r - prev > 30:
+                segs.append((start, prev))
+                start = r
+            prev = r
+        segs.append((start, prev))
+        sy0, sy1 = min(segs)
+        _yy, xx = np.where(band_c[sy0 : sy1 + 1])
         if len(xx) < max(32, gcw * ch // 400):
             return None
         sx0 = int(xx.min())
         sx1 = int(xx.max()) + 1
         if side == "R":
-            sx0 -= tc1
-            sx1 -= tc1
-        sy0 = int(yy.min())
-        sy1 = int(yy.max()) + 1
-        crop = g.crop((sx0, sy0, sx1, sy1))
-        # 袖口朝外: 左袖袖口在裁片左缘 → 90° CCW 袖口朝下; 右袖镜像 → 90° CW。
-        rot = crop.transpose(Image.Transpose.ROTATE_90) if side == "L" else crop.transpose(Image.Transpose.ROTATE_270)
-        return rot
+            # np.where 返回切片内相对坐标, 换回全图坐标要 +tc1。
+            sx0 += tc1
+            sx1 += tc1
+        crop = g.crop((sx0, sy0, sx1, sy1 + 1))
+        if sx1 - sx0 > (sy1 + 1 - sy0) * 1.25:
+            # 横向摊开: 左袖袖口在裁片左缘 → 90° CCW 袖口朝下; 右袖镜像 → 90° CW。
+            if side == "L":
+                crop = crop.transpose(Image.Transpose.ROTATE_90)
+            else:
+                crop = crop.transpose(Image.Transpose.ROTATE_270)
+        # 向下折放: 长度轴已竖直(肩端在上袖口在下), 不转。
+        return crop
 
     from PIL import ImageFilter
 
     for side, px in (("L", px_l), ("R", px_r)):
-        sl = _sleeve_crop(side)
+        sl = _sleeve_strip(side)
         if sl is None:
             continue
-        sl = sl.resize((arm_w, arm_len), Image.Resampling.LANCZOS)
+        sl = sl.resize((arm_w, strip_h), Image.Resampling.LANCZOS)
         # 去白底: alpha 太低的像素(背景/抠图残边)置 0, 避免贴进白晕。
         arr = np.array(sl)  # copy: np.asarray 返回只读视图, 无法写回
         al = arr[:, :, 3].astype(np.uint8)

@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 from engine import (
     ETHNICITY_FIT,
@@ -391,3 +392,114 @@ def test_compose_tryon_marks_engine_when_composite(base_image, garment_image):
     result = eng.compose_tryon(base_image, garment_image, "women", "upper", 512, "white", "western_europe")
     assert result.info.get("engine") == "composite-fallback"
     assert result.info.get("engine_degraded") is False
+
+
+# ---- refit_sleeves_to_arms: 袖条重挂(修"长袖/短袖变无袖") ----
+def _flat_with_folded_sleeves(tmp_path, sleeve="long", flare=False):
+    """768x1024 白底平铺图: 中央灰衣身 + 左右向下折放袖(左红/右蓝), 可选低位绿散段。
+
+    袖带宽 ~60px(带内占 <22%/78% 列), 衣身 240-528 不越带界, 与
+    09290/09263/04469 实拍平铺(袖向下折放)同构。
+    """
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (768, 1024), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle((240, 200, 528, 700), fill=(128, 128, 128))
+    s_bottom = 700 if sleeve == "long" else 420
+    d.rectangle((120, 260, 180, s_bottom), fill=(200, 60, 60))
+    d.rectangle((588, 260, 648, s_bottom), fill=(60, 60, 200))
+    if flare:
+        d.rectangle((90, 800, 150, 890), fill=(30, 200, 60))
+    img.save(tmp_path / f"flat_{sleeve}_{flare}.jpg")
+    return img
+
+
+def _blank_warped():
+    from PIL import Image
+
+    return Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
+
+
+def test_refit_pastes_both_sleeves_folded_layout(tmp_path):
+    from engine import refit_sleeves_to_arms
+
+    garment = _flat_with_folded_sleeves(tmp_path)
+    out = refit_sleeves_to_arms(_blank_warped(), garment, 1024, None, "long")
+    arr = np.asarray(out)
+    # 左袖列 x 307-358: 红色袖料; 右袖列 x 665-716: 蓝色袖料
+    # (右袖旧实现 -=tc1 坐标全负, 裁片越界成全透明 → 空贴)。
+    for x0, x1, want in ((315, 350, (200, 60, 60)), (673, 708, (60, 60, 200))):
+        zone = arr[300:600, x0:x1]
+        solid = zone[(zone[:, :, 3] > 200)]
+        assert solid.size, f"袖列 x{x0}-{x1} 无实心袖料"
+        med = solid[:, :3].mean(axis=0)
+        assert abs(int(med[0]) - want[0]) < 90 and abs(int(med[2]) - want[2]) < 90, f"袖色 {med} != {want}"
+
+
+def test_refit_does_not_paste_white_background(tmp_path):
+    from engine import refit_sleeves_to_arms
+
+    garment = _flat_with_folded_sleeves(tmp_path)
+    out = refit_sleeves_to_arms(_blank_warped(), garment, 1024, None, "long")
+    arr = np.asarray(out)
+    for x0, x1 in ((307, 358), (665, 716)):
+        zone = arr[210:630, x0:x1]
+        opaque = zone[zone[:, :, 3] > 200][:, :3]
+        # 白底在裁片里 alpha≈0 不贴入: 贴入的实心像素不得是纯白块
+        # (旧实现: 不透明 JPEG 直接裁 → 整条 51x430 白矩形贴上画布)。
+        assert opaque.size > 500, "袖条实心区过小(疑似没贴上)"
+        assert not np.any((opaque >= 248).all(axis=1))
+
+
+def test_refit_short_sleeve_strip_ends_above_elbow(tmp_path):
+    from engine import refit_sleeves_to_arms
+
+    garment = _flat_with_folded_sleeves(tmp_path, sleeve="short")
+    out = refit_sleeves_to_arms(_blank_warped(), garment, 1024, None, "short")
+    arr = np.asarray(out)
+    col = arr[:, 315:350, 3] > 60
+    # 肩下袖段(短)在 y 300 有料, 肘下 y 500 无料(长袖才会到腕 634)
+    assert col[280:330].any(), "短袖上臂段缺失"
+    assert not col[480:530].any(), "短袖条贴过了肘(应为 ~0.40 臂长)"
+
+
+def test_refit_ignores_detached_lower_segment(tmp_path):
+    from engine import refit_sleeves_to_arms
+
+    garment = _flat_with_folded_sleeves(tmp_path, flare=True)
+    out = refit_sleeves_to_arms(_blank_warped(), garment, 1024, None, "long")
+    arr = np.asarray(out)
+    visible = arr[arr[:, :, 3] > 200][:, :3]
+    # 低位散段(衣摆侧缘/垂带, 绿)不连肩, 不应被当袖贴上
+    assert visible.size
+    assert not np.any((visible[:, 1] > 150) & (visible[:, 0] < 100) & (visible[:, 2] < 100))
+
+
+def test_refit_horizontal_sleeve_layout_rotates(tmp_path):
+    from engine import refit_sleeves_to_arms
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (768, 1024), (255, 255, 255))
+    d = ImageDraw.Draw(img)
+    d.rectangle((240, 200, 528, 700), fill=(128, 128, 128))
+    d.rectangle((60, 300, 200, 360), fill=(200, 60, 60))
+    d.rectangle((568, 300, 708, 360), fill=(60, 60, 200))
+    out = refit_sleeves_to_arms(_blank_warped(), img, 1024, None, "long")
+    arr = np.asarray(out)
+    for x0, x1 in ((315, 350), (673, 708)):
+        zone = arr[300:600, x0:x1]
+        assert (zone[:, :, 3] > 200).sum() > 500, f"横向摊开袖未旋转贴上 x{x0}"
+    left = arr[300:600, 315:350]
+    solid = left[left[:, :, 3] > 200][:, :3]
+    assert (solid[:, 0] > 120).mean() > 0.9, "左袖旋转后应为红色袖料"
+
+
+def test_refit_passthrough_unsupported_sleeve_len(tmp_path):
+    from engine import refit_sleeves_to_arms
+
+    garment = _flat_with_folded_sleeves(tmp_path)
+    for sl in (None, "sleeveless", "three_quarter"):
+        warped = _blank_warped()
+        out = refit_sleeves_to_arms(warped, garment, 1024, None, sl)
+        assert np.asarray(out).tolist() == np.asarray(warped).tolist()
