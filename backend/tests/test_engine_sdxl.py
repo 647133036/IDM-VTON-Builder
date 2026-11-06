@@ -411,9 +411,42 @@ def test_sleeve_negative_prompts_pin_opposite_sleeve_terms():
 
     table = engine_sdxl.SLEEVE_NEGATIVE_PROMPTS
     assert set(table) == {"long", "short", "sleeveless"}
-    # 长袖: 必须压"露小臂/短袖/无袖"
+    # 长袖: 必须压"露小臂/短袖/中袖"
     assert "bare forearms" in table["long"] and "short sleeves" in table["long"]
     # 短袖: 必须压"长袖/无袖"
     assert "long sleeves" in table["short"] and "sleeveless" in table["short"]
     # 无袖: 必须压"长袖/短袖"
     assert "long sleeves" in table["sleeveless"] and "short sleeves" in table["sleeveless"]
+
+
+def test_dedupe_negative_drops_repeat_phrases_and_keeps_order():
+    """negative 短语去重: CLIP 77-token 截断下重复词条白烧预算(AUDIENCE 与
+    COMMON 曾同时带 "bad anatomy, extra limbs"), 保留首次出现并保序。"""
+    import engine_sdxl
+
+    out = engine_sdxl._dedupe_negative(
+        [
+            "bare forearms, short sleeves",
+            "bad anatomy, extra limbs",
+            "plastic, bad anatomy, extra limbs",
+            "",
+            "floor shadow",
+        ]
+    )
+    assert out == "bare forearms, short sleeves, bad anatomy, extra limbs, plastic, floor shadow"
+
+
+def test_negative_assembly_fits_clip_budget_with_sleeve_first():
+    """negative 组装契约: 袖型词必须最前(CLIP 按 77 token 截断, 旧序追加末尾
+    实测袖型词 encoded=0 → C3 与 C2 逐像素相同); 全 audience 与全袖型的
+    组合短语无重复、袖型词在首位。token 数用服务器真实 CLIPTokenizer 验证
+    (women+long=75, 全组合 ≤77), 这里钉字符串结构防回归。"""
+    import engine_sdxl as eng
+
+    for aud in eng.AUDIENCE_NEGATIVE:
+        for sl, sv in eng.SLEEVE_NEGATIVE_PROMPTS.items():
+            text = eng._dedupe_negative([sv, eng.AUDIENCE_NEGATIVE[aud], eng.FIT_NEGATIVE, eng.COMMON_NEGATIVE])
+            phrases = [p.strip() for p in text.split(",")]
+            assert text.startswith(sv.split(",")[0].strip() + ","), f"{aud}/{sl}: sleeve terms not first"
+            assert len(phrases) == len({p.lower() for p in phrases}), f"{aud}/{sl}: dup phrases"
+            assert all(phrases), f"{aud}/{sl}: empty phrase"

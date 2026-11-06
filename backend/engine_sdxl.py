@@ -56,12 +56,12 @@ AUDIENCE_NEGATIVE = {
     "boys": "worst quality, low quality, adult body, distorted proportions, big head, small body, extra limbs",
     "baby": "worst quality, low quality, adult body, extra limbs, missing limbs",
 }
-# 通用反向(全 audience 生效):电商主图禁项——塑料感/空气刷、有色背景、地面阴影、水印文字。
-COMMON_NEGATIVE = (
-    "plastic, airbrushed, deformed, distorted body, bad anatomy, extra limbs, "
-    "colored background, beige background, studio shadow, floor shadow, "
-    "watermark, text, logo, signature"
-)
+# 通用反向(全 audience 生效):电商主图禁项——塑料感/空气刷、有色背景、地面阴影。
+# CLIP 77-token 预算(实测 token 数): "distorted body"并入"deformed"、"beige background"
+# 并入"colored background"; "studio shadow"并入"floor shadow"(白底后处理本就会压
+# 背景阴影); watermark/text/logo/signature 裁掉 —— 88-token 时代它们位于截断
+# 丢弃区, 从未被编码过, 留在串里只烧 token 预算。
+COMMON_NEGATIVE = "plastic, airbrushed, deformed, colored background, floor shadow"
 # 摄影质感正向(防"假人感"):电商主图需要的写实体感与面料细节。
 PHOTO_QUALITY = "photorealistic, 8k uhd, dslr, soft studio lighting, detailed fabric texture, natural fabric drape"
 
@@ -89,11 +89,35 @@ GARMENT_PROMPT_SUFFIX = {
 
 # 袖型反向约束: SDXL 对正向袖型描述跟随弱(09290 长袖平铺被画成肘部
 # 截断), negative 按检测袖型压掉对立袖型, 比正向描述收敛快。
+# 词条必须前置(组装处保证): negative 按 CLIP 77 token 截断, 旧序追加在
+# 末尾时袖型词全部落在丢弃区(encoded=0, C3 与 C2 逐像素相同的根因)。
+# "sleeveless"离 long 视觉太远, 不占预算。
 SLEEVE_NEGATIVE_PROMPTS = {
-    "long": "bare forearms, short sleeves, three-quarter sleeves, sleeveless",
+    "long": "bare forearms, short sleeves, three-quarter sleeves",
     "short": "long sleeves, sleeveless top, bare shoulders",
     "sleeveless": "long sleeves, short sleeves, sleeve fabric",
 }
+
+
+def _dedupe_negative(parts: list[str]) -> str:
+    """按短语去重拼接 negative 片段。
+
+    AUDIENCE_NEGATIVE 与 COMMON_NEGATIVE 的 "bad anatomy, extra limbs" 等
+    短语重复时保留首次出现 —— negative 走 CLIP 77-token 截断, 重复词条
+    白烧预算还挤掉袖型词。大小写不敏感, 保序, 空片段跳过。
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for part in parts:
+        if not part:
+            continue
+        for phrase in part.split(","):
+            phrase = phrase.strip()
+            key = phrase.lower()
+            if phrase and key not in seen:
+                seen.add(key)
+                out.append(phrase)
+    return ", ".join(out)
 
 
 def infer_auto_garment_type(extent: dict | None) -> str:
@@ -958,14 +982,21 @@ def compose_tryon_sdxl(
     if background == "white":
         # 电商主图:背景要求纯白无缝影棚、无地面/阴影(后处理还会强制压白)。
         prompt = f"{prompt}, isolated on a pure white seamless studio backdrop, no floor, no shadow"
-    negative_prompt = (
-        f"{AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE['women'])}, {FIT_NEGATIVE}, {COMMON_NEGATIVE}"
-    )
     # 袖型反向约束: 检测到袖型时压掉对立袖型(04469 短袖被画成无袖、
     # 09290 长袖被画成肘部截断的实测根因之一 —— 正向袖型词跟随弱)。
+    # 袖型词放最前 + 短语去重: negative 走 CLIP tokenizer 77-token 截断
+    # (truncation=True 静默截断, 无日志), 旧序追加末尾时袖型词全部被截
+    # 掉(encoded=0, C3 与 C2 逐像素相同的实测根因)。去重后全 audience
+    # 加全袖型组合 ≤77 token, 袖型词与核心禁项全部编码。
     _neg_sleeve = SLEEVE_NEGATIVE_PROMPTS.get(_sleeve_prompt or "")
-    if _neg_sleeve:
-        negative_prompt = f"{negative_prompt}, {_neg_sleeve}"
+    negative_prompt = _dedupe_negative(
+        [
+            _neg_sleeve,
+            AUDIENCE_NEGATIVE.get(audience, AUDIENCE_NEGATIVE["women"]),
+            FIT_NEGATIVE,
+            COMMON_NEGATIVE,
+        ]
+    )
 
     pipe, ip_adapter_loaded, ip_adapter_reason = _get_sdxl_pipe(device, dtype)
 

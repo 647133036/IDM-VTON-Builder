@@ -1742,13 +1742,19 @@ def limit_mask_to_subject(
     - subject 为 None/尺寸不齐/交集为空 → 原样返回 mask(fail-open:
       u2net 挂掉时退回旧行为, 不让整条后处理链断掉)。
     - mask 的羽化带(0-255 渐变)在主体内原样保留, 只在主体外归零。
+    - 双类型兼容: 生产链路里 clothing_mask 返回 uint8 ndarray(0-255),
+      foreground_mask 返回 uint8 ndarray(0/1); 单测里常喂 PIL Image。
+      输入是什么类型, 输出就是什么类型(下游 blend/reapply/seam 按
+      ndarray 消费, 不能换型)。
     """
     if mask is None:
         return None
     if subject is None:
         return mask
-    m = np.asarray(mask.convert("L"))
-    s = np.asarray(subject.convert("L"))
+    m = np.asarray(mask.convert("L")) if isinstance(mask, Image.Image) else np.asarray(mask)
+    s = np.asarray(subject.convert("L")) if isinstance(subject, Image.Image) else np.asarray(subject)
+    if s.ndim == 3:
+        s = s.mean(axis=2)
     if s.shape[:2] != m.shape[:2]:
         return mask
     s_bin = s > 0
@@ -1763,7 +1769,9 @@ def limit_mask_to_subject(
     out = np.where(s_bin, m, 0)
     if not (out > 0).any():
         return mask
-    return Image.fromarray(out.astype("uint8"))
+    if isinstance(mask, Image.Image):
+        return Image.fromarray(out.astype("uint8"))
+    return out.astype("uint8")
 
 
 def blend_tryon(

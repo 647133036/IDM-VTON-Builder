@@ -169,3 +169,12 @@ Entries discovered by the Agent during task execution should follow this format:
   - PLTON / PhysDiff-VTON style high-frequency injection during denoising is not
     available on this SDXL ControlNet pipeline; do not claim generation-time
     pattern constraints.
+
+[User Instruction Summary]
+- Date: 2026-11-06
+- Context: GPU 服务器(AutoDL)切换为"无卡开机"(CPU-only)模式期间的协作流程
+- Category: Workflow & Collaboration
+- Instructions:
+  - 服务器可能处于无卡开机状态(无 GPU, nvidia-smi 报 No devices found), SSH/scp/CPU 推理仍可用
+  - 先干完 CPU 能做的事: 本地修码+测试+推送、scp 同步、sha256 校验、CPU 上跑 detect/推断验证、备好重跑 harness
+  - 需要 GPU 的任务(如 compose_tryon_sdxl 出图)明确告知用户, 等用户换有卡开机后再执行

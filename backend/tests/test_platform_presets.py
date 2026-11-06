@@ -747,6 +747,21 @@ def test_limit_mask_to_subject_keeps_feather_inside_subject():
     assert out[0, 0] == 0
 
 
+def test_limit_mask_to_subject_accepts_production_ndarray_masks():
+    """生产链路类型: clothing_mask 返回 uint8 ndarray(0-255 羽化),
+    foreground_mask 返回 uint8 ndarray(0/1)。ndarray 进 → ndarray 出
+    (GPU 实测: PIL-only 假设在这里 AttributeError 崩掉整条链)。"""
+    mask = np.full((60, 80), 255, dtype=np.uint8)
+    mask[10:20, 10:40] = 128  # 羽化带
+    subj = np.zeros((60, 80), dtype=np.uint8)
+    subj[:, :40] = 1  # 生成图主体: 左半边画了内容, 右半边是白背景
+    out = limit_mask_to_subject(mask, subj)
+    assert isinstance(out, np.ndarray)
+    assert out.dtype == np.uint8
+    assert (out[:, :40] == mask[:, :40]).all()  # 主体内数值(含羽化带)原样
+    assert (out[:, 45:] == 0).all()  # dilate 3px 后白背景区归零
+
+
 # --- clothing_mask with garment_extent --------------------------------------
 
 
