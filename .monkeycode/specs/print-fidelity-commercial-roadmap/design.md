@@ -63,9 +63,10 @@ graph TD
 | fashn-human-parser（NVIDIA SegFormer 权重） | NVIDIA Source Code License §3.3 含商用限制 | **禁止商用**：`engine_fashn._ensure_parser_stub()` 向 `sys.modules` 注入零张量 stub，权重永不下载 |
 | FASHN DWPose / YOLOX 权重 | Apache 2.0 | 允许商用，随 FASHN 权重组下载 |
 | DS-VTON / POVNet 官方实现 | 学术代码，未确认商用 | 吸收 coarse-to-fine 与残差高频回收的分层，用自研两段 inpaint + 频率分离实现 |
+| Leffa（franciszzj/Leffa） | 代码与试衣权重标注 MIT；但完整推理链捆绑 DensePose 权重 `model_final_162be9.pkl`（CC BY-NC）、OpenPose `body_pose_model.pth`（CMU 非商用）、SCHP/ATR/LIP 人体解析（研究用途），且 UNet 以 DensePose I-map 为条件输入 | **排除**（2026-11-10 HF 卡核证）：试衣权重 MIT 但无法脱离非商用条件链单独推理，与 IDM-VTON 同类；无商用替代价值，不进入机理对照 |
 | 任何 NC / 未获书面授权的权重 | — | 运行时 `engine_status` 不得出现对应路径 |
 
-允许的生产组件（与 README 授权说明一致）：FASHN VTON v1.5 主模型与 `fashn_vton` 代码（Apache 2.0，商用主引擎）、FASHN DWPose / YOLOX 权重（Apache 2.0）、SDXL（已获商用授权）、ControlNet OpenPose/Canny/Depth（已获商用授权）、SDXL Inpainting（与 SDXL 同协议）、IP-Adapter Apache 2.0、RTMPose Apache 2.0、Rembg/U2Net MIT、MediaPipe Apache 2.0 回退、OpenCV 几何、自研 LoRA 与后处理。fashn-human-parser（NVIDIA SegFormer 权重）含商用限制，商用路径注入零张量 stub。
+允许的生产组件（与 README 授权说明一致）：FASHN VTON v1.5 主模型与 `fashn_vton` 代码（Apache 2.0，商用主引擎）、FASHN DWPose / YOLOX 权重（Apache 2.0）、SDXL（已获商用授权）、ControlNet OpenPose/Canny/Depth（已获商用授权）、SDXL Inpainting（`diffusers/stable-diffusion-xl-1.0-inpainting-0.1`，HF 卡标签 `license: openrail++`，2026-11-10 核证允许商用）、IP-Adapter Apache 2.0、RTMPose Apache 2.0、Rembg/U2Net MIT、MediaPipe Apache 2.0 回退、OpenCV 几何、自研 LoRA 与后处理。fashn-human-parser（NVIDIA SegFormer 权重）含商用限制，商用路径注入零张量 stub。
 
 ## Components and Interfaces
 
