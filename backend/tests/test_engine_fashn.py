@@ -37,6 +37,32 @@ def test_parser_stub_skips_real_human_parser(monkeypatch):
     assert int(pred.sum()) == 0
 
 
+def test_parser_stub_satisfies_fashn_vton_v15_import_surface():
+    """fashn_vton v1.5 模块导入期需要的全部名字(GPU 冒烟曾因缺 3 个名字炸在 import)。"""
+    import engine_fashn
+
+    sys.modules.pop("fashn_human_parser", None)
+    engine_fashn._ensure_parser_stub()
+    stub = sys.modules["fashn_human_parser"]
+    # pipeline.py 导入: CATEGORY_TO_BODY_COVERAGE, FashnHumanParser
+    for name in ("CATEGORY_TO_BODY_COVERAGE", "FashnHumanParser"):
+        assert hasattr(stub, name), name
+    # preprocessing/agnostic.py 导入: BODY_COVERAGE_TO_LABELS, IDENTITY_LABELS, LABELS_TO_IDS
+    bctl = stub.BODY_COVERAGE_TO_LABELS
+    assert set(bctl) == {"upper", "lower", "full"}
+    assert set(bctl) == set(stub.CATEGORY_TO_BODY_COVERAGE.values())
+    identity = tuple(stub.IDENTITY_LABELS)
+    assert identity and all(isinstance(x, str) for x in identity)
+    l2i = stub.LABELS_TO_IDS
+    assert l2i and all(isinstance(v, int) for v in l2i.values())
+    # 每个覆盖档的 label 必须都在 LABELS_TO_IDS 里(结构自洽)
+    for labels in bctl.values():
+        for label in labels:
+            assert label in l2i, label
+    for label in identity:
+        assert label in l2i, label
+
+
 def test_get_fashn_pipe_uses_stub_and_weights_dir(monkeypatch, tmp_path):
     import engine_fashn
 

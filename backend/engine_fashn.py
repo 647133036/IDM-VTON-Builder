@@ -44,6 +44,46 @@ def _ensure_parser_stub() -> None:
         "bottoms": "lower",
         "one-pieces": "full",
     }
+    # fashn_vton v1.5 在模块导入期还需要以下三个常量(preprocessing/agnostic.py)。
+    # segmentation_free=True 时运行期不触解析器, 但导入必须成功; 值按 SCHP/LIP
+    # 语义给出(仅供类型/结构兼容, 商用路径永不消费)。
+    stub.BODY_COVERAGE_TO_LABELS = {
+        "upper": ("Upper-clothes",),
+        "lower": ("Pants", "Skirt"),
+        "full": ("Dress",),
+    }
+    stub.IDENTITY_LABELS = (
+        "Face",
+        "Hair",
+        "Sunglasses",
+        "Hat",
+        "Left-arm",
+        "Right-arm",
+        "Left-leg",
+        "Right-leg",
+        "Left-shoe",
+        "Right-shoe",
+    )
+    stub.LABELS_TO_IDS = {
+        "Background": 0,
+        "Hat": 1,
+        "Hair": 2,
+        "Sunglasses": 3,
+        "Upper-clothes": 4,
+        "Skirt": 5,
+        "Pants": 6,
+        "Dress": 7,
+        "Belt": 8,
+        "Left-shoe": 9,
+        "Right-shoe": 10,
+        "Face": 11,
+        "Left-leg": 12,
+        "Right-leg": 13,
+        "Left-arm": 14,
+        "Right-arm": 15,
+        "Bag": 16,
+        "Scarf": 17,
+    }
     stub.BODY_COVERAGE_TO_FASHN_LABELS = {}
     stub.FASHN_LABELS_TO_IDS = {}
 

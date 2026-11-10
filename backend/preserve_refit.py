@@ -116,47 +116,39 @@ def tps_warp(
         h, w = ref_img.size[1], ref_img.size[0]
         canvas_w, canvas_h = canvas_size
 
-        # 源锚点 (x, y) 在平铺图上
+        # 源锚点 (x, y) 在平铺图上, 目标锚点在画布上
         src = np.array(src_pts, dtype=np.float64)
         dst = np.array(dst_pts, dtype=np.float64)
 
-        # 构建 TPS: 仿射 + RBF 径向基
+        # 逆向 TPS: 以目标锚点为节点、源锚点为值, 求 g: 画布坐标 -> 平铺图坐标,
+        # remap 时对每个画布像素取 g 求采样位置(逆向映射, 高频印花不走样)。
+        # Bookstein 方程组: [[K, P^T], [P, 0]] (n+3)x(n+3), P = [1; x; y] (3, n)。
         n = len(src)
-        A = np.zeros((n, 2))
-        A[:, 0] = src[:, 0]
-        A[:, 1] = src[:, 1]
-        B = np.zeros((n, 2))
-        B[:, 0] = dst[:, 0]
-        B[:, 1] = dst[:, 1]
-
-        # 求解 TPS 系数
         K = np.zeros((n, n))
         for i in range(n):
             for j in range(n):
-                K[i, j] = _rbf_kernel(A[i], A[j])
-        P = np.vstack([np.ones((1, n)), A.T])
-        M = np.zeros((n + 2, n + 2))
-        M[2:, 2:] = K
-        M[:2, 2:] = P
-        M[2:, :2] = P.T
-        rhs = np.zeros((n + 2, 2))
-        rhs[2:, :] = B
+                K[i, j] = _rbf_kernel(dst[i], dst[j])
+        P = np.vstack([np.ones((1, n)), dst.T])
+        M = np.zeros((n + 3, n + 3))
+        M[:n, :n] = K
+        M[:n, n:] = P.T
+        M[n:, :n] = P
+        rhs = np.zeros((n + 3, 2))
+        rhs[:n, :] = src
         sol = np.linalg.solve(M, rhs)
-        a0 = sol[0, :]
-        a1 = sol[1, :]
-        w_coeff = sol[2:, :]
+        w_coeff = sol[:n, :]
+        aff = sol[n:, :]
 
         # 生成目标像素网格
         xg, yg = np.meshgrid(np.arange(canvas_w, dtype=np.float64), np.arange(canvas_h, dtype=np.float64))
         gx = np.stack([xg, yg], axis=-1).reshape(-1, 2)
 
-        # TPS 映射: target -> source
+        # TPS 映射: 目标画布 -> 源平铺图
         K_g = np.zeros((len(gx), n))
         for i in range(n):
-            K_g[:, i] = _rbf_kernel_batch(gx, A[i])
-        src_coords = a0 + a1 @ gx.T
-        src_coords += K_g @ w_coeff
-        src_coords = src_coords.T
+            K_g[:, i] = _rbf_kernel_batch(gx, dst[i])
+        G = np.hstack([np.ones((len(gx), 1)), gx])
+        src_coords = G @ aff + K_g @ w_coeff
 
         sx = np.clip(src_coords[:, 0], 0, w - 1).astype(np.float32).reshape(canvas_h, canvas_w)
         sy = np.clip(src_coords[:, 1], 0, h - 1).astype(np.float32).reshape(canvas_h, canvas_w)

@@ -120,6 +120,51 @@ def test_tps_warp_identity_mapping():
     assert abs(int(center[1]) - 200) < 30
 
 
+def test_tps_warp_node_exactness_distinguishes_from_lanczos():
+    """TPS 在锚点节点处必须精确映射: 节点标记色落在目标锚点位置。
+
+    回归: 旧实现 TPS 系统阵尺寸错((n+2) vs P(3,n)), 100% 抛 ValueError 走
+    LANCZOS 兜底, 全部既有测试因纯色图而无法区分。本测试用非均匀锚点,
+    LANCZOS 等比缩放会把标记放在比例位置, 与目标锚点位置不同。
+    """
+    w, h = 100, 200
+    ref = Image.new("RGBA", (w, h), (0, 0, 0, 255))
+    r = np.zeros((h, w, 4), dtype=np.uint8)
+    markers = {
+        (0, 0): (255, 0, 0),
+        (w - 1, 0): (0, 255, 0),
+        (w - 1, h - 1): (0, 0, 255),
+        (0, h - 1): (255, 255, 0),
+    }
+    for (mx, my), color in markers.items():
+        for dy in range(-2, 3):
+            for dx in range(-2, 3):
+                x, y = mx + dx, my + dy
+                if 0 <= x < w and 0 <= y < h:
+                    r[y, x] = (*color, 255)
+    ref = Image.fromarray(r, "RGBA")
+
+    src = [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)]
+    # 非均匀目标锚点: 若退化为 LANCZOS 等比缩放, 标记会落在 (79,119) 而非 (40,118)
+    dst = [(2, 2), (78, 2), (40, 118), (2, 118)]
+    out = preserve_refit.tps_warp(ref, src, dst, (80, 120))
+    arr = np.array(out)
+    # 节点精确: 每个目标锚点像素就是对应源节点标记色
+    checks = [
+        ((2, 2), (255, 0, 0)),
+        ((78, 2), (0, 255, 0)),
+        ((40, 118), (0, 0, 255)),
+        ((2, 118), (255, 255, 0)),
+    ]
+    for (x, y), color in checks:
+        px = arr[y, x, :3]
+        assert all(abs(int(px[i]) - color[i]) <= 40 for i in range(3)), f"node ({x},{y}): {tuple(px)} != {color}"
+    # 关键区分点: dst 节点 (40,118) 映射蓝色。LANCZOS 等比缩放下该像素采样源图
+    # (50, 196) 附近 = 黑背景; TPS 才会把蓝标记放到这里(上面循环已断言)。
+    # 反向确认: (40,118) 若为 TPS 节点, 蓝标记不会再占 (79,119) 比例位置 —— 但
+    # TPS 外插也可能落到那里, 该点无区分力, 不作断言。
+
+
 # ---------- optical_flow_refit ----------
 
 
