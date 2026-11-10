@@ -1,4 +1,5 @@
 import copy
+import os
 
 import pytest
 from PIL import Image
@@ -138,3 +139,87 @@ def test_workflow_claim_and_fail_marks_job():
     assert claimed and claimed["id"] == job["id"]
     patch_job(job["id"], {"status": "failed", "error": "boom", "progress": 100})
     assert get_job(job["id"])["status"] == "failed"
+
+
+def _stub_compose_factory(fidelity_by_seed=None, fidelity=0.95):
+    """返回 compose_tryon 替身: 写入 print_fidelity/delivery_tier 到 img.info。"""
+
+    def _compose(base_path, src, audience, garment_type, long_side, background, ethnicity):
+        img = Image.new("RGB", (96, 128), (120, 60, 60))
+        if fidelity_by_seed is not None:
+            seed = int(os.environ.get("VTON_SEED", "0"))
+            pf = fidelity_by_seed.get(seed, 0.5)
+        else:
+            pf = fidelity
+        img.info["print_fidelity"] = pf
+        img.info["delivery_tier"] = "auto" if pf >= 0.70 else "review"
+        img.info["engine"] = "stub"
+        return img
+
+    return _compose
+
+
+def test_process_job_persists_print_fidelity_tier(tmp_path, ready_base_image, monkeypatch):
+    """compose 写入 print_fidelity/delivery_tier 时落库 job 元数据。"""
+    import worker as worker_mod
+
+    monkeypatch.setenv("VTON_MULTI_SEED", "1")
+    monkeypatch.setattr(worker_mod, "compose_tryon", _stub_compose_factory(fidelity=0.95))
+
+    import store as store_mod
+
+    src = store_mod.UPLOADS / "print_tee.jpg"
+    _make_png(src, (200, 200), (200, 40, 40))
+    base_table = [
+        {
+            "id": "base_women_01",
+            "file": None,
+            "path": str(ready_base_image),
+            "audience": "women",
+            "ethnicity": "east_asia",
+        }
+    ]
+    job = create_job({"base_id": "base_women_01", "source_name": "print_tee.jpg", "title": "tee"})
+    process_job(copy.deepcopy(job), base_table)
+    final = get_job(job["id"])
+    assert final["status"] == "done"
+    assert final["print_fidelity"] == 0.95
+    assert final["delivery_tier"] == "auto"
+
+
+def test_process_job_multiseed_picks_best_print_fidelity(tmp_path, ready_base_image, monkeypatch):
+    """多 seed 按印花保真分择优, multiseed 元数据(含 scores)落库。"""
+    import worker as worker_mod
+
+    monkeypatch.setenv("VTON_MULTI_SEED", "2")
+    # refit_seeds_default() = [42, 1042]: 1042 分高 → 应被选中
+    monkeypatch.setattr(
+        worker_mod,
+        "compose_tryon",
+        _stub_compose_factory(fidelity_by_seed={42: 0.40, 1042: 0.90}),
+    )
+
+    import store as store_mod
+
+    src = store_mod.UPLOADS / "print_tee2.jpg"
+    _make_png(src, (200, 200), (200, 40, 40))
+    base_table = [
+        {
+            "id": "base_women_01",
+            "file": None,
+            "path": str(ready_base_image),
+            "audience": "women",
+            "ethnicity": "east_asia",
+        }
+    ]
+    job = create_job({"base_id": "base_women_01", "source_name": "print_tee2.jpg", "title": "tee2"})
+    process_job(copy.deepcopy(job), base_table)
+    final = get_job(job["id"])
+    assert final["status"] == "done"
+    assert final["print_fidelity"] == 0.90
+    assert final["delivery_tier"] == "auto"
+    ms = final.get("multiseed") or {}
+    assert ms.get("n_seeds") == 2
+    assert ms.get("chosen_seed") == 1042
+    assert ms.get("scores", {}).get("42") == 0.40
+    assert ms.get("scores", {}).get("1042") == 0.90

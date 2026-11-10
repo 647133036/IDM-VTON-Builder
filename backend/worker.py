@@ -87,7 +87,11 @@ def process_job(job: dict, bases: list[dict]) -> None:
                 os.environ.pop("VTON_SEED", None)
 
         def _scorer(img, seed):
-            # 简化: 图案/纯色用 SSIM(全图中间 60% ROI); 文字类走 OCR(此处回退 SSIM)
+            # 首选 compose 引擎写入的印花保真分(贴回区内 warp 参考 vs 结果,
+            # 跨 seed 可比); 无分时回退平铺参考 vs 结果的粗 SSIM(弱信号)。
+            pf = img.info.get("print_fidelity")
+            if pf is not None:
+                return float(pf)
             try:
                 from PIL import Image
 
@@ -103,7 +107,12 @@ def process_job(job: dict, bases: list[dict]) -> None:
                 return 0.0
 
         result, _all_scores, _chosen = run_multiseed(_task, seeds, _scorer)
-        result.info["multiseed"] = {"n_seeds": n_seeds, "seeds": seeds, "chosen_seed": _chosen}
+        result.info["multiseed"] = {
+            "n_seeds": n_seeds,
+            "seeds": seeds,
+            "chosen_seed": _chosen,
+            "scores": {str(s): sc for s, sc in _all_scores},
+        }
         if len(seeds) > 1:
             patch_job(job["id"], {"message": f"Multi-seed ({n_seeds}) done, chosen seed={_chosen}"})
     engine_used = result.info.get("engine") or engine_info["engine"]
@@ -119,8 +128,16 @@ def process_job(job: dict, bases: list[dict]) -> None:
             "degraded_reason": degraded_reason,
         },
     )
+    # 印花保真分 + 交付档位落库: auto 直接放行, review 须人工确认后才推店。
+    _tier_fields = {}
+    if "print_fidelity" in result.info:
+        _tier_fields["print_fidelity"] = result.info["print_fidelity"]
+    if "delivery_tier" in result.info:
+        _tier_fields["delivery_tier"] = result.info["delivery_tier"]
     if "multiseed" in result.info:
-        patch_job(job["id"], {"multiseed": result.info["multiseed"]})
+        _tier_fields["multiseed"] = result.info["multiseed"]
+    if _tier_fields:
+        patch_job(job["id"], _tier_fields)
 
     ext = "png" if job.get("output_format") == "png" or background == "transparent" else "jpg"
     out_path = RESULTS / f"{job['id']}.{ext}"

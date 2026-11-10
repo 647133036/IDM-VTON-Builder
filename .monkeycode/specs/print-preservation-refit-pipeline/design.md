@@ -143,15 +143,18 @@ job 元数据新增字段：
 | `VTON_MULTI_SEED` | `3` | 多 seed 数量, 纯色款=1 |
 | `VTON_QG_SSIM` | `0.70` | SSIM 质检阈值 |
 | `VTON_QG_OCR` | `0.80` | OCR 质检阈值 |
+| `VTON_PRINT_INPAINT` | `0` | 印花 ROI 边界带并入局部 inpaint(`1` 开启; 与 `VTON_INPAINT_REPAIR` 任一开启即走修复路径) |
 
 ## Job Metadata Fields
 
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `refit_engine` | str | 实际使用的贴印引擎(grid/tps/optical_flow) |
-| `multiseed` | dict | `{n_seeds, seeds, chosen_seed}` |
+| `multiseed` | dict | `{n_seeds, seeds, chosen_seed, scores}` |
 | `lock_identity` | bool | 保护贴回是否执行 |
 | `detail_applied` | bool | pattern_lock 是否执行 |
+| `print_fidelity` | float | 印花保真分 0-1(贴回区内 warp 参考 vs 结果的灰度 NCC; 纯色款=1.0) |
+| `delivery_tier` | str | 交付档位: `auto` 直接放行 / `review` 人工确认后推店 |
 
 ## References
 

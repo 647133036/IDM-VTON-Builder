@@ -254,3 +254,93 @@ def test_score_for_sku_pattern():
     score, tier = quality_gate.score_for_sku(ref, out, sku_has_text=False)
     assert score > 0.9
     assert tier == "auto"
+
+
+# ---------- detect_print_roi ----------
+
+
+def _print_garment(size=(64, 64)):
+    """灰底 + 中央白块印花(24x24)的衣片参考图, mask 盖住中央半区."""
+    w, h = size
+    arr = np.full((h, w), 128, dtype=np.uint8)
+    y0, x0 = h // 2 - 12, w // 2 - 12
+    arr[y0 : y0 + 24, x0 : x0 + 24] = 230
+    cloth = Image.fromarray(arr, "L").convert("RGB")
+    mask_arr = np.zeros((h, w), dtype=np.uint8)
+    mask_arr[h // 4 : h * 3 // 4, w // 4 : w * 3 // 4] = 255
+    return cloth, Image.fromarray(mask_arr, "L")
+
+
+def test_detect_print_roi_returns_edge_band():
+    cloth, mask = _print_garment()
+    band = preserve_refit.detect_print_roi(cloth, mask)
+    assert band is not None
+    assert band.dtype == np.uint8
+    assert (band == 255).any()
+    w, h = cloth.size
+    y0 = h // 2 - 12
+    # 印花块边缘附近应有边界带
+    assert band[y0 + 1, w // 2] == 255 or band[y0 - 1, w // 2] == 255
+    # 印花块深部(块中心, 距边界 12px)不进 inpaint
+    assert band[h // 2, w // 2] == 0
+
+
+def test_detect_print_roi_solid_color_returns_none():
+    cloth = Image.new("RGB", (64, 64), (128, 128, 128))
+    mask = Image.new("L", (64, 64), 255)
+    assert preserve_refit.detect_print_roi(cloth, mask) is None
+
+
+def test_detect_print_roi_outside_mask_ignored():
+    cloth, _mask = _print_garment()
+    # mask 只盖住左上角(远离中央印花) → ROI 面积不足 → None
+    small_mask_arr = np.zeros((64, 64), dtype=np.uint8)
+    small_mask_arr[0:16, 0:16] = 255
+    small_mask = Image.fromarray(small_mask_arr, "L")
+    assert preserve_refit.detect_print_roi(cloth, small_mask) is None
+
+
+# ---------- print_fidelity_score ----------
+
+
+def _board_arr(size=(64, 64), cell=4, a=30, b=210):
+    w, h = size
+    ys, xs = np.mgrid[0:h, 0:w]
+    board = np.where(((ys // cell) + (xs // cell)) % 2 == 0, a, b).astype(np.uint8)
+    return np.stack([board] * 3, axis=-1)
+
+
+def test_print_fidelity_score_identical_pattern():
+    arr = _board_arr()
+    res = Image.fromarray(arr, "RGB")
+    mask = Image.new("L", (64, 64), 255)
+    assert quality_gate.print_fidelity_score(res, res, mask) > 0.99
+
+
+def test_print_fidelity_score_solid_pair_returns_one():
+    res = Image.new("RGB", (64, 64), (200, 30, 30))
+    ref = Image.new("RGB", (64, 64), (40, 40, 180))
+    mask = Image.new("L", (64, 64), 255)
+    assert quality_gate.print_fidelity_score(res, ref, mask) == 1.0
+
+
+def test_print_fidelity_score_inverted_pattern_low():
+    arr = _board_arr()
+    res = Image.fromarray(arr, "RGB")
+    ref = Image.fromarray(255 - arr, "RGB")
+    mask = Image.new("L", (64, 64), 255)
+    assert quality_gate.print_fidelity_score(res, ref, mask) < 0.2
+
+
+def test_print_fidelity_score_empty_mask_returns_zero():
+    res = Image.new("RGB", (64, 64), (200, 30, 30))
+    mask = Image.new("L", (64, 64), 0)
+    assert quality_gate.print_fidelity_score(res, res, mask) == 0.0
+
+
+def test_print_fidelity_score_size_mismatch_resizes_ref():
+    small = Image.fromarray(_board_arr((64, 64), cell=4), "RGB")
+    big = Image.fromarray(_board_arr((128, 128), cell=8), "RGB")
+    mask = Image.new("L", (128, 128), 255)
+    # 缩放后棋盘相位一致 → 高分
+    assert quality_gate.print_fidelity_score(big, small, mask) > 0.9

@@ -1995,6 +1995,49 @@ def test_sdxl_inpaint_repair_no_model_returns_unchanged(monkeypatch):
     assert np.array_equal(np.array(out), np.array(img))
 
 
+def test_sdxl_inpaint_repair_print_gate_alone_enables(monkeypatch):
+    """VTON_PRINT_INPAINT=1 单独开启也进修复路径(走到 mask 构建后因无模型返回)。"""
+    import platform_presets
+
+    monkeypatch.delenv("VTON_INPAINT_REPAIR", raising=False)
+    monkeypatch.setenv("VTON_PRINT_INPAINT", "1")
+    img = Image.fromarray(np.full((50, 50, 3), 128, dtype=np.uint8), "RGB")
+    mask = np.full((50, 50), 255, dtype=np.uint8)
+
+    called = {}
+
+    def _spy(image, mask_u8, original=None, grow_px=8, anomaly_thresh=30, print_roi=None):
+        called["print_roi"] = print_roi
+        return np.zeros((50, 50), dtype=np.uint8)
+
+    monkeypatch.setattr(platform_presets, "_build_inpaint_mask", _spy)
+    out = _sdxl_inpaint_repair(img, mask, print_roi=np.full((50, 50), 255, dtype=np.uint8))
+    # 门通过 → _build_inpaint_mask 被调用且 print_roi 透传; 空 mask → 原样返回
+    assert called["print_roi"] is not None
+    assert np.array_equal(np.array(out), np.array(img))
+
+
+def test_sdxl_inpaint_repair_gate_off_skips_mask_build(monkeypatch):
+    """两个 env 都未开启时不进修复路径(_build_inpaint_mask 不被调用)。"""
+    import platform_presets
+
+    monkeypatch.delenv("VTON_INPAINT_REPAIR", raising=False)
+    monkeypatch.delenv("VTON_PRINT_INPAINT", raising=False)
+    img = Image.fromarray(np.full((50, 50, 3), 128, dtype=np.uint8), "RGB")
+    mask = np.full((50, 50), 255, dtype=np.uint8)
+
+    called = {"n": 0}
+
+    def _spy(*args, **kwargs):
+        called["n"] += 1
+        return np.zeros((50, 50), dtype=np.uint8)
+
+    monkeypatch.setattr(platform_presets, "_build_inpaint_mask", _spy)
+    out = _sdxl_inpaint_repair(img, mask)
+    assert called["n"] == 0
+    assert np.array_equal(np.array(out), np.array(img))
+
+
 def test_build_inpaint_mask_seam_band_only():
     """无 original 时只提取接缝带,内部区域为 0。"""
     mask = np.zeros((60, 60), dtype=np.uint8)
@@ -2032,6 +2075,31 @@ def test_build_inpaint_mask_smaller_than_full():
     img = Image.fromarray(np.full((100, 100, 3), 128, dtype=np.uint8), "RGB")
     focused = _build_inpaint_mask(img, mask, original=None)
     assert focused.sum() < mask.sum()
+
+
+def test_build_inpaint_mask_unions_print_roi():
+    """print_roi(印花边界带)应并入 focused mask, 即使远离接缝带。"""
+    mask = np.zeros((60, 60), dtype=np.uint8)
+    mask[10:50, 10:30] = 255  # 接缝带在 x≈10..30 的边界
+    img = Image.fromarray(np.full((60, 60, 3), 128, dtype=np.uint8), "RGB")
+    # 印花 ROI 边界带放在右下角(远离接缝带)
+    print_roi = np.zeros((60, 60), dtype=np.uint8)
+    print_roi[40:50, 40:55] = 255
+    focused = _build_inpaint_mask(img, mask, original=None, print_roi=print_roi)
+    assert (focused[40:50, 40:55] == 255).all()
+    # 印花 ROI 内部中心也进 inpaint(边界带本身就是 ROI)
+    assert focused[45, 47] == 255
+
+
+def test_build_inpaint_mask_print_roi_resized_if_mismatch():
+    """print_roi 尺寸与图像不一致时自动 resize 后并入。"""
+    mask = np.zeros((60, 60), dtype=np.uint8)
+    mask[10:50, 10:50] = 255
+    img = Image.fromarray(np.full((60, 60, 3), 128, dtype=np.uint8), "RGB")
+    print_roi = np.full((30, 30), 255, dtype=np.uint8)
+    focused = _build_inpaint_mask(img, mask, original=None, print_roi=print_roi)
+    # resize 后整图有 ROI 值, 且仍小于整帧
+    assert (focused == 255).any()
 
 
 # ---------------------------------------------------------------------------

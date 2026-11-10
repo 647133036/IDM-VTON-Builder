@@ -117,3 +117,47 @@ def score_for_sku(ref_roi: Image.Image, out_roi: Image.Image, sku_has_text: bool
     score = ocr_score(ref_roi, out_roi) if sku_has_text else ssim_score(ref_roi, out_roi)
     tier = delivery_tier(score, sku_has_text)
     return score, tier
+
+
+def print_fidelity_score(
+    result: Image.Image,
+    cloth_ref: Image.Image,
+    apply_mask: Image.Image,
+) -> float:
+    """印花保真分: 贴回区内 warp 参考与结果的灰度相关, 返回 0-1。
+
+    pattern_lock 生效时贴回区像素 ≈ warp 参考, 分数高(auto 档);
+    花纹/字母被重画或错位时分数低(review 档)。纯色款(双方都近平
+    纯色)无印花可保, 满分。多 seed 排序用同一分数, 跨 seed 可比。
+
+    灰度 NCC(归一化互相关)映射到 [0,1]: 无 skimage 依赖, CPU 纯 numpy。
+    """
+    res = result.convert("RGB")
+    ref = cloth_ref.convert("RGB")
+    if ref.size != res.size:
+        ref = ref.resize(res.size, Image.Resampling.LANCZOS)
+    r = np.asarray(res, dtype=np.float32)
+    c = np.asarray(ref, dtype=np.float32)
+    m = np.asarray(apply_mask)
+    if m.ndim == 3:
+        m = m[..., 0]
+    if m.shape[:2] != r.shape[:2]:
+        m = np.array(Image.fromarray(m.astype(np.uint8)).resize((r.shape[1], r.shape[0]), Image.Resampling.BILINEAR))
+    zone = m > 127
+    if not zone.any():
+        return 0.0
+
+    # 收缩到 mask bbox 提速
+    ys, xs = np.where(zone)
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()) + 1, int(xs.min()), int(xs.max()) + 1
+    gr = r[y0:y1, x0:x1, :3].mean(axis=2)[zone[y0:y1, x0:x1]]
+    gc = c[y0:y1, x0:x1, :3].mean(axis=2)[zone[y0:y1, x0:x1]]
+
+    # 纯色款: 双方灰度都近平常数 → 无印花可保, 满分
+    if float(gr.std()) < 6.0 and float(gc.std()) < 6.0:
+        return 1.0
+
+    gr_n = (gr - gr.mean()) / (gr.std() + 1e-6)
+    gc_n = (gc - gc.mean()) / (gc.std() + 1e-6)
+    ncc = float((gr_n * gc_n).mean())
+    return max(0.0, min(1.0, (ncc + 1.0) / 2.0))

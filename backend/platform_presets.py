@@ -276,13 +276,18 @@ def _build_inpaint_mask(
     original: Image.Image | None = None,
     grow_px: int = 8,
     anomaly_thresh: int = 30,
+    print_roi: np.ndarray | None = None,
 ) -> np.ndarray:
-    """构建聚焦 inpaint 遮罩:接缝带 + 肤色异常区。
+    """构建聚焦 inpaint 遮罩:接缝带 + 肤色异常区 + 印花 ROI 边界带。
 
     不再用整张 shared_mask(会重画整个衣服区),改为只针对真正有问题的区域:
     1. 接缝带:mask 边界 dilate-erode 带(同 _seam_repair)
     2. 肤色异常区:result 中皮肤像素与 original 对应像素 L1 距离 > thresh,
        排除脸区(前景顶部 18%)
+    3. 印花 ROI 边界带(VTON_PRINT_INPAINT=1 时由 detect_print_roi 提供):
+       确定性贴印区(字母/图案内部)不进 inpaint——内部像素由 SKU 平铺图
+       像素构成,重绘会把字母再画漂;只有贴印区与生成衣料的边界带进
+       局部 inpaint 做混合。
     """
     import cv2
 
@@ -295,6 +300,18 @@ def _build_inpaint_mask(
     dilated = cv2.dilate(mask, k)
     eroded = cv2.erode(mask, k)
     combined = ((dilated > 20) & (eroded < 20)).astype(np.uint8) * 255
+
+    if print_roi is not None:
+        pr = np.asarray(print_roi)
+        if pr.ndim == 3:
+            pr = pr[..., 0]
+        if pr.shape[:2] != combined.shape[:2]:
+            pr = np.array(
+                Image.fromarray(pr.astype(np.uint8)).resize(
+                    (combined.shape[1], combined.shape[0]), Image.Resampling.BILINEAR
+                )
+            )
+        combined = cv2.bitwise_or(combined, (pr > 20).astype(np.uint8) * 255)
 
     if original is not None:
         orig = np.array(original.convert("RGB"), dtype=np.uint8)
@@ -324,8 +341,9 @@ def _sdxl_inpaint_repair(
     strength: float = 0.35,
     device=None,
     original: Image.Image | None = None,
+    print_roi: np.ndarray | None = None,
 ) -> Image.Image:
-    """SDXL Inpainting 二次修复:低降噪强度局部重绘接缝/肤色异常区。
+    """SDXL Inpainting 二次修复:低降噪强度局部重绘接缝/肤色异常/印花边界区。
 
     需要 SDXL Inpainting 模型 (stable-diffusion-xl-1.0-inpainting-0.1)。
     用 StableDiffusionXLInpaintPipeline 对聚焦 mask 区域做低强度(0.35)重绘,
@@ -334,11 +352,15 @@ def _sdxl_inpaint_repair(
     v0.1.7 改进:
     - 遮罩从整张 shared_mask 改为接缝带 + 肤色异常区(_build_inpaint_mask),
       避免重画整个衣服区。
-    - 管线单例(_INPAINT_PIPE + _INPAINT_LOCK),不再每次调用 from_pretrained + del。
+    - 管线单例(_INPAint_PIPE + _INPAint_LOCK),不再每次调用 from_pretrained + del。
     - original 参数传入原图,用于检测肤色异常区。
 
+    印花 ROI(VTON_PRINT_INPAINT=1):
+    - print_roi 为 detect_print_roi 输出的印花边界带, 只混合贴印区与生成
+      衣料的过渡带, 字母/图案内部像素保持确定性贴印, 不重绘。
+
     启用条件:
-      1. VTON_INPAINT_REPAIR=1 环境变量开启
+      1. VTON_INPAINT_REPAIR=1 或 VTON_PRINT_INPAINT=1 环境变量开启
       2. SDXL Inpainting 模型已下载到 models/sdxl/sdxl_inpaint/
       3. torch + diffusers 可用
 
@@ -346,13 +368,15 @@ def _sdxl_inpaint_repair(
     """
     global _INPAINT_PIPE
 
-    if os.environ.get("VTON_INPAINT_REPAIR", "0") != "1":
+    _repair_on = os.environ.get("VTON_INPAINT_REPAIR", "0") == "1"
+    _print_on = os.environ.get("VTON_PRINT_INPAINT", "0") == "1"
+    if not (_repair_on or _print_on):
         return image
 
     try:
         import cv2
 
-        focused = _build_inpaint_mask(image, mask_u8, original=original)
+        focused = _build_inpaint_mask(image, mask_u8, original=original, print_roi=print_roi)
         if not focused.any():
             return image
 

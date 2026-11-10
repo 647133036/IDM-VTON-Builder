@@ -223,3 +223,22 @@ Entries discovered by the Agent during task execution should follow this format:
   - `engine_status()` 新增 `refit_engine` 字段; `engine.py` 商用分支读 `VTON_REFIT_ENGINE`。
   - 测试 `test_preserve_refit.py` 22 用例覆盖 protect_inverse_refit / tps_warp /
     optical_flow_refit / run_multiseed / quality_gate。全量回归 378 passed。
+
+[Project Knowledge Summary]
+- Date: 2026-11-10
+- Context: Discovered by Agent while implementing print-ROI inpaint + fidelity tier
+- Category: Workflow & Collaboration
+- Instructions:
+  - 印花 ROI 局部 inpaint: `VTON_PRINT_INPAINT=1` 时 `detect_print_roi(cloth_ref, apply_mask)`
+    取贴回区内高频区(印花/文字边缘)的 dilate-erode 边界带; `_sdxl_inpaint_repair`
+    门禁为 `VTON_INPAINT_REPAIR=1 OR VTON_PRINT_INPAINT=1`, 边界带并入 `_build_inpaint_mask`
+    的 `print_roi` 参数(bitwise_or)。字母/图案内部像素保持确定性贴印, 不重绘。
+  - 印花保真分: `quality_gate.print_fidelity_score(result, cloth_ref, apply_mask)` 用贴回区内
+    warp 参考 vs 结果的灰度 NCC 映射 `(ncc+1)/2`; 双方灰度 std<6(纯色款)返回 1.0。
+    engine_sdxl/engine_fashn 写入 `result.info["print_fidelity"]` + `delivery_tier`,
+    worker 落库 job 元数据; 多 seed scorer 首选 print_fidelity(跨 seed 可比)。
+  - 测试注意: Telea/dilate-erode 边界带的逐像素位置对输入敏感, 断言要用
+    "边缘附近有带"(or 组合) + "块中心无带", 不要断言精确行号。
+  - worker 多 seed 测试用 `monkeypatch.setattr(worker_mod, "compose_tryon", stub)` 替换
+    模块级导入的 compose, stub 读 `os.environ["VTON_SEED"]` 按 seed 返回不同
+    print_fidelity, 验证择优与 multiseed 元数据(含 scores dict)落库。

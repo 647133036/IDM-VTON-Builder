@@ -1630,13 +1630,39 @@ def compose_tryon_sdxl(
 
     # SDXL Inpainting 二次修复(可选):低降噪强度(0.35)局部重绘接缝/肤色
     # 异常区。需要 SDXL Inpainting 模型 + VTON_INPAINT_REPAIR=1。
-    # 未安装时原样返回(CPU 层已处理大部分问题)。
+    # VTON_PRINT_INPAINT=1 时额外并入印花 ROI 边界带: 确定性贴印区
+    # (字母/图案内部)不进 inpaint, 只有贴印区与生成衣料的边界带进
+    # 局部 inpaint 做混合。
     if lock_identity:
         try:
-            result = _sdxl_inpaint_repair(result, apply_mask, original=human_img)
+            _print_roi = None
+            if os.environ.get("VTON_PRINT_INPAINT", "0") == "1" and warp_enabled and apply_mask is not None:
+                from preserve_refit import detect_print_roi
+
+                _print_roi = detect_print_roi(cloth_ref, apply_mask)
+                if _print_roi is not None:
+                    logger.info(
+                        "print ROI edge band %.1f%% of frame; included in inpaint repair",
+                        float(_print_roi.mean()) / 255.0 * 100.0,
+                    )
+            result = _sdxl_inpaint_repair(result, apply_mask, original=human_img, print_roi=_print_roi)
         except Exception:  # noqa: BLE001
             logger.warning("_sdxl_inpaint_repair failed; using pre-inpaint result (DEGRADED)")
             degraded_reasons.append("SDXL inpaint repair failed")
+
+    # 印花保真分 + 交付档位: 贴回区内 warp 参考与结果的灰度相关。
+    # pattern_lock 生效 → 高分 auto; 花纹/字母被重画或错位 → 低分 review。
+    # 写入 result.info, 由 worker 落库 job 元数据; 多 seed 排序共用此分。
+    if apply_mask is not None and warp_enabled:
+        try:
+            from quality_gate import delivery_tier, print_fidelity_score
+
+            _pf = print_fidelity_score(result, cloth_ref, apply_mask)
+            result.info["print_fidelity"] = _pf
+            result.info["delivery_tier"] = delivery_tier(_pf, sku_has_text=False)
+            logger.info("print fidelity %.3f -> tier %s", _pf, result.info["delivery_tier"])
+        except Exception:
+            logger.exception("print fidelity scoring failed; tier not set")
 
     # 袖条生成后确定性合成: 走廊尾段(前臂)常被"∩生成主体"裁掉——SDXL 不把
     # 前臂画满 → 走廊白底被剔(c7 实测 cut_row 以下 in-apply=0), 袖条最多贴到

@@ -191,6 +191,7 @@ def compose_tryon_fashn(
     lock_on = os.environ.get("VTON_LOCK_ID", "1") != "0"
     detail_applied = False
     apply_mask = None
+    cloth_ref = None
     if (pattern_on or lock_on) and warp_enabled:
         try:
             warp_canvas = max(result.size)
@@ -236,6 +237,18 @@ def compose_tryon_fashn(
         except Exception:
             logger.exception("FASHN protect_inverse_refit failed; keeping FASHN pixels")
             degraded_reasons.append("FASHN protect_inverse_refit failed")
+
+    # 印花保真分 + 交付档位: 贴回区内 warp 参考与结果的灰度相关。
+    # pattern_lock 生效 → 高分 auto; 花纹/字母被重画或错位 → 低分 review。
+    if apply_mask is not None and cloth_ref is not None:
+        try:
+            from quality_gate import delivery_tier, print_fidelity_score
+
+            _pf = print_fidelity_score(result, cloth_ref, apply_mask)
+            result.info["print_fidelity"] = _pf
+            result.info["delivery_tier"] = delivery_tier(_pf, sku_has_text=False)
+        except Exception:
+            logger.exception("FASHN print fidelity scoring failed; tier not set")
 
     if background == "transparent":
         result = _remove_background(result)

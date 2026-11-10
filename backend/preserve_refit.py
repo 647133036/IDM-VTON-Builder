@@ -191,6 +191,62 @@ def _rbf_kernel_batch(pts: np.ndarray, center: np.ndarray) -> np.ndarray:
     return out
 
 
+def detect_print_roi(
+    cloth_ref: Image.Image,
+    apply_mask: Image.Image,
+    edge_px: int = 4,
+    hf_thresh: float = 12.0,
+    min_area_frac: float = 0.002,
+) -> np.ndarray | None:
+    """印花 ROI 边界带: warp 参考图在贴回区内的高频区(logo/字母/大图案)的边缘带。
+
+    高频 = |灰度 - 高斯模糊| 超阈值的区域(印花/文字/缝合线), 收缩到贴回
+    mask 内, 形态学去噪后取 dilate-erode 边界带。字母/图案内部像素由
+    确定性贴印(pattern_lock/TPS)构成, 不进 inpaint——只有贴印区与生成
+    衣料的边界带进局部 inpaint 做混合。
+
+    Args:
+        cloth_ref: warp 后的 SKU 平铺参考图 (RGB/RGBA)
+        apply_mask: 贴回区域掩膜 (L, 255=重绘)
+        edge_px: 边界带半宽(px)
+        hf_thresh: 高频能量阈值(0-255 灰度差)
+        min_area_frac: ROI 面积占比下限, 低于此返回 None(纯色款无印花)
+
+    Returns:
+        uint8 边界带掩膜(255=进 inpaint), 纯色/失败返回 None
+    """
+    try:
+        import cv2
+
+        ref = np.asarray(cloth_ref.convert("L"), dtype=np.float32)
+        mask = np.asarray(apply_mask)
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        if mask.shape[:2] != ref.shape[:2]:
+            mask = np.array(
+                Image.fromarray(mask.astype(np.uint8)).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
+            )
+
+        blur = cv2.GaussianBlur(ref, (0, 0), 4.0)
+        hf = np.abs(ref - blur)
+        roi = ((hf > hf_thresh) & (mask > 127)).astype(np.uint8) * 255
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        roi = cv2.morphologyEx(roi, cv2.MORPH_OPEN, k)
+        roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k)
+
+        if float(roi.mean()) / 255.0 < min_area_frac:
+            return None
+
+        ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (edge_px * 2 + 1, edge_px * 2 + 1))
+        dil = cv2.dilate(roi, ke)
+        ero = cv2.erode(roi, ke)
+        band = cv2.subtract(dil, ero)
+        return band
+    except Exception:
+        logger.exception("detect_print_roi failed")
+        return None
+
+
 def optical_flow_refit(
     refit_img: Image.Image,
     gen_img: Image.Image,
