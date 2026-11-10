@@ -124,3 +124,70 @@ def test_compose_tryon_fashn_calls_segmentation_free(monkeypatch, tmp_path):
     assert out.info["engine"] == "fashn-vton"
     assert out.info["fashn_category"] == "one-pieces"
     assert max(out.size) == 64
+
+
+def test_compose_tryon_fashn_fidelity_survives_bg_and_resize(monkeypatch, tmp_path):
+    """GPU 冒烟实测: 白底转换/缩放替换 Image 后 .info 丢失, print_fidelity 变 null。
+
+    保真分在内容阶段计算, 但必须写入尾段元数据块(背景/缩放之后)才能落库。
+    """
+    import engine_fashn
+    import engine_sdxl
+    import numpy as np
+    import platform_presets
+    import preserve_refit
+    import prewhiten as prewhiten_mod
+    from PIL import Image as PILImage
+
+    class FakePipeline:
+        def __init__(self, weights_dir):
+            pass
+
+        def __call__(self, **kwargs):
+            return types.SimpleNamespace(images=[PILImage.new("RGB", (32, 32), (9, 9, 9))])
+
+    fake_mod = types.ModuleType("fashn_vton")
+    fake_mod.TryOnPipeline = FakePipeline
+    monkeypatch.setitem(sys.modules, "fashn_vton", fake_mod)
+    monkeypatch.setattr(engine_fashn, "FASHN_DIR", tmp_path)
+    monkeypatch.setattr(engine_fashn, "_fashn_state", {"pipe": None})
+    monkeypatch.setenv("VTON_PATTERN_LOCK", "1")
+    monkeypatch.setenv("VTON_WARP", "1")
+    monkeypatch.setenv("VTON_PROTECT_FEATHER", "4")
+
+    ref = PILImage.new("RGBA", (32, 32), (200, 10, 10, 255))
+    alpha = PILImage.new("L", (32, 32), 255)
+    monkeypatch.setattr(prewhiten_mod, "prewhiten_input", lambda img: (img, {"status": "already_white"}))
+    monkeypatch.setattr(engine_sdxl, "crop_garment_to_content", lambda img: img)
+    monkeypatch.setattr(engine_sdxl, "infer_auto_garment_type", lambda ext: "dress")
+    monkeypatch.setattr(engine_sdxl, "align_garment_to_pose", lambda *a, **k: (ref, alpha))
+    monkeypatch.setattr(engine_sdxl, "intersect_mask_with_garment_alpha", lambda m, a: (m, 1))
+    monkeypatch.setattr(platform_presets, "detect_garment_extent", lambda img: None)
+    monkeypatch.setattr(
+        platform_presets,
+        "foreground_mask",
+        lambda img: np.full((img.size[1], img.size[0]), 255, dtype=np.uint8),
+    )
+    monkeypatch.setattr(
+        platform_presets,
+        "clothing_mask",
+        lambda result, **k: np.full((result.size[1], result.size[0]), 255, dtype=np.uint8),
+    )
+    monkeypatch.setattr(platform_presets, "limit_mask_to_subject", lambda m, s: m)
+    monkeypatch.setattr(platform_presets, "reapply_garment_detail", lambda result, ref, mask, **k: result)
+    monkeypatch.setattr(platform_presets, "force_white_background", lambda result, subject_mask=None: result)
+    monkeypatch.setattr(preserve_refit, "protect_inverse_refit", lambda r, b, m, feather_px=4: r)
+
+    person = tmp_path / "p.png"
+    garment = tmp_path / "g.png"
+    PILImage.new("RGB", (40, 60), (10, 20, 30)).save(person)
+    PILImage.new("RGB", (40, 60), (200, 10, 10)).save(garment)
+
+    out = engine_fashn.compose_tryon_fashn(person, garment, "women", "dress", 48, "white", "western_europe")
+    assert out.info["engine"] == "fashn-vton"
+    assert out.info["detail_applied"] is True
+    # long_side=48 强制缩放(32->48), 白底路径换新 Image; 保真分必须仍在
+    assert max(out.size) == 48
+    assert "print_fidelity" in out.info, "fidelity lost across background/resize transforms"
+    assert out.info["print_fidelity"] == 1.0
+    assert out.info["delivery_tier"] == "auto"

@@ -1653,14 +1653,17 @@ def compose_tryon_sdxl(
     # 印花保真分 + 交付档位: 贴回区内 warp 参考与结果的灰度相关。
     # pattern_lock 生效 → 高分 auto; 花纹/字母被重画或错位 → 低分 review。
     # 写入 result.info, 由 worker 落库 job 元数据; 多 seed 排序共用此分。
+    # 只算不写: 后续袖条/背景/缩放会替换 Image 对象丢掉 .info, 元数据统一
+    # 在尾部元数据块写入, 否则 print_fidelity 会变 null。
+    _pf_val = None
+    _tier_val = None
     if apply_mask is not None and warp_enabled:
         try:
             from quality_gate import delivery_tier, print_fidelity_score
 
-            _pf = print_fidelity_score(result, cloth_ref, apply_mask)
-            result.info["print_fidelity"] = _pf
-            result.info["delivery_tier"] = delivery_tier(_pf, sku_has_text=False)
-            logger.info("print fidelity %.3f -> tier %s", _pf, result.info["delivery_tier"])
+            _pf_val = print_fidelity_score(result, cloth_ref, apply_mask)
+            _tier_val = delivery_tier(_pf_val, sku_has_text=False)
+            logger.info("print fidelity %.3f -> tier %s", _pf_val, _tier_val)
         except Exception:
             logger.exception("print fidelity scoring failed; tier not set")
 
@@ -1724,6 +1727,10 @@ def compose_tryon_sdxl(
     result.info["lock_identity"] = lock_identity
     result.info["detail_applied"] = detail_applied
     result.info["prewhiten"] = {"base": pw_base, "garment": pw_garment}
+    if _pf_val is not None:
+        result.info["print_fidelity"] = _pf_val
+    if _tier_val is not None:
+        result.info["delivery_tier"] = _tier_val
     # 出图后清空 CUDA 缓存:VAE 解码的 fp32 中间张量会留下大块显存碎片,
     # 不清会在下一任务/下一解码时放大峰值,触发 cgroup OOM。
     if device.type == "cuda":

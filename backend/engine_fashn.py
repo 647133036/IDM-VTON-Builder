@@ -280,13 +280,16 @@ def compose_tryon_fashn(
 
     # 印花保真分 + 交付档位: 贴回区内 warp 参考与结果的灰度相关。
     # pattern_lock 生效 → 高分 auto; 花纹/字母被重画或错位 → 低分 review。
+    # 只算不写: 后续背景/缩放会替换 Image 对象丢掉 .info, 元数据统一在
+    # 尾部元数据块写入(与 engine.py 同序), 否则 print_fidelity 会变 null。
+    _pf_val = None
+    _tier_val = None
     if apply_mask is not None and cloth_ref is not None:
         try:
             from quality_gate import delivery_tier, print_fidelity_score
 
-            _pf = print_fidelity_score(result, cloth_ref, apply_mask)
-            result.info["print_fidelity"] = _pf
-            result.info["delivery_tier"] = delivery_tier(_pf, sku_has_text=False)
+            _pf_val = print_fidelity_score(result, cloth_ref, apply_mask)
+            _tier_val = delivery_tier(_pf_val, sku_has_text=False)
         except Exception:
             logger.exception("FASHN print fidelity scoring failed; tier not set")
 
@@ -315,4 +318,8 @@ def compose_tryon_fashn(
     result.info["lock_identity"] = lock_on and apply_mask is not None
     result.info["fashn_category"] = category
     result.info["prewhiten"] = {"base": pw_base, "garment": pw_garment}
+    if _pf_val is not None:
+        result.info["print_fidelity"] = _pf_val
+    if _tier_val is not None:
+        result.info["delivery_tier"] = _tier_val
     return result
