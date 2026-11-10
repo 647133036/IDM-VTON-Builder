@@ -213,24 +213,37 @@ if want fashn; then
 fi
 
 # ── SDXL Inpaint(可选兜底;缺时全图 ControlNet + degraded 标记) ────────────
+# 注意: 官方 stabilityai/stable-diffusion-xl-inpainting 仓库不存在,
+# 用 diffusers 社区微调版 stable-diffusion-xl-1.0-inpainting-0.1,
+# 只拉 fp16 变体(约 6G, 引擎 _sdxl_inpaint_repair 以 variant=fp16 加载)。
 if want sdxl_inpaint; then
-    echo "==> sdxl_inpaint (stabilityai/stable-diffusion-xl-inpainting)"
+    echo "==> sdxl_inpaint (diffusers/stable-diffusion-xl-1.0-inpainting-0.1, fp16)"
     if have "${SDXL_DIR}/sdxl_inpaint/model_index.json"; then
         echo "    已存在, 跳过"
     else
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
             "model_index.json" "${SDXL_DIR}/sdxl_inpaint"
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
-            "unet/*" "${SDXL_DIR}/sdxl_inpaint"
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
-            "vae/*" "${SDXL_DIR}/sdxl_inpaint"
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
-            "text_encoder/*" "${SDXL_DIR}/sdxl_inpaint"
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
-            "text_encoder_2/*" "${SDXL_DIR}/sdxl_inpaint"
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "scheduler/*" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "unet/config.json" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "unet/diffusion_pytorch_model.fp16.safetensors" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "vae/config.json" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "vae/diffusion_pytorch_model.fp16.safetensors" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "text_encoder/config.json" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "text_encoder/model.fp16.safetensors" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "text_encoder_2/config.json" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
+            "text_encoder_2/model.fp16.safetensors" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
             "tokenizer/*" "${SDXL_DIR}/sdxl_inpaint"
-        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+        hf_dl "diffusers/stable-diffusion-xl-1.0-inpainting-0.1" \
             "tokenizer_2/*" "${SDXL_DIR}/sdxl_inpaint"
     fi
 fi

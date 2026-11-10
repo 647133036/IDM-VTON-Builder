@@ -389,10 +389,14 @@ def _sdxl_inpaint_repair(
             if _INPAINT_PIPE is None:
                 import torch
                 from diffusers import StableDiffusionXLInpaintPipeline
+                from engine_sdxl import _pipeline_fp16_variant_kwargs
 
                 dtype = torch.float16 if torch.cuda.is_available() else torch.float32
                 _INPAINT_PIPE = StableDiffusionXLInpaintPipeline.from_pretrained(
-                    str(inpaint_dir), torch_dtype=dtype, local_files_only=True
+                    str(inpaint_dir),
+                    torch_dtype=dtype,
+                    local_files_only=True,
+                    **_pipeline_fp16_variant_kwargs(inpaint_dir),
                 )
                 if torch.cuda.is_available():
                     _INPAINT_PIPE.enable_model_cpu_offload()
