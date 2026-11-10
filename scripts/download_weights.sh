@@ -45,11 +45,16 @@ echo "    目标目录: ${MODELS_DIR}"
 echo "    HF_ENDPOINT: ${HF_ENDPOINT}"
 echo ""
 
-if ! command -v huggingface-cli &>/dev/null; then
-    echo "未找到 huggingface-cli。**不自动 pip install**(不拖动依赖);请先单独安装:"
+if command -v hf &>/dev/null; then
+    HF_BIN="hf"
+elif command -v huggingface-cli &>/dev/null; then
+    HF_BIN="huggingface-cli"
+else
+    echo "未找到 hf / huggingface-cli。**不自动 pip install**(不拖动依赖);请先单独安装:"
     echo "  pip install -i https://mirrors.aliyun.com/pypi/simple/ \"huggingface_hub\""
     exit 1
 fi
+echo "    下载器: ${HF_BIN}"
 
 # ── 工具函数 ────────────────────────────────────────────────────────────────
 want() {  # want <组名>  —— 配合 ONLY 过滤
@@ -59,11 +64,11 @@ want() {  # want <组名>  —— 配合 ONLY 过滤
 hf_dl() {  # hf_dl <repo> <include-glob> <dest-dir>
     local repo="$1" inc="$2" dest="$3"
     if [ "${DRY_RUN:-0}" = "1" ]; then
-        echo "    [DRY_RUN] huggingface-cli download ${repo} --include \"${inc}\" --local-dir ${dest}"
+        echo "    [DRY_RUN] ${HF_BIN} download ${repo} --include \"${inc}\" --local-dir ${dest}"
         return 0
     fi
     mkdir -p "${dest}"
-    huggingface-cli download "${repo}" --include "${inc}" --local-dir "${dest}"
+    "${HF_BIN}" download "${repo}" --include "${inc}" --local-dir "${dest}"
 }
 # 权重已存在则跳过(幂等, 断点续跑友好)。
 have() { [ -e "$1" ]; }
