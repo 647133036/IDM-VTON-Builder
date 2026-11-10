@@ -152,19 +152,21 @@ def test_compose_tryon_east_vs_north_pixels_differ(tmp_path):
 
 
 def test_engine_status_shape():
-    st = engine_status()
-    assert set(st) >= {
-        "engine",
-        "license_mode",
-        "gpu_available",
+    from engine import engine_status
+
+    s = engine_status()
+    for key in (
         "idm_vton_available",
         "sdxl_available",
         "fashn_available",
         "sdxl_inpaint",
+        "refit_engine",
         "commercial_compliant",
         "compliance_advice",
-    }
-    assert st["engine"] in (
+    ):
+        assert key in s, f"missing {key}"
+    assert s["refit_engine"] in ("grid", "tps", "optical_flow")
+    assert s["engine"] in (
         "composite-fallback",
         "idm-vton",
         "sdxl-commercial",

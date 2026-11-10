@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 import traceback
@@ -62,7 +63,49 @@ def process_job(job: dict, bases: list[dict]) -> None:
     )
     patch_job(job["id"], {"progress": 35, "message": f"Calling {engine_label}"})
     ethnicity = base.get("ethnicity") or ""
-    result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
+    # 多 seed 出图: 印花/文字款 VTON_MULTI_SEED=3(默认), 纯色 =1。
+    # 每个 seed 跑一次 compose_tryon, 按质检分排序取最高。
+    # VTON_MULTI_SEED=0 强制单 seed; VTON_MULTI_SEED=1 也是单 seed。
+    n_seeds = max(1, int(os.environ.get("VTON_MULTI_SEED", "3")))
+    if n_seeds == 1:
+        result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
+    else:
+        from preserve_refit import refit_seeds_default, run_multiseed
+        from quality_gate import score_for_sku
+
+        seeds = refit_seeds_default()[:n_seeds]
+        # 纯色款单 seed 控成本: job 未显式标 has_print=False 时按印花处理
+        has_print = job.get("has_print", True)
+        if not has_print:
+            seeds = seeds[:1]
+
+        def _task(seed):
+            os.environ["VTON_SEED"] = str(seed)
+            try:
+                return compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
+            finally:
+                os.environ.pop("VTON_SEED", None)
+
+        def _scorer(img, seed):
+            # 简化: 图案/纯色用 SSIM(全图中间 60% ROI); 文字类走 OCR(此处回退 SSIM)
+            try:
+                from PIL import Image
+
+                ref_arr = Image.open(src).convert("RGB")
+                out_arr = img.convert("RGB")
+                if out_arr.size != ref_arr.size:
+                    out_arr = out_arr.resize(ref_arr.size)
+                h, w = ref_arr.size[1], ref_arr.size[0]
+                box = (int(w * 0.2), int(h * 0.2), int(w * 0.8), int(h * 0.8))
+                score, _tier = score_for_sku(ref_arr.crop(box), out_arr.crop(box), sku_has_text=False)
+                return score
+            except Exception:  # noqa: BLE001
+                return 0.0
+
+        result, _all_scores, _chosen = run_multiseed(_task, seeds, _scorer)
+        result.info["multiseed"] = {"n_seeds": n_seeds, "seeds": seeds, "chosen_seed": _chosen}
+        if len(seeds) > 1:
+            patch_job(job["id"], {"message": f"Multi-seed ({n_seeds}) done, chosen seed={_chosen}"})
     engine_used = result.info.get("engine") or engine_info["engine"]
     degraded = bool(result.info.get("engine_degraded", False))
     degraded_reason = result.info.get("degraded_reason") or ""
@@ -76,6 +119,8 @@ def process_job(job: dict, bases: list[dict]) -> None:
             "degraded_reason": degraded_reason,
         },
     )
+    if "multiseed" in result.info:
+        patch_job(job["id"], {"multiseed": result.info["multiseed"]})
 
     ext = "png" if job.get("output_format") == "png" or background == "transparent" else "jpg"
     out_path = RESULTS / f"{job['id']}.{ext}"

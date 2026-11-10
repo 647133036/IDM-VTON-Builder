@@ -141,6 +141,7 @@ def compose_tryon_fashn(
         limit_mask_to_subject,
         reapply_garment_detail,
     )
+    from preserve_refit import protect_inverse_refit
     from prewhiten import prewhiten_input
 
     base_img = Image.open(base_path).convert("RGB")
@@ -187,8 +188,10 @@ def compose_tryon_fashn(
     degraded_reasons: list[str] = []
     warp_enabled = os.environ.get("VTON_WARP", "1") != "0"
     pattern_on = os.environ.get("VTON_PATTERN_LOCK", "1") != "0"
+    lock_on = os.environ.get("VTON_LOCK_ID", "1") != "0"
     detail_applied = False
-    if pattern_on and warp_enabled:
+    apply_mask = None
+    if (pattern_on or lock_on) and warp_enabled:
         try:
             warp_canvas = max(result.size)
             cloth_ref, cloth_ref_alpha = align_garment_to_pose(
@@ -211,7 +214,7 @@ def compose_tryon_fashn(
             )
             apply_mask = limit_mask_to_subject(shared, subj) if shared is not None else None
             apply_mask, _kept = intersect_mask_with_garment_alpha(apply_mask, cloth_ref_alpha)
-            if apply_mask is not None:
+            if pattern_on and apply_mask is not None:
                 result = reapply_garment_detail(
                     result,
                     cloth_ref,
@@ -221,8 +224,18 @@ def compose_tryon_fashn(
                 )
                 detail_applied = True
         except Exception:
-            logger.exception("FASHN pattern_lock failed; keeping FASHN pixels")
-            degraded_reasons.append("FASHN pattern_lock failed")
+            logger.exception("FASHN pattern_lock/lock failed; keeping FASHN pixels")
+            degraded_reasons.append("FASHN pattern_lock/lock failed")
+
+    # 保护贴回: 遮罩外(人脸/发丝/手/露肤手臂/背景)贴回源图像素,
+    # 遮罩内保留 FASHN 像素 + 贴印。手臂不会变白、胸口不会变白、发丝不会糊。
+    if lock_on and apply_mask is not None:
+        try:
+            _feather = int(os.environ.get("VTON_PROTECT_FEATHER", "4"))
+            result = protect_inverse_refit(result, base_img, apply_mask, feather_px=_feather)
+        except Exception:
+            logger.exception("FASHN protect_inverse_refit failed; keeping FASHN pixels")
+            degraded_reasons.append("FASHN protect_inverse_refit failed")
 
     if background == "transparent":
         result = _remove_background(result)
@@ -246,6 +259,7 @@ def compose_tryon_fashn(
     result.info["engine_degraded"] = bool(degraded_reason)
     result.info["degraded_reason"] = degraded_reason
     result.info["detail_applied"] = detail_applied
+    result.info["lock_identity"] = lock_on and apply_mask is not None
     result.info["fashn_category"] = category
     result.info["prewhiten"] = {"base": pw_base, "garment": pw_garment}
     return result

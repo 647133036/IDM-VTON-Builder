@@ -203,3 +203,23 @@ Entries discovered by the Agent during task execution should follow this format:
     零张量 stub; `_patch_loaded_pipeline` 同步替换已加载的 `fashn_vton.pipeline` 中
     `FashnHumanParser` 与 `CATEGORY_TO_BODY_COVERAGE` 引用, 确保 NVIDIA SegFormer 权重
     永不下载。测试 `test_engine_fashn.py` 验证 stub 标志 `_atelier_commercial_stub=True`。
+
+[Project Knowledge Summary]
+- Date: 2026-11-10
+- Context: Discovered by Agent while implementing print-preservation refit pipeline
+- Category: Workflow & Collaboration
+- Instructions:
+  - 商用主路径保护贴回: `protect_inverse_refit(result, source, apply_mask, feather_px)` 替代
+    旧 `blend_tryon` + `_seam_repair` 两步。遮罩外贴源图, 遮罩内保留生成像素,
+    边界带用 cv2.inpaint TELEA 平滑。`VTON_PROTECT_FEATHER`(默认 4) 控制边界带宽度。
+  - 确定性贴印升级: `VTON_REFIT_ENGINE` 选 `grid`(默认)/`tps`/`optical_flow`。
+    `tps_warp` 用 RBF thin-plate-spline 把 SKU 平铺图投到人体;
+    `optical_flow_refit` 在 TPS 结果上叠加 Farneback 光流微移(×0.5 保守系数)。
+    贴印在 `reapply_garment_detail`(pattern_lock) 之前执行, 让 pattern_lock 用更准的贴印像素。
+  - 多 seed 排序: `VTON_MULTI_SEED`(默认 3, 纯色=1)。`worker.py` 调 `run_multiseed`,
+    按 `quality_gate.score_for_sku`(SSIM/OCR) 排序取最高, 写 `job.multiseed` 元数据。
+  - 质检分档: `quality_gate.delivery_tier` 按 `VTON_QG_SSIM`(0.70) / `VTON_QG_OCR`(0.80)
+    分 `auto`/`review`。scikit-image 不可用时 `ssim_score` 回退到 numpy 灰度均值/方差 SSIM。
+  - `engine_status()` 新增 `refit_engine` 字段; `engine.py` 商用分支读 `VTON_REFIT_ENGINE`。
+  - 测试 `test_preserve_refit.py` 22 用例覆盖 protect_inverse_refit / tps_warp /
+    optical_flow_refit / run_multiseed / quality_gate。全量回归 378 passed。

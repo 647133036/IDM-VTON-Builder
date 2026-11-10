@@ -13,8 +13,6 @@ from platform_presets import (
     _correct_skin_tone,
     _detect_pose_keypoints,
     _sdxl_inpaint_repair,
-    _seam_repair,
-    blend_tryon,
     clothing_mask,
     detect_garment_extent,
     force_white_background,
@@ -801,6 +799,65 @@ def _mask_to_pil(mask, size: tuple[int, int]) -> Image.Image:
     return im
 
 
+def _collect_refit_anchors(
+    garment_img: Image.Image,
+    cloth_ref: Image.Image,
+    human_img: Image.Image,
+    garment_extent: dict | None,
+    pose: dict | None,
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """收集贴印锚点: 平铺图(领口/肩/下摆) -> 人体(肩/髋/膝)。
+
+    返回 (src_pts, dst_pts)。任一侧缺失返回 ([], []) 让调用方回退网格。
+    """
+    try:
+        import numpy as _np
+
+        g_arr = _np.asarray(garment_img.convert("RGBA"))
+        alpha = g_arr[..., 3]
+        # 平铺图领口 = alpha 顶部中央; 下摆 = alpha 底部中央; 肩 = 领口两侧
+        cols = _np.where(alpha.sum(axis=0) > 20)[0]
+        if len(cols) < 8:
+            return [], []
+        mid_x = int((cols.min() + cols.max()) / 2)
+        rows = _np.where(alpha.sum(axis=1) > 20)[0]
+        top_y = int(rows[0])
+        bot_y = int(rows[-1])
+        shoulder_x_l = int(cols.min() + (mid_x - cols.min()) * 0.3)
+        shoulder_x_r = int(cols.max() - (cols.max() - mid_x) * 0.3)
+        src_pts = [
+            (float(mid_x), float(top_y)),  # 领口
+            (float(shoulder_x_l), float(top_y)),  # 左肩
+            (float(shoulder_x_r), float(top_y)),  # 右肩
+            (float(mid_x), float(bot_y)),  # 下摆
+        ]
+
+        # 人体锚点: 从 pose 关键点取
+        if pose is None:
+            return [], []
+        # pose 归一化 [0,1]; 映射到 human_img 像素
+        hw, hh = human_img.size
+        shoulder = pose.get("shoulder")
+        hip = pose.get("hip")
+        knee = pose.get("knee")
+        if not (shoulder and hip):
+            return [], []
+        sy = shoulder[1] * hh
+        hy = hip[1] * hh
+        ky = knee[1] * hh if knee else hy + (hy - sy) * 0.5
+        sx = shoulder[0] * hw
+        dst_pts = [
+            (sx, sy + (hy - sy) * 0.15),  # 领口(略低于肩)
+            (sx - (sx - 0.05 * hw), sy),  # 左肩(外扩)
+            (sx + (hw - sx) * 0.6, sy),  # 右肩(外扩)
+            (sx, max(hy, ky * 0.85)),  # 下摆(髋或膝)
+        ]
+        return src_pts, dst_pts
+    except Exception:
+        logger.exception("refit anchor collection failed")
+        return [], []
+
+
 def _build_sdxl_infer_kwargs(
     *,
     prompt: str,
@@ -1070,8 +1127,8 @@ def compose_tryon_sdxl(
     if crop_garment:
         garment_img = crop_garment_to_content(garment_img)
 
-    # 生成边长固定 1024(SDXL 原生);warp/pattern_lock 参考跟输出长边,
-    # 禁止先缩到 1024 再 warp 丢掉印花高频。
+    # 贴印参考图长边跟输出 (≥ 2048), 不缩到 1024 丢印花高频。
+    # SDXL 原生生成仍锁 1024; warp/贴印/IP-Adapter 语义路用高分辨率 canvas。
     target_w, target_h = 1024, 1024
     warp_canvas = max(1024, int(long_side))
     human_img = fit_square(base_img, target_w)
@@ -1352,9 +1409,10 @@ def compose_tryon_sdxl(
 
     # 服装区遮罩:细节回贴(衣服纹理/颜色)与身份锁(人脸/背景)共用同一张
     # clothing_mask, 只算一次(含 rembg u2net 推理,是重操作)。
-    # mask 255=衣服区(reapply 在此贴回原衣纹理颜色),0=人脸/手/背景
-    # (blend_tryon 在此贴回原图像素保身份)。两者互补:reapply 管衣服保真,
-    # 身份锁管人脸不走形。任一开关开启才算 mask,都关时跳过省一次推理。
+    # mask 255=重绘区(reapply 在此贴回原衣纹理颜色),0=保护区
+    # (protect_inverse_refit 在此贴回源图像素保身份)。两者互补:
+    # reapply 管衣服保真, 保护贴回管脸/发丝/手臂不走形。
+    # 任一开关开启才算 mask,都关时跳过省一次推理。
     need_mask = (
         os.environ.get("VTON_DETAIL", "1") != "0"
         or os.environ.get("VTON_LOCK_ID", "1") != "0"
@@ -1482,6 +1540,39 @@ def compose_tryon_sdxl(
         except Exception:
             logger.warning("VTON_DEBUG_MASK dump failed", exc_info=True)
 
+    # 确定性贴印升级: VTON_REFIT_ENGINE 选择 tps / optical_flow / grid(默认)。
+    # 在 reapply_garment_detail 之前, 用 TPS/光流把 cloth_ref 的贴印像素对齐褶皱,
+    # 让 pattern_lock 用更准的贴印结果。grid = 现状; tps = RBF TPS 网格升级;
+    # optical_flow = tps 结果上叠加 Farneback 光流微移。
+    # 注意: 必须在 reapply_garment_detail(detail_applied 计算)之前执行, 且 cloth_ref
+    # 替换后 cloth_ref_alpha 也要同步更新, 否则 pattern_lock 会用旧 alpha。
+    if shared_mask is not None and apply_mask is not None and warp_enabled:
+        _refit_engine = os.environ.get("VTON_REFIT_ENGINE", "grid").lower()
+        if _refit_engine in ("tps", "optical_flow"):
+            try:
+                from preserve_refit import optical_flow_refit, tps_warp
+
+                _anchor_src, _anchor_dst = _collect_refit_anchors(
+                    garment_img, cloth_ref, human_img, garment_extent, _pose
+                )
+                if _anchor_src and _anchor_dst:
+                    _refit_canvas = (result.size[0], result.size[1])
+                    _refit = tps_warp(cloth_ref, _anchor_src, _anchor_dst, _refit_canvas)
+                    if _refit_engine == "optical_flow":
+                        _refit = optical_flow_refit(_refit, result, apply_mask)
+                    cloth_ref = _refit if _refit.mode == "RGBA" else _refit.convert("RGBA")
+                    if cloth_ref_alpha is not None and cloth_ref_alpha.size != cloth_ref.size:
+                        cloth_ref_alpha = cloth_ref_alpha.resize(cloth_ref.size, Image.Resampling.BILINEAR)
+                    logger.info(
+                        "refit engine=%s applied (%d anchors); pattern_lock will use refit pixels",
+                        _refit_engine,
+                        len(_anchor_src),
+                    )
+                else:
+                    logger.warning("refit anchors unavailable; keeping grid remap")
+            except Exception:
+                logger.exception("refit engine %s failed; keeping grid remap", _refit_engine)
+
     # 商品细节回贴:VTON_PATTERN_LOCK=1 且已 warp 时, warp 衣直接覆盖衣服区,
     # 生成图只调褶皱光影;否则走高频柔光 + Reinhard 颜色迁移。
     # PATTERN_LOCK 与 DETAIL 解耦:关 DETAIL 仍可贴回颜色/纹理(配方 C 花纹丢失根因)。
@@ -1512,23 +1603,19 @@ def compose_tryon_sdxl(
         except Exception:
             logger.exception("reapply_garment_detail failed; using raw SDXL output")
 
-    # 身份锁:mask 外(人脸/手/背景)贴回原图 human_img,防止 SDXL 人脸走形。
-    # mask 内保留 reapply 修正后的衣服(不被覆盖)。VTON_LOCK_ID=1(默认)开启。
+    # 身份锁: 遮罩外(人脸/发丝/手/背景)贴回源图 human_img, 遮罩内保留生成像素。
+    # 替代旧 blend_tryon + _seam_repair 两步: protect_inverse_refit 一步完成
+    # 保护贴回 + Telea 边界, 手臂不会变白、胸口不会变白、发丝不会糊。
     lock_identity = False
-    if os.environ.get("VTON_LOCK_ID", "1") != "0" and shared_mask is not None:
-        result = blend_tryon(human_img, result, apply_mask)
+    if os.environ.get("VTON_LOCK_ID", "1") != "0" and apply_mask is not None:
+        from preserve_refit import protect_inverse_refit
+
+        _feather = int(os.environ.get("VTON_PROTECT_FEATHER", "4"))
+        result = protect_inverse_refit(result, human_img, apply_mask, feather_px=_feather)
         lock_identity = True
 
-    # 接缝修复:blend_tryon 后 mask 边界处原图与生成像素的接缝可能有色阶
-    # 断层(胸口白块/领口硬边)。用 cv2.inpaint Telea 以周边像素平滑过渡。
-    if lock_identity:
-        try:
-            result = _seam_repair(result, apply_mask)
-        except Exception:  # noqa: BLE001
-            # pipeline audit 行21: 接缝修复正是 C 配方依赖的修缺陷, 静默 debug 会让
-            # "模型变差"掩盖"后处理没跑"。升 warning + 记降级。
-            logger.warning("_seam_repair failed; using raw blend result (DEGRADED)")
-            degraded_reasons.append("seam repair failed (chest/seam color step may show)")
+    # 接缝修复: protect_inverse_refit 已内置 Telea 边界带, 无需再跑 _seam_repair。
+    # 肤色校正: 保护贴回后手臂/胸口已贴回源图像素, 肤色校正作为兜底仍保留。
 
     # 肤色校正:SDXL 重画手臂皮肤常丢失原始肤色(发白发灰)。
     # 检测 result 中肤色像素,把色调向 human_img 原始肤色偏移。

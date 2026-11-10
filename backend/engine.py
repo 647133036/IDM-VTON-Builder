@@ -1214,6 +1214,13 @@ def engine_status() -> dict:
     avail, reason = _idm_vton_available()
     license_allowed, license_reason = _license_allows_idm()
 
+    # 贴印引擎: grid(默认)/tps/optical_flow, 由 VTON_REFIT_ENGINE 控制
+    import os as _os_eng
+
+    refit_engine = _os_eng.environ.get("VTON_REFIT_ENGINE", "grid").lower()
+    if refit_engine not in ("grid", "tps", "optical_flow"):
+        refit_engine = "grid"
+
     sdxl_avail = False
     sdxl_reason = ""
     ip_adapter_avail = False
@@ -1271,6 +1278,7 @@ def engine_status() -> dict:
         "sdxl_inpaint": sdxl_inpaint,
         "ip_adapter_available": ip_adapter_avail,
         "gpu_available": gpu_available,
+        "refit_engine": refit_engine,
         "engine": engine,
         "license_mode": _LICENSE_MODE or "unset",
         "license_allows_idm": license_allowed,
