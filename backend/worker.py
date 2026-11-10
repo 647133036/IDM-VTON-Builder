@@ -65,8 +65,12 @@ def process_job(job: dict, bases: list[dict]) -> None:
     ethnicity = base.get("ethnicity") or ""
     # 多 seed 出图: 印花/文字款 VTON_MULTI_SEED=3(默认), 纯色 =1。
     # 每个 seed 跑一次 compose_tryon, 按质检分排序取最高。
-    # VTON_MULTI_SEED=0 强制单 seed; VTON_MULTI_SEED=1 也是单 seed。
-    n_seeds = max(1, int(os.environ.get("VTON_MULTI_SEED", "3")))
+    # VTON_MULTI_SEED=0 强制单 seed; 非法值回退默认 3; 上限 8(控成本)。
+    try:
+        _n_env = int(os.environ.get("VTON_MULTI_SEED", "3"))
+    except ValueError:
+        _n_env = 3
+    n_seeds = max(1, min(_n_env, 8))
     if n_seeds == 1:
         result = compose_tryon(base_path, src, audience, garment_type, long_side, background, ethnicity)
     else:

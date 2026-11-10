@@ -17,6 +17,16 @@ def _make_png(path, size=(256, 384), color=(30, 120, 200)):
     Image.new("RGB", size, color).save(path)
 
 
+def _make_sku_png(path, size=(200, 200), color=(200, 40, 40)):
+    """白底 + 中央色块的平铺 SKU 图(composite 路径 garment_alpha 需要背景对比)。"""
+    import numpy as np
+
+    w, h = size
+    arr = np.full((h, w, 3), 255, dtype=np.uint8)
+    arr[h // 5 : h * 4 // 5, w // 5 : w * 4 // 5] = color
+    Image.fromarray(arr, "RGB").save(path)
+
+
 @pytest.fixture()
 def ready_base_image(tmp_path):
     p = tmp_path / "women_01.png"
@@ -51,7 +61,7 @@ def test_process_job_done_with_base_ethnicity(tmp_path, ready_base_image):
     import store as store_mod
 
     src = store_mod.UPLOADS / "ladies_dress.jpg"
-    _make_png(src, (200, 200), (200, 40, 40))
+    _make_sku_png(src, (200, 200), (200, 40, 40))
     base_table = [
         {
             "id": "base_women_01",
@@ -80,6 +90,10 @@ def test_process_job_done_with_base_ethnicity(tmp_path, ready_base_image):
     assert final["preview_url"]
     assert get_job(job["id"])["audience"] == "women"
     assert get_job(job["id"])["garment_type"] == "dress"
+    # 真实 compose 链路(CPU composite 兜底)的印花保真分/档位/多 seed 元数据落库
+    assert final.get("print_fidelity", 0) >= 0.99  # 纯色款 → 满分
+    assert final.get("delivery_tier") == "auto"
+    assert final.get("multiseed", {}).get("n_seeds", 0) >= 1
 
 
 def test_process_job_missing_base_file_fails(tmp_path):

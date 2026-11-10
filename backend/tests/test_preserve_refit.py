@@ -190,15 +190,18 @@ def test_run_multiseed_tie_breaks_first():
 
 
 def test_refit_seeds_default():
-    os.environ["VTON_MULTI_SEED"] = "3"
-    seeds = preserve_refit.refit_seeds_default()
-    assert len(seeds) == 3
-    os.environ["VTON_MULTI_SEED"] = "1"
-    seeds1 = preserve_refit.refit_seeds_default()
-    assert len(seeds1) == 1
-    os.environ["VTON_MULTI_SEED"] = "99"
-    seeds_capped = preserve_refit.refit_seeds_default()
-    assert len(seeds_capped) == 8  # cap at 8
+    try:
+        os.environ["VTON_MULTI_SEED"] = "3"
+        seeds = preserve_refit.refit_seeds_default()
+        assert len(seeds) == 3
+        os.environ["VTON_MULTI_SEED"] = "1"
+        seeds1 = preserve_refit.refit_seeds_default()
+        assert len(seeds1) == 1
+        os.environ["VTON_MULTI_SEED"] = "99"
+        seeds_capped = preserve_refit.refit_seeds_default()
+        assert len(seeds_capped) == 8  # cap at 8
+    finally:
+        os.environ.pop("VTON_MULTI_SEED", None)
 
 
 # ---------- quality_gate ----------

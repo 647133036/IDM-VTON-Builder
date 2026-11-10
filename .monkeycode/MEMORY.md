@@ -242,3 +242,22 @@ Entries discovered by the Agent during task execution should follow this format:
   - worker 多 seed 测试用 `monkeypatch.setattr(worker_mod, "compose_tryon", stub)` 替换
     模块级导入的 compose, stub 读 `os.environ["VTON_SEED"]` 按 seed 返回不同
     print_fidelity, 验证择优与 multiseed 元数据(含 scores dict)落库。
+
+[Project Knowledge Summary]
+- Date: 2026-11-10
+- Context: Discovered by Agent while wiring print fidelity into CPU composite path
+- Category: Workflow & Collaboration
+- Instructions:
+  - CPU composite 兜底路径(engine.py `_composite_engine`)同样写 print_fidelity/
+    delivery_tier: 参考层=无阴影原始贴放层(ref_layer), mask=layer alpha。三引擎
+    (FASHN/SDXL/composite)的 job 元数据字段一致。
+  - `print_fidelity_score` 纯色判定只看参考侧 std<6(composite 接触阴影会抬高
+    结果侧方差, 不算失真)。
+  - 测试环境变量必须清理: `test_refit_seeds_default` 曾泄漏 VTON_MULTI_SEED=99
+    使后续真 compose 测试跑 8 次; 用 try/finally pop 或 monkeypatch.setenv。
+  - worker 读 VTON_MULTI_SEED 有 int() 护栏: 非法值回退 3, 上限封顶 8。
+  - 测试用纯色方图做 SKU 时 composite 的 `garment_alpha` 返回全 0(无背景对比
+    → 衣服不贴), 测试样图必须白底+色块(见 test_worker.py `_make_sku_png`)。
+  - GPU 冒烟脚本: `scripts/gpu/smoke_print_pipeline.py`(服务器布局 /root/vton/repo
+    + /root/autodl-tmp/vton_combo 样图), 一条命令验证 engine_status + FASHN 出图
+    + 保真分档 + 多 seed 择优。

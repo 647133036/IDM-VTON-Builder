@@ -901,6 +901,10 @@ def _composite_engine(
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     layer.paste(fitted, (tx, ty), fitted)
 
+    # CPU 路径保真参考: 无阴影的原始贴放层(garment 像素直接来自 SKU)
+    ref_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    ref_layer.paste(fitted, (tx, ty), fitted)
+
     canvas = Image.new("RGBA", base.size, (255, 255, 255, 255) if background == "white" else (0, 0, 0, 0))
     canvas.alpha_composite(base)
     canvas.alpha_composite(shadow_layer)
@@ -915,8 +919,20 @@ def _composite_engine(
 
     rw, rh = result.size
     scale = long_side / max(rw, rh)
-    if abs(scale - 1) > 0.01:
+    if abs(scale - 1.0) > 0.01:
         result = result.resize((int(rw * scale), int(rh * scale)), Image.Resampling.LANCZOS)
+        ref_layer = ref_layer.resize(result.size, Image.Resampling.LANCZOS)
+
+    # CPU 路径同样写印花保真分 + 交付档位(worker 落库, 与 FASHN/SDXL 路径一致)
+    try:
+        from quality_gate import delivery_tier, print_fidelity_score
+
+        pf = print_fidelity_score(result, ref_layer.convert("RGB"), layer.split()[-1])
+        result.info["print_fidelity"] = pf
+        result.info["delivery_tier"] = delivery_tier(pf, sku_has_text=False)
+        logger.info("composite print fidelity %.3f -> tier %s", pf, result.info["delivery_tier"])
+    except Exception:
+        logger.exception("composite print fidelity scoring failed; tier not set")
     return result
 
 

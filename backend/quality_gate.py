@@ -153,8 +153,9 @@ def print_fidelity_score(
     gr = r[y0:y1, x0:x1, :3].mean(axis=2)[zone[y0:y1, x0:x1]]
     gc = c[y0:y1, x0:x1, :3].mean(axis=2)[zone[y0:y1, x0:x1]]
 
-    # 纯色款: 双方灰度都近平常数 → 无印花可保, 满分
-    if float(gr.std()) < 6.0 and float(gc.std()) < 6.0:
+    # 纯色款: 参考侧灰度近平常数 → SKU 无印花可保, 满分
+    # (只看参考侧: composite 路径的接触阴影会抬高结果侧方差, 不算失真)
+    if float(gc.std()) < 6.0:
         return 1.0
 
     gr_n = (gr - gr.mean()) / (gr.std() + 1e-6)
