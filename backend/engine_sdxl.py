@@ -38,6 +38,7 @@ _sdxl_state: dict = {
     "depth_loaded": False,
     "lora_loaded": False,
     "lora_install_failed": False,
+    "inpaint_mode": False,
 }
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -163,9 +164,9 @@ def intersect_mask_with_garment_alpha(
     哪"的形状; 膨胀余量后与 apply_mask 求交, 形外的走廊尾巴/hem 尾巴
     不再贴回, 保留原图像素(裤子/肚皮)。
 
-    - 椭圆核 (0.055w, 0.025h): 横向错位来自袖条列(画布基模比例)与真人
+    - 椭圆核 (0.055w, 0.008h): 横向错位来自袖条列(画布基模比例)与真人
       手臂列(u2net 主体外 25%)的坐标系差, 需大横余量; 纵向锚点(肩/腕/
-      hem)两侧同源, 小余量即可。
+      hem)两侧同源, 过大竖余量会把衣料形渗到裤头(09290 裤头变色)。
     - kept < min_keep(形与 mask 明显错位)/alpha 缺失/cv2 缺失 → 原样返回
       (fail-open); VTON_MASK_ALPHA_INTERSECT=0 一键关闭(A/B 用)。
     - 类型透传: PIL 进 PIL 出, ndarray 进 ndarray 出(下游按 ndarray 消费)。
@@ -191,13 +192,21 @@ def intersect_mask_with_garment_alpha(
     if ra.shape != m.shape:
         ra = cv2.resize(ra, (w, h), interpolation=cv2.INTER_LINEAR)
     kx = max(9, int(0.055 * w) | 1)
-    ky = max(5, int(0.025 * h) | 1)
-    ra = cv2.dilate(ra, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky)))
-    out = np.minimum(m.astype(np.uint8), ra)
-    denom = max(float(m.mean()), 1.0)
-    kept = float(out.mean()) / denom
+    ky = max(3, int(0.008 * h) | 1)
+    ra_dil = cv2.dilate(ra, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kx, ky)))
+    m_u8 = m.astype(np.uint8)
+    denom = max(float(m_u8.mean()), 1.0)
+    # 错位守卫先按原始 mask 判(并集前): alpha 与主体 mask 完全错开时
+    # kept≈0 → fail-open, 不信任 warp 形。
+    kept = float(np.minimum(m_u8, ra_dil).mean()) / denom
     if kept < min_keep:
         return apply_mask, None
+    # 实心面料区并入 mask(守卫通过后): 宽松款(04469 罩衫)面料比模特身体
+    # 宽, 腰侧面料悬垂在人体剪影之外 —— 只按主体剪影裁 mask 会把悬垂
+    # 面料裁掉, blend 贴回底图白背景 = "腰间两边泛白"(实测 mask 覆盖
+    # 0.00 vs ref alpha 1.00)。alpha>200 的实心衣料允许贴入。
+    strict = ((ra > 200).astype(np.uint8)) * 255
+    out = np.minimum(np.maximum(m_u8, strict), ra_dil)
     if was_pil:
         return Image.fromarray(out), kept
     return out, kept
@@ -428,6 +437,7 @@ def engine_status(force: bool = False) -> dict:
         "rtmpose": _has(_REPO_ROOT / "models" / "rtmpose" / "rtmpose-m_coco.pth"),
         "mediapipe": _has(_REPO_ROOT / "models" / "mediapipe" / "pose_landmarker_full.task"),
         "u2net_seg": _has(_REPO_ROOT / "models" / "seg" / "u2net.onnx"),
+        "sdxl_inpaint": _has(SDXL_DIR / "sdxl_inpaint" / "model_index.json"),
     }
     return dict(_engine_status_cache)
 
@@ -545,6 +555,8 @@ def align_garment_to_pose(
     canvas: int = 1024,
     sleeve_len: str | None = None,
     pose: dict | None = None,
+    hem: str | None = None,
+    arm_cols: tuple[int, int, int, int] | None = None,
 ) -> tuple[Image.Image, Image.Image | None]:
     """把平铺衣"掰"到人体姿态:按目标人群肩宽/轮廓缩放并做 2D 网格变形,
     得到一张"正穿在人身上"的服装参考图,供 SDXL IP-Adapter 使用。
@@ -559,6 +571,10 @@ def align_garment_to_pose(
     垂直对齐(VTON_WARP_VERTICAL, 默认 1.0)按 GARMENT_BOX 调整后的躯干框
     映射领口→颈部、下摆→腰部(上衣)或膝部(连衣裙)或髋部(下装),
     修正仅按肩宽缩放导致的 logo/花纹垂直偏位。
+    上衣 hem=mid/long 时把框底从腰线拉到髋/大腿(与 clothing_mask 截线同口径),
+    避免中长款被压成齐腰(04469 下摆丢失/漏肚脐)。arm_cols(人物剪影左右臂列,
+    compose 用 _arm_column_bands 算好传入)决定袖条横向落位, None 时 refit
+    退回画布比例。
 
     VTON_WARP=0 时关闭(回退原平铺图);VTON_WARP_STRENGTH 可覆盖默认强度。
 
@@ -587,6 +603,36 @@ def align_garment_to_pose(
     adj = GARMENT_BOX.get(garment_type, GARMENT_BOX["upper"])
     box["y"] = box["y"] + adj["y"] * box["h"]
     box["h"] = box["h"] * adj["h"]
+    # 品类=upper 但衣料实测过腰: 框底仍钉在腰 → 中长款被压成齐腰。
+    # 与 clothing_mask 截线同口径拉长(mid +0.35 相对躯干框, long +0.50)。
+    if garment_type == "upper" and hem in ("mid", "long"):
+        _hem_scale = 1.35 if hem == "mid" else 1.50
+        box["h"] = box["h"] * _hem_scale
+        logger.info(
+            "warp box hem=%s type=upper → h*=%.2f (y=%.3f bottom=%.3f)",
+            hem,
+            _hem_scale,
+            box["y"],
+            box["y"] + box["h"],
+        )
+    # 上衣下摆兜底盖过裤头(waist 分类也至少到髋+0.03): 平铺图拍法(折袖/
+    # 压缩挂拍)使 hem 分类偏短(c10 实测 09263/09290 分类 waist → 框底
+    # 0.568c, alpha 下摆在肚脐上 → 漏肚脐/"只盖裤头两边"), 用户预期是
+    # 上衣盖住裤头。取 pose 髋点(缺省 0.643)与 mid/long 拉长后框底的
+    # 较大者。
+    if garment_type in ("upper", "auto", "tunic"):
+        _hip = 0.0
+        _p_hip = pose.get("hip") if pose else None
+        if _p_hip and len(_p_hip) >= 3 and _p_hip[2] >= 0.3:
+            _hip = float(_p_hip[1])
+        _hip_bottom = (_hip if _hip > 0 else 0.643) + 0.03
+        if box["y"] + box["h"] < _hip_bottom:
+            logger.info(
+                "warp box hem floor: bottom %.3f -> %.3f (cover waistband)",
+                box["y"] + box["h"],
+                _hip_bottom,
+            )
+            box["h"] = _hip_bottom - box["y"]
     box["width_key"] = adj.get("w", "shoulder")
     base_strength = GARMENT_WARP_STRENGTH.get(garment_type, 0.42)
     raw = os.environ.get("VTON_WARP_STRENGTH", "").strip()
@@ -609,6 +655,16 @@ def align_garment_to_pose(
     if warped.mode != "RGBA":
         warped = warped.convert("RGBA")
 
+    # 统一到 canvas 方画布: 窄长平铺按宽缩放会生成超高画布(04469 实测
+    # 1024x1374)。旧代码 RGB 参考图对超高图"裁切"到 canvas、alpha 却被下游
+    # "resize"回 canvas —— 同一件衣服两套行坐标(1:1.343 错位): 贴回时衣料
+    # 内容整体低于 alpha 形 34%, 下摆被 alpha 切掉(漏肚脐/腰间没盖), 特征
+    # (结/口袋)错位(结跑到胸口)。这里统一 resize 到 canvas 方画布后再贴
+    # 袖条, RGB 参考图/alpha/袖条三者行坐标完全一致; 垂直 remap 的目标行
+    # 按画布比例表达, resize 后即落在 box 行上, 不产生二次压缩。
+    if warped.size != (canvas, canvas):
+        warped = warped.resize((canvas, canvas), Image.Resampling.LANCZOS)
+
     # 袖几何对齐: 2D warp 折不下袖子, 这里把平铺衣的左右袖(横向摊开/向下
     # 折放自适应, 短袖只贴肘上段)合成到画布手臂列, 让参考图在手臂上有真实
     # 袖纹(修"长袖变无袖/短袖无袖")。竖直锚点用 pose 的肩/腕归一化 y(无 pose
@@ -616,7 +672,7 @@ def align_garment_to_pose(
     # 白底不整块贴入。VTON_SLEEVE_REFIT=0 一键关闭本步(A/B 用)。
     if sleeve_len in ("long", "short") and os.environ.get("VTON_SLEEVE_REFIT", "1") != "0":
         try:
-            warped = refit_sleeves_to_arms(warped, garment, canvas, pose, sleeve_len)
+            warped = refit_sleeves_to_arms(warped, garment, canvas, pose, sleeve_len, arm_cols=arm_cols)
         except Exception:
             logger.exception("refit_sleeves_to_arms failed; keeping torso-only reference")
 
@@ -726,6 +782,66 @@ def _pipeline_fp16_variant_kwargs(pipeline_dir: Path) -> dict[str, str]:
     return {"variant": "fp16"} if has_variant else {}
 
 
+def _inpaint_weights_ready() -> bool:
+    return (SDXL_DIR / "sdxl_inpaint" / "model_index.json").is_file()
+
+
+def _mask_to_pil(mask, size: tuple[int, int]) -> Image.Image:
+    """clothing_mask / ndarray / PIL → 生成分辨率的 L 图;None 则全白(整图重绘)。"""
+    import numpy as np
+
+    if mask is None:
+        return Image.new("L", size, 255)
+    arr = np.asarray(mask)
+    if arr.ndim == 3:
+        arr = arr[..., 0]
+    im = Image.fromarray(arr.astype("uint8"), "L")
+    if im.size != size:
+        im = im.resize(size, Image.Resampling.BILINEAR)
+    return im
+
+
+def _build_sdxl_infer_kwargs(
+    *,
+    prompt: str,
+    negative_prompt: str,
+    control_images,
+    control_scales,
+    width: int,
+    height: int,
+    num_inference_steps: int,
+    guidance_scale: float,
+    generator,
+    ip_adapter_image=None,
+    inpaint_mode: bool = False,
+    init_image: Image.Image | None = None,
+    mask_image: Image.Image | None = None,
+    strength: float = 0.99,
+) -> dict:
+    """组装 SDXL 采样参数:inpaint 用 image=底座 / mask=衣身 / control_image=姿态。"""
+    kwargs = {
+        "prompt": prompt,
+        "negative_prompt": negative_prompt,
+        "width": width,
+        "height": height,
+        "num_inference_steps": int(num_inference_steps),
+        "guidance_scale": float(guidance_scale),
+        "generator": generator,
+        "output_type": "pil",
+        "controlnet_conditioning_scale": control_scales,
+    }
+    if inpaint_mode:
+        kwargs["image"] = init_image
+        kwargs["mask_image"] = mask_image
+        kwargs["control_image"] = control_images
+        kwargs["strength"] = float(strength)
+    else:
+        kwargs["image"] = control_images
+    if ip_adapter_image is not None:
+        kwargs["ip_adapter_image"] = ip_adapter_image
+    return kwargs
+
+
 def _get_sdxl_pipe(device, dtype):
     # 首次加载必须单飞(NEW-H3):并发请求同时见 pipe=None 会重复构建管线撑爆显存。
     with _PIPE_LOCK:
@@ -739,9 +855,18 @@ def _get_sdxl_pipe(device, dtype):
             StableDiffusionXLControlNetPipeline,
         )
 
-        scheduler = DDPMScheduler.from_pretrained(
-            str(SDXL_DIR / "sdxl_base"), subfolder="scheduler", local_files_only=True
-        )
+        try:
+            from diffusers import StableDiffusionXLControlNetInpaintPipeline as _InpaintPipeCls
+        except ImportError:
+            _InpaintPipeCls = None
+
+        inpaint_dir = SDXL_DIR / "sdxl_inpaint"
+        inpaint_mode = bool(_InpaintPipeCls is not None and _inpaint_weights_ready())
+        pipe_cls = _InpaintPipeCls if inpaint_mode else StableDiffusionXLControlNetPipeline
+        pipe_root = inpaint_dir if inpaint_mode else (SDXL_DIR / "sdxl_base")
+        sched_root = pipe_root if (pipe_root / "scheduler").is_dir() else (SDXL_DIR / "sdxl_base")
+
+        scheduler = DDPMScheduler.from_pretrained(str(sched_root), subfolder="scheduler", local_files_only=True)
 
         # thibaud/controlnet-openpose-sdxl-1.0 ships the weights as a single-file
         # checkpoint (OpenPoseXL2.safetensors) rather than a diffusers subfolder layout.
@@ -789,14 +914,14 @@ def _get_sdxl_pipe(device, dtype):
 
         pipe = None
         try:
-            pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
-                str(SDXL_DIR / "sdxl_base"),
+            pipe = pipe_cls.from_pretrained(
+                str(pipe_root),
                 controlnet=controlnets,
                 scheduler=scheduler,
                 torch_dtype=dtype,
                 use_safetensors=True,
                 local_files_only=True,
-                **_pipeline_fp16_variant_kwargs(SDXL_DIR / "sdxl_base"),
+                **_pipeline_fp16_variant_kwargs(pipe_root),
             )
             # SDXL base VAE 需以 fp32 解码,否则 fp16 下解码溢出产生 NaN/黑图。
             # 此刻组件在 CPU 上,直接改 dtype 即可。
@@ -873,6 +998,14 @@ def _get_sdxl_pipe(device, dtype):
             _sdxl_state["depth_loaded"] = depth_loaded
             _sdxl_state["lora_loaded"] = lora_loaded
             _sdxl_state["lora_install_failed"] = lora_install_failed
+            _sdxl_state["inpaint_mode"] = inpaint_mode
+            if inpaint_mode:
+                logger.info("SDXL main path: ControlNet Inpaint (%s)", pipe_root)
+            else:
+                logger.warning(
+                    "SDXL Inpaint weights missing or ControlNetInpaintPipeline unavailable; "
+                    "main path falls back to full-frame ControlNet (face/arms will be redrawn)"
+                )
             return pipe, ip_adapter_loaded, ip_adapter_reason
         except Exception:
             # 加载失败必须释放已占显存,否则残留半成品会持续占用 VRAM(NEW-H3)。
@@ -886,6 +1019,7 @@ def _get_sdxl_pipe(device, dtype):
                 _sdxl_state["depth_loaded"] = False
                 _sdxl_state["lora_loaded"] = False
                 _sdxl_state["lora_install_failed"] = False
+                _sdxl_state["inpaint_mode"] = False
             try:
                 import gc
 
@@ -936,7 +1070,10 @@ def compose_tryon_sdxl(
     if crop_garment:
         garment_img = crop_garment_to_content(garment_img)
 
+    # 生成边长固定 1024(SDXL 原生);warp/pattern_lock 参考跟输出长边,
+    # 禁止先缩到 1024 再 warp 丢掉印花高频。
     target_w, target_h = 1024, 1024
+    warp_canvas = max(1024, int(long_side))
     human_img = fit_square(base_img, target_w)
     cloth_img = fit_square(garment_img, target_h)
 
@@ -987,25 +1124,54 @@ def compose_tryon_sdxl(
     warp_enabled = os.environ.get("VTON_WARP", "1") != "0"
     cloth_ref = cloth_img
     cloth_ref_alpha: Image.Image | None = None
+    # warp 分支内赋值; 先给默认值, 生成后袖条合成(post-hoc)也要用。
+    _sleeve = (garment_extent or {}).get("sleeve")
+    _pose = None
+    _arm_cols = None
     if warp_enabled:
         try:
             _sleeve = garment_extent.get("sleeve") if garment_extent else None
-            # 长袖几何对齐需要肩/腕竖直锚点: 用 RTMPose 定位目标模特(基图)的肩/腕。
-            # 拿不到 pose 时 refit 退回全身比例(仍安全)。
+            # 袖几何对齐需要肩/腕竖直锚点: 长袖到腕、短袖到肘上。拿不到 pose
+            # 时 refit 退回全身比例(仍安全)。
             _pose = None
-            if _sleeve == "long":
+            if _sleeve in ("long", "short"):
                 try:
                     _pose = _detect_pose_keypoints(human_img)
                 except Exception:
                     logger.exception("pose for sleeve refit failed; refit will use full-body ratios")
+            # 袖条横向落位: 从人物剪影自适应左右臂列(白底画布), 硬编码画布
+            # 比例在"手臂贴身/letterbox 进画布"的底图上会贴到白背景上。
+            _arm_cols = None
+            if _sleeve in ("long", "short"):
+                try:
+                    from engine import _arm_column_bands
+
+                    _arm_cols = _arm_column_bands(human_img)
+                    if _arm_cols is not None and warp_canvas != target_w:
+                        _scale = warp_canvas / float(target_w)
+                        _arm_cols = tuple(round(v * _scale) for v in _arm_cols)
+                    if _arm_cols is not None:
+                        logger.info(
+                            "sleeve arm bands from silhouette: L %d-%d R %d-%d",
+                            _arm_cols[0],
+                            _arm_cols[1],
+                            _arm_cols[2],
+                            _arm_cols[3],
+                        )
+                    else:
+                        logger.info("sleeve arm bands undetected; refit falls back to canvas ratios")
+                except Exception:
+                    logger.exception("arm column detection failed; refit uses canvas ratios")
             cloth_ref, cloth_ref_alpha = align_garment_to_pose(
                 garment_img,
                 audience,
                 ethnicity,
                 garment_type,
-                target_w,
+                warp_canvas,
                 sleeve_len=_sleeve,
                 pose=_pose,
+                hem=_hem_x,
+                arm_cols=_arm_cols,
             )
         except Exception:
             logger.exception("align_garment_to_pose failed; using flat cloth reference")
@@ -1126,21 +1292,55 @@ def compose_tryon_sdxl(
 
     generator = torch.Generator(device=device).manual_seed(int(_os.environ.get("VTON_SEED", "42")))
 
-    pipe_kwargs = {
-        "prompt": prompt,
-        "negative_prompt": negative_prompt,
-        "image": control_images,
-        "controlnet_conditioning_scale": control_scales,
-        "width": target_w,
-        "height": target_h,
-        "num_inference_steps": int(num_inference_steps),
-        "guidance_scale": float(os.environ.get("VTON_GUIDANCE", "7.5")),
-        "generator": generator,
-        "output_type": "pil",
-    }
+    inpaint_mode = bool(_sdxl_state.get("inpaint_mode"))
+    hole_img = None
+    if cloth_ref.size != (target_w, target_h):
+        ip_ref = cloth_ref.resize((target_w, target_h), PILImage.Resampling.LANCZOS)
+    else:
+        ip_ref = cloth_ref
+    if inpaint_mode:
+        try:
+            import numpy as _np_hole
 
-    if ip_adapter_loaded:
-        pipe_kwargs["ip_adapter_image"] = cloth_ref
+            _hole_subj = foreground_mask(human_img)
+            _hole_mask = clothing_mask(
+                human_img,
+                garment_type=garment_type,
+                garment_extent=garment_extent,
+                subject_mask=_hole_subj,
+            )
+            if _hole_mask is not None and cloth_ref_alpha is not None:
+                _hole_mask, _ = intersect_mask_with_garment_alpha(_hole_mask, cloth_ref_alpha)
+            hole_img = _mask_to_pil(_hole_mask, (target_w, target_h))
+            if float(_np_hole.asarray(hole_img).mean()) < 4.0:
+                hole_img = None
+                inpaint_mode = False
+                degraded_reasons.append("inpaint hole empty; falling back to full-frame ControlNet")
+                logger.warning("DEGRADED: inpaint hole empty; full-frame ControlNet")
+        except Exception:
+            logger.exception("failed to build inpaint hole; full-frame ControlNet")
+            hole_img = None
+            inpaint_mode = False
+            degraded_reasons.append("inpaint hole build failed; falling back to full-frame ControlNet")
+    elif not _inpaint_weights_ready():
+        degraded_reasons.append("sdxl_inpaint weights missing; full-frame ControlNet redraws face/arms")
+
+    pipe_kwargs = _build_sdxl_infer_kwargs(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        control_images=control_images,
+        control_scales=control_scales,
+        width=target_w,
+        height=target_h,
+        num_inference_steps=int(num_inference_steps),
+        guidance_scale=float(os.environ.get("VTON_GUIDANCE", "7.5")),
+        generator=generator,
+        ip_adapter_image=ip_ref if ip_adapter_loaded else None,
+        inpaint_mode=inpaint_mode and hole_img is not None,
+        init_image=human_img if inpaint_mode else None,
+        mask_image=hole_img,
+        strength=float(os.environ.get("VTON_INPAINT_STRENGTH", "0.99")),
+    )
 
     # 采样(含 denoise)在 autocast 下跑;VAE 解码移出 autocast 并以 fp32 执行,
     # 否则 SDXL fp16 VAE 解码溢出产生 NaN/黑图。
@@ -1189,8 +1389,8 @@ def compose_tryon_sdxl(
     # 走廊 85% 兜底/下摆截线), 生成器没画满的走廊里是生成图白背景;
     # 不求交就会把白底(被 Reinhard 染成衣色)半透明盖到原图上 ——
     # 09290 髋部粉块 + 黑矩形根因。reapply/blend/seam/inpaint 都用应用
-    # mask; _correct_skin_tone 仍用几何 mask(超集排除, 走廊里保留下来的
-    # 原图皮肤/裤子像素本就是原图色, 不需要肤色兜底去动它们)。
+    # mask; _correct_skin_tone 用应用 mask, 校正贴回区内的生成肤色
+    # (胸口/手臂两个肤色), 衣料像素不拉。
     # 此处 result 还是裸 SDXL 帧(未染色), u2net 判主体最可靠。
     apply_mask = limit_mask_to_subject(shared_mask, foreground_mask(result)) if shared_mask is not None else None
     # 贴回 mask ∩ warp 衣料形: 走廊/hem 尾巴里的裤子/肚皮重画不贴回原图
@@ -1336,7 +1536,7 @@ def compose_tryon_sdxl(
     # 强拉成肤色(袖子发黄根因)。
     if lock_identity:
         try:
-            result = _correct_skin_tone(human_img, result, cloth_mask=shared_mask)
+            result = _correct_skin_tone(human_img, result, cloth_mask=apply_mask)
         except Exception:  # noqa: BLE001
             logger.warning("_correct_skin_tone failed; using raw blend result (DEGRADED)")
             degraded_reasons.append("skin tone correction failed (arms/hands may look washed out)")
@@ -1350,6 +1550,27 @@ def compose_tryon_sdxl(
         except Exception:  # noqa: BLE001
             logger.warning("_sdxl_inpaint_repair failed; using pre-inpaint result (DEGRADED)")
             degraded_reasons.append("SDXL inpaint repair failed")
+
+    # 袖条生成后确定性合成: 走廊尾段(前臂)常被"∩生成主体"裁掉——SDXL 不把
+    # 前臂画满 → 走廊白底被剔(c7 实测 cut_row 以下 in-apply=0), 袖条最多贴到
+    # 肘。生成后把臂列带整段接管: 袖端以下贴回原图手臂/手(原肤色, 抹掉 SDXL
+    # 多画的袖/发灰肤色), 袖条(与 refit 同源)盖在上面, 不再依赖 apply_mask。
+    # VTON_SLEEVE_REFIT=0 可关。
+    if warp_enabled and _sleeve in ("long", "short") and os.environ.get("VTON_SLEEVE_REFIT", "1") != "0":
+        try:
+            from engine import arm_refit_overlay
+
+            _ov = arm_refit_overlay(
+                garment_img, human_img, target_w, pose=_pose, sleeve_len=_sleeve, arm_cols=_arm_cols
+            )
+            if _ov is not None:
+                _res = result.convert("RGBA")
+                _res.alpha_composite(_ov)
+                result = _res if result.mode == "RGBA" else _res.convert("RGB")
+                logger.info("arm refit overlay composited (strips + base arms, post-hoc)")
+        except Exception:
+            logger.exception("post-hoc arm refit overlay failed; arms keep generated pixels")
+            degraded_reasons.append("post-hoc arm overlay failed (sleeves/forearms may look washed out)")
 
     if background == "transparent":
         result = _remove_background(result)

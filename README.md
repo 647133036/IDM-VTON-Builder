@@ -183,7 +183,7 @@ Canny 按品类 0.55/0.45，IP-Adapter 0.9，texture_strength 0.70；`detect_gar
 - 真实推送：Shopify Admin API 上传商品图，WordPress REST 媒体 + WooCommerce 商品关联
 - 成品大图预览弹窗，左右对照原图与成品
 - 界面中英文一键切换，语言偏好本地持久化
-- 三层引擎体系：IDM-VTON（需授权）/ SDXL（商用合规）/ 合成引擎（无 GPU 兜底）
+- 三层引擎体系：FASHN VTON v1.5（商用主引擎）/ SDXL Inpaint（兜底）/ 合成引擎（无 GPU 兜底）；研究模式仍可用 IDM-VTON（需授权）
 
 ## 安全
 
@@ -428,8 +428,9 @@ ruff format --check backend/ training/
 
 ```text
 backend/
-  engine.py               合成引擎（CPU 兜底）
-  engine_sdxl.py           SDXL 商用引擎（对齐 + ControlNet + IP-Adapter + 动态遮罩 + 图案锁 + 接缝/肤色后处理）
+  engine.py                合成引擎（CPU 兜底）
+  engine_fashn.py          FASHN VTON v1.5 商用主引擎（parser stub + segmentation_free）
+  engine_sdxl.py           SDXL Inpaint 兜底引擎（对齐 + ControlNet + IP-Adapter + 动态遮罩 + 图案锁 + 接缝/肤色后处理）
   platform_presets.py      店规 + detect_garment_extent + clothing_mask + blend_tryon + reapply / pattern_lock + seam/skin + RTMPose/MediaPipe 关键点检测
   export_csv.py            CSV/SKU 批量导出
   lora_io.py               LoRA 加载（PEFT 优先）
@@ -454,7 +455,7 @@ LICENSE_MODE=commercial
 
 | LICENSE_MODE | 引擎优先级 | 商用合规 |
 |---|---|---|
-| `commercial` | SDXL -> 合成引擎 | 合规 |
+| `commercial` | FASHN VTON v1.5 -> SDXL Inpaint -> 合成引擎 | 合规 |
 | `research` | IDM-VTON -> 合成引擎 | 不合规 |
 | 未设置 | 合成引擎 | 需确认 |
 
@@ -477,7 +478,10 @@ GET  /api/health  /api/license
 | 组件 | 许可证 | 商用 | 本项目使用方式 |
 |------|--------|------|----------------|
 | IDM-VTON 模型权重 | CC BY-NC-SA 4.0 | 禁止 | 仅借鉴 garment warp 思路，未使用其权重 |
-| Stable Diffusion XL | CreativeML Open RAIL++-M | 允许（作者已获商用授权） | 商用换衣管线的生成底座 |
+| FASHN VTON v1.5 | Apache 2.0 | 允许 | 商用主引擎（像素空间、TPS、无 mask）；parser 走零张量 stub |
+| FASHN DWPose / YOLOX | Apache 2.0 | 允许 | FASHN 人体/姿态解析权重 |
+| fashn-human-parser | NVIDIA Source Code License | 禁止 | 商用路径注入 stub，SegFormer 权重不下载 |
+| Stable Diffusion XL | CreativeML Open RAIL++-M | 允许（作者已获商用授权） | 商用换衣管线的生成底座（FASHN 失败兜底） |
 | ControlNet | Open RAIL++-M | 允许（作者已获商用授权） | OpenPose / Canny / Depth 条件注入 |
 | IP-Adapter | Apache 2.0 | 允许 | 服装特征注入 |
 | RTMPose | Apache 2.0 | 允许 | 关键点检测（腰线插值 + knee 截断） |
@@ -486,7 +490,7 @@ GET  /api/health  /api/license
 | PLTON 论文方法 | 学术公开 | 思路可借鉴 | LF/HF 频率分离的 CPU 后处理实现，未使用其代码或权重 |
 | 本项目核心代码 | 商用权归作者所有 | 允许 | 换衣管线、平台适配、后处理、训练脚本等全部自研代码 |
 
-**商用部署**：设 `LICENSE_MODE=commercial`，引擎优先级 SDXL → 合成引擎，不加载 IDM-VTON。作者已获得 SDXL / ControlNet 商用授权，IP-Adapter / RTMPose / Rembg / MediaPipe 均为商用合规许可，可安全用于商业场景。
+**商用部署**：设 `LICENSE_MODE=commercial`，引擎优先级 FASHN VTON v1.5 → SDXL Inpaint → 合成引擎，不加载 IDM-VTON。FASHN 主模型与 DWPose / YOLOX 权重为 Apache 2.0；fashn-human-parser（NVIDIA SegFormer）含商用限制，商用路径注入零张量 stub、权重永不下载。作者已获得 SDXL / ControlNet 商用授权，IP-Adapter / RTMPose / Rembg / MediaPipe 均为商用合规许可，可安全用于商业场景。
 
 ## 感谢
 

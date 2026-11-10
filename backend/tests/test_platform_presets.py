@@ -349,6 +349,222 @@ def test_clothing_mask_lower_drops_torso():
     assert int(m[150, 60]) > 180
 
 
+def test_clothing_mask_upper_hem_floor_covers_waistband(monkeypatch):
+    """上衣截线兜底到 pose 髋点+0.03h: waist 分类不再截在肚脐上(修漏肚脐)。
+
+    c10 实测: hem=waist 截线 ~585 在肚脐上, 裤头/肚脐区被剔出生成区 →
+    "腰间只盖裤头两边"。兜底后截线至少到髋点+3% 身高。
+    """
+    import platform_presets
+
+    subj = np.zeros((1024, 1024), dtype=np.uint8)
+    subj[60:1000, 200:824] = 1
+    img = Image.fromarray(np.full((1024, 1024, 3), 80, dtype=np.uint8), "RGB")
+    monkeypatch.setattr(
+        platform_presets,
+        "_detect_pose_keypoints",
+        lambda _img: {
+            "shoulder": (0.5, 0.28, 1.0),
+            "hip": (0.5, 0.643, 1.0),
+            "knee": (0.5, 0.93, 1.0),
+            "wrist": (0.5, 0.67, 1.0),
+        },
+    )
+    m = clothing_mask(
+        img,
+        garment_type="upper",
+        subject_mask=subj,
+        garment_extent={"sleeve": "long", "hem": "waist", "neckline": "closed"},
+    )
+    assert m is not None
+    floor = int(0.643 * 1024 + 0.03 * 1024)
+    # mask 末端有 ~13 行羽化: 探针取羽化带外。640 在旧截线(585+羽化)与
+    # 新截线羽化带(~665+)之间, 旧代码该行=0。
+    assert int(m[640, 512]) > 180, "肚脐~裤头带被旧腰线截掉(漏肚脐)"
+    assert int(m[floor + 11, 512]) < 40, "髋点+0.03h 以下未清零"
+
+
+def test_pattern_lock_lighting_clamp_default_tight(monkeypatch):
+    """默认 lighting clamp 0.92/1.08: SDXL 高光最多抬亮贴图 8%(修胸口变白)。
+
+    c10 旧默认 [0.75, 1.25]: SDXL 胸口高光把贴图整片抬亮 25%, 用户读作
+    "胸口变白"。收紧后贴图颜色始终贴近参考色 ±8%。
+    """
+    for key in (
+        "VTON_PATTERN_LOCK_LIGHTING_MIN",
+        "VTON_PATTERN_LOCK_LIGHTING_MAX",
+        "VTON_PATTERN_LOCK_LIGHT_STRENGTH",
+        "VTON_PATTERN_LOCK_LF_STRENGTH",
+        "VTON_PATTERN_LOCK_HF_STRENGTH",
+        "VTON_PATTERN_LOCK_SKIN_WEIGHT",
+        "VTON_PATTERN_LOCK_SKIP_WHITE_BG",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    ref = Image.new("RGB", (100, 100), (100, 120, 140))
+    mask = np.full((100, 100), 255, dtype=np.uint8)
+    hi = reapply_garment_detail(Image.new("RGB", (100, 100), (240, 240, 240)), ref, mask, pattern_lock=True)
+    lo = reapply_garment_detail(Image.new("RGB", (100, 100), (30, 30, 30)), ref, mask, pattern_lock=True)
+    ref_px = np.array([100.0, 120.0, 140.0])
+    assert (np.asarray(hi)[50, 50] / ref_px).max() <= 1.10, "高光贴回超过 +10% (旧 1.25 抬亮 25%)"
+    assert (np.asarray(lo)[50, 50] / ref_px).min() >= 0.90, "暗部贴回低于 -10% (旧 0.75 压暗 25%)"
+
+
+def test_pattern_lock_uses_alpha_channel_not_luma_for_dark_garment(monkeypatch):
+    """RGBA ref_alpha 必须按 A 通道定贴回不透明度(修深色衣透出肤色)。
+
+    旧代码 ref_alpha.convert("L") 对 RGBA 取的是 RGB 亮度而非 alpha:
+    深色衣(藏青/墨绿, luma 65-90)alpha 全 1 也不透明度只剩 0.25-0.35,
+    gen 像素(肚皮肤色/白晕)透出 65%+ —— 漏肚脐/图案失真/结淡根因;
+    浅色衣(09290, luma 180)侥幸只稀释 30% 肉眼难察觉。
+    """
+    for key in (
+        "VTON_PATTERN_LOCK_LIGHTING_MIN",
+        "VTON_PATTERN_LOCK_LIGHTING_MAX",
+        "VTON_PATTERN_LOCK_LIGHT_STRENGTH",
+        "VTON_PATTERN_LOCK_LF_STRENGTH",
+        "VTON_PATTERN_LOCK_HF_STRENGTH",
+        "VTON_PATTERN_LOCK_SKIN_WEIGHT",
+        "VTON_PATTERN_LOCK_SKIP_WHITE_BG",
+        "VTON_PATTERN_LOCK_WHITE_THRESH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    w = h = 100
+    # 深色藏青 ref, 左半透明(alpha=0 画布白)右半衣料(alpha=255)
+    navy_rgb = Image.new("RGB", (w, h), (20, 60, 105))
+    a = np.zeros((h, w), dtype=np.uint8)
+    a[:, 50:] = 255
+    ref_alpha = Image.merge("RGBA", (*navy_rgb.split(), Image.fromarray(a)))
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    gen = Image.new("RGB", (w, h), (210, 170, 140))  # 肤色 gen(漏肚脐场景)
+    out = np.asarray(reapply_garment_detail(gen, navy_rgb, mask, pattern_lock=True, ref_alpha=ref_alpha))
+    ref_px = np.array([20.0, 60.0, 105.0])
+    # alpha=1 区: 全量贴回(lighting 被 clamp 1.08 → lit≈ref x 1.08)
+    assert np.abs(out[50, 80].astype(float) - ref_px).max() <= 12, f"深色衣贴回被稀释成 luma 混合: {out[50, 80]}"
+    # alpha=0 区: 画布白不贴入, gen 原样保留(袖子白晕防线)
+    assert tuple(out[50, 10]) == (210, 170, 140), f"alpha=0 画布区被贴入: {out[50, 10]}"
+
+
+def test_pattern_lock_skips_semi_transparent_ref_edges(monkeypatch):
+    """alpha<150 半透参考边缘不贴(修袖缘浅蓝/杂色 fringe)。
+
+    mask 膨胀核(kx~56px)会让 mask 越过面料形边界; 半透 alpha(40-130)
+    按比例混入 = 袖缘浅蓝杂边(09263 实测袖外 404-430 列 [107,132,137]
+    面料色外渗)。半透边缘必须整段跳过, 边界交还给 mask 羽化。
+    """
+    for key in (
+        "VTON_PATTERN_LOCK_LIGHTING_MIN",
+        "VTON_PATTERN_LOCK_LIGHTING_MAX",
+        "VTON_PATTERN_LOCK_LIGHT_STRENGTH",
+        "VTON_PATTERN_LOCK_LF_STRENGTH",
+        "VTON_PATTERN_LOCK_HF_STRENGTH",
+        "VTON_PATTERN_LOCK_SKIN_WEIGHT",
+        "VTON_PATTERN_LOCK_SKIP_WHITE_BG",
+        "VTON_PATTERN_LOCK_WHITE_THRESH",
+        "VTON_PATTERN_LOCK_FOLD_GAIN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    w = h = 100
+    teal = Image.new("RGB", (w, h), (0, 150, 180))
+    a = np.full((h, w), 255, dtype=np.uint8)
+    a[:, :30] = 100  # 左侧半透带(面料形羽化边缘)
+    ref_alpha = Image.merge("RGBA", (*teal.split(), Image.fromarray(a)))
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    gen = Image.new("RGB", (w, h), (200, 160, 130))  # 肤色 gen
+    out = np.asarray(reapply_garment_detail(gen, teal, mask, pattern_lock=True, ref_alpha=ref_alpha))
+    assert tuple(out[50, 10]) == (200, 160, 130), f"半透边缘被按比例混入(fringe): {out[50, 10]}"
+    assert tuple(out[50, 80]) != (200, 160, 130), "实心区仍应贴入面料"
+
+
+def test_pattern_lock_transfers_gen_folds_onto_flat_ref(monkeypatch):
+    """gen 的中频褶皱光影要叠到贴回面料上(修"贴上去"贴纸感)。
+
+    全量贴回后面料完全平光 → 衣服像贴纸(胸口被衣服贴上/中段失真的
+    感知根因)。FOLD_GAIN 把 gen 的带通褶皱(零均值)叠加到 lit:
+    gen 有一条横褶阴影时, 贴回面料同位置应额外变暗; FOLD_GAIN=0
+    回到平光贴回(旧行为)。
+    """
+    for key in (
+        "VTON_PATTERN_LOCK_LIGHTING_MIN",
+        "VTON_PATTERN_LOCK_LIGHTING_MAX",
+        "VTON_PATTERN_LOCK_LIGHT_STRENGTH",
+        "VTON_PATTERN_LOCK_LF_STRENGTH",
+        "VTON_PATTERN_LOCK_HF_STRENGTH",
+        "VTON_PATTERN_LOCK_SKIN_WEIGHT",
+        "VTON_PATTERN_LOCK_SKIP_WHITE_BG",
+        "VTON_PATTERN_LOCK_WHITE_THRESH",
+        "VTON_PATTERN_LOCK_FOLD_GAIN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    w = h = 120
+    ref = Image.new("RGB", (w, h), (150, 150, 150))
+    a = np.full((h, w), 255, dtype=np.uint8)
+    ref_alpha = Image.merge("RGBA", (*ref.split(), Image.fromarray(a)))
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    g = np.full((h, w, 3), 180, dtype=np.uint8)
+    g[50:70, :] = 90  # gen 上一条横褶阴影带
+    gen = Image.fromarray(g)
+    out = np.asarray(reapply_garment_detail(gen, ref, mask, pattern_lock=True, ref_alpha=ref_alpha)).astype(float)
+    monkeypatch.setenv("VTON_PATTERN_LOCK_FOLD_GAIN", "0")
+    out0 = np.asarray(reapply_garment_detail(gen, ref, mask, pattern_lock=True, ref_alpha=ref_alpha)).astype(float)
+    assert out0[60, 60][0] - out[60, 60][0] >= 15, (
+        f"褶皱行未获得额外明暗(fold 项未生效): {out[60, 60]} vs {out0[60, 60]}"
+    )
+    assert abs(out[20, 60][0] - out0[20, 60][0]) <= 8, "远离褶皱带不应被改变"
+
+
+def test_pattern_lock_transfers_spatial_shading_and_absorbs_global_lift(monkeypatch):
+    """空间身体明暗要传到贴回面料, 全局亮暗差被中位数吸收(修"贴上去"贴纸感)。
+
+    旧实现逐像素亮度比钳 ±8%: gen 的侧影/褶皱阴影(明暗差 20-40%)被砍到
+    ±8% → 面料平光如贴纸(C13 三件实证)。新实现: LF 比值按衣料区中位数
+    归一 → 阴影区全量变暗(钳到 0.62), 全局抬亮(胸口变白场景, 整片 x1.3)
+    被中位数吸收为 1.0 不回归。
+    """
+    for key in (
+        "VTON_PATTERN_LOCK_LIGHTING_MIN",
+        "VTON_PATTERN_LOCK_LIGHTING_MAX",
+        "VTON_PATTERN_LOCK_LIGHT_STRENGTH",
+        "VTON_PATTERN_LOCK_LF_STRENGTH",
+        "VTON_PATTERN_LOCK_HF_STRENGTH",
+        "VTON_PATTERN_LOCK_SKIN_WEIGHT",
+        "VTON_PATTERN_LOCK_SKIP_WHITE_BG",
+        "VTON_PATTERN_LOCK_WHITE_THRESH",
+        "VTON_PATTERN_LOCK_FOLD_GAIN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("VTON_PATTERN_LOCK_FOLD_GAIN", "0")
+    w = h = 120
+    ref = Image.new("RGB", (w, h), (150, 150, 150))
+    a = np.full((h, w), 255, dtype=np.uint8)
+    ref_alpha = Image.merge("RGBA", (*ref.split(), Image.fromarray(a)))
+    mask = np.full((h, w), 255, dtype=np.uint8)
+
+    def _run(gen_l, gen_r):
+        g = np.zeros((h, w, 3), dtype=np.uint8)
+        g[:, :60] = gen_l
+        g[:, 60:] = gen_r
+        return np.asarray(
+            reapply_garment_detail(Image.fromarray(g), ref, mask, pattern_lock=True, ref_alpha=ref_alpha)
+        ).astype(float)
+
+    # 左亮右暗的空间明暗(gen 带身体侧影), 第二组整体 x1.3(全局抬亮)
+    out = _run(180, 60)
+    out_lift = _run(234, 78)
+    shadow = out[60, 100][0]
+    lit_side = out[60, 20][0]
+    assert shadow <= 150 * 0.75, f"阴影区未随 gen 变暗(贴纸感, 旧钳制只 -8%): {shadow}"
+    assert shadow >= 150 * 0.5, f"阴影低于非对称下限 0.62: {shadow}"
+    assert lit_side <= 150 * 1.15, f"高光超非对称上限(胸口变白回归): {lit_side}"
+    assert lit_side > 150, f"亮区应获得空间明暗(被中位数误吸收): {lit_side}"
+    assert abs(out_lift[60, 100][0] - shadow) <= 2, "全局抬亮应被中位数完全吸收"
+    assert abs(out_lift[60, 20][0] - lit_side) <= 2, "全局抬亮应被中位数完全吸收"
+    # 均值再归一: 裁剪后按均值÷回一次 → 贴回面料整体亮度贴产品色 ±8%
+    region = out[30:90, 10:110, 0]
+    assert abs(float(region.mean()) - 150.0) <= 150 * 0.08, (
+        f"面料均值偏离产品色(整体压暗/提亮): mean={region.mean():.1f} vs ref=150"
+    )
+
+
 def test_blend_tryon_keeps_unmasked_pixels():
     orig = Image.new("RGB", (40, 40), (10, 20, 30))
     gen = Image.new("RGB", (40, 40), (200, 10, 10))
@@ -1562,9 +1778,24 @@ def test_correct_skin_tone_skips_garment_covered_positions():
     # 袖子区不被染色:RGB 与输入袖子几乎一致
     assert abs(int(out[30, 45, 0]) - sleeve[0]) < 10
     assert abs(int(out[30, 45, 2]) - sleeve[2]) < 10
-    # 裸臂区仍被拉回原肤色
-    assert abs(int(out[30, 15, 0]) - skin[0]) < 12
-    assert abs(int(out[30, 15, 1]) - skin[1]) < 12
+
+
+def test_correct_skin_tone_shifts_generated_skin_inside_cloth_mask():
+    """贴回区内的生成肤色(胸口发白)向原图肤色拉,衣料本身不动。"""
+    skin = (180, 140, 120)
+    pale = (235, 220, 170)
+    fabric = (40, 80, 180)
+    orig = np.full((80, 80, 3), (241, 241, 241), dtype=np.uint8)
+    orig[20:70, 10:70] = skin
+    res = np.full((80, 80, 3), (241, 241, 241), dtype=np.uint8)
+    res[20:50, 20:60] = pale
+    res[50:70, 20:60] = fabric
+    cloth = np.zeros((80, 80), dtype=np.uint8)
+    cloth[20:70, 20:60] = 255
+    out = np.array(_correct_skin_tone(Image.fromarray(orig, "RGB"), Image.fromarray(res, "RGB"), cloth_mask=cloth))
+    assert int(out[35, 40, 0]) < 220, f"pale chest should shift toward orig, got {out[35, 40]}"
+    assert abs(int(out[60, 40, 0]) - fabric[0]) < 12
+    assert abs(int(out[60, 40, 2]) - fabric[2]) < 12
 
 
 # ---------------------------------------------------------------------------
@@ -1643,17 +1874,22 @@ def _subject_with_skin(size=(200, 200)):
 
 
 def test_clothing_mask_short_sleeve_excludes_arm_skin():
-    """短袖时手臂皮肤被排除出 clothing mask(保护原图手臂)。"""
+    """短袖肘下前臂挖出,上臂留给袖料。"""
     img, subj = _subject_with_skin()
-    garment_extent = {"sleeve": "short", "hem": "waist"}
+    garment_extent = {"sleeve": "short", "hem": "mid"}
     mask = clothing_mask(img, garment_type="upper", subject_mask=subj, garment_extent=garment_extent)
     assert mask is not None
-    # 左臂肤色区(row 80, col 60): 应被排除(mask=0,保留原图皮肤)
-    assert mask[80, 60] < 20, f"left arm skin should be excluded, got {mask[80, 60]}"
-    # 右臂肤色区(row 80, col 135): 应被排除
-    assert mask[80, 135] < 20, f"right arm skin should be excluded, got {mask[80, 135]}"
-    # 衣物中心区(row 100, col 100): 应保留(mask>0,允许生成替换)
-    assert mask[100, 100] > 20, f"torso clothing should remain in mask, got {mask[100, 100]}"
+    # 上臂(肘上): 短袖袖料区, 保留在 mask(erode 后取靠近躯干的列)
+    assert mask[60:80, 62:70].max() > 20, "short-sleeve upper arm should stay in mask"
+    assert mask[60:80, 130:138].max() > 20, "short-sleeve upper arm should stay in mask"
+    assert mask[70, 100] > 20, f"torso clothing should remain in mask, got {mask[70, 100]}"
+    long_mask = clothing_mask(
+        img, garment_type="upper", subject_mask=subj, garment_extent={"sleeve": "long", "hem": "mid"}
+    )
+    assert long_mask is not None
+    assert float(mask[95:115, 55:70].mean()) < float(long_mask[95:115, 55:70].mean()), (
+        "short sleeve should carve more forearm than long sleeve"
+    )
 
 
 def test_clothing_mask_long_sleeve_keeps_arm_skin_in_mask():
@@ -1867,6 +2103,17 @@ def test_pattern_lock_reduces_overlay_on_skin():
     out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0))
     shift = np.abs(out[20:60, 20:60].astype(int) - gen_arr[20:60, 20:60].astype(int)).mean()
     assert shift < 40, f"skin overlay shift {shift:.1f} should stay small"
+
+
+def test_pattern_lock_pastes_fabric_over_generated_skin_when_ref_has_alpha():
+    """参考图袖条盖在生成裸臂上时仍贴袖料,不被肤色降权吃掉。"""
+    gen_arr = np.full((80, 80, 3), (180, 140, 120), dtype=np.uint8)
+    gen = Image.fromarray(gen_arr, "RGB")
+    ref = Image.fromarray(np.full((80, 80, 3), (40, 40, 160), dtype=np.uint8), "RGB")
+    alpha = Image.new("RGBA", (80, 80), (40, 40, 160, 255))
+    mask = np.full((80, 80), 255, dtype=np.uint8)
+    out = np.array(reapply_garment_detail(gen, ref, mask, pattern_lock=True, light_strength=0.0, ref_alpha=alpha))
+    assert int(out[40, 40, 2]) > 120, f"fabric should paste over generated skin, got {out[40, 40]}"
 
 
 def test_pattern_lock_frequency_separation_preserves_pattern():

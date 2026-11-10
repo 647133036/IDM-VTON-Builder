@@ -87,11 +87,77 @@ SDXL pipeline 效果略逊于 IDM-VTON，但完全合规。
 
 ## 改进方向
 
-如需提升 SDXL pipeline 效果：
+LoRA / ControlNet 自训仍然有效，但印花失效的主因是扩散在潜空间「重画」衣服，不是缺一次微调。完整分层见当前工作区 `.monkeycode/specs/print-fidelity-commercial-roadmap/`。下面是写入商用管线的执行顺序。
 
-1. **训练自定义 ControlNet** — 用自有服装数据微调
-2. **训练自定义 IP-Adapter** — 针对服装风格优化
-3. **增加后处理** — 色彩校正、边缘融合
+## 印花保真商用技术路线
+
+纯色能过、印花/logo/文字崩，是扩散试衣的结构性失效。VAE 8x 压缩几乎不影响纯色；印花、字母、细密图案是高频，一压缩一 warp 就被重新解释。IP-Adapter 只锁品类/廓形/底色；字母间距和拼写没有「把这块图贴过去」的算子。生产路径用自研几何 + 后处理承担底层细节，禁止把禁商用权重接进来「补这一路」。
+
+### 商用双通路（对应学术结构，实现全部已在仓库里）
+
+| 职责 | 学术对照（不加载） | 本管线 |
+|------|-------------------|--------|
+| 高层语义 | IP-Adapter / CLIP | `ip-adapter_sdxl_vit-h`（Apache 2.0） |
+| 底层细节 | GarmentNet 拼自注意力 | `_warp_garment` + `pattern_lock` 频率分离 |
+| 姿态 | DensePose 潜变量 | RTMPose + ControlNet OpenPose SDXL + Depth |
+| 重绘范围 | 服装二值遮罩 | `clothing_mask` ∩ 生成主体 ∩ warp alpha |
+| 像素级文字/大图案 | 像素空间生成 | Phase 2 确定性贴印，扩散只出 shading |
+
+### 引擎优先级（`LICENSE_MODE=commercial`）
+
+| 优先级 | 引擎 | 说明 |
+|--------|------|------|
+| 1 | FASHN VTON v1.5（`engine_fashn.py`） | Apache 2.0，像素空间 + TPS，无需 mask；`segmentation_free=True`，parser 注入零张量 stub |
+| 2 | SDXL ControlNet Inpaint（`engine_sdxl.py`） | 衣身 hole 重绘兜底；Inpaint 权重缺失时全图 ControlNet + degraded 标记 |
+| 3 | 仓库内合成引擎（`engine.py`） | 纯 PIL，无第三方权重，保真度有限 |
+
+### 禁止进入 `LICENSE_MODE=commercial` 的加载集
+
+IDM-VTON 微调 UNet / GarmentNet（CC BY-NC-SA）、DensePose、fashn-human-parser（NVIDIA SegFormer 权重，含商用限制 §3.3）、DS-VTON / POVNet 官方代码、任何 NC 或未获书面授权的权重。FASHN VTON v1.5 主模型与 `fashn_vton` 代码为 Apache 2.0，允许商用；DWPose / YOLOX 权重同为 Apache 2.0。OpenPose 原版人体估计（CC BY-NC-SA）不作为生产检测器。
+
+姿态条件图继续用已获商用授权的 ControlNet OpenPose SDXL 权重；人体关键点用 RTMPose（Apache 2.0）。OpenPose 原版人体估计（CC BY-NC-SA）不作为生产检测器。
+
+### 三种崩法，三种修法
+
+| 崩法 | 主修 |
+|------|------|
+| 文字 / logo 拼写变形 | 确定性贴印 + OCR 逐字比对 |
+| 图案拉伸、错位、重复 | 参考图分辨率门闩 + TPS/光流升级 |
+| 印花边缘糊、和衣身不对齐 | 遮罩收紧 + Telea / 印花 ROI inpaint |
+
+### 按成本的处理顺序
+
+**Phase 0（不重训，先做）**
+
+- 平铺图长边保持到不低于输出长边（默认 2048），禁止预处理先缩到 512 再 warp；低层通路能拿到的细节由这张图决定
+- 遮罩收紧到服装本体（已有 apply_mask 求交继续作为硬约束）
+- 印花/文字款多 seed 出图，按质检分排序；纯色可单 seed
+
+**Phase 1（结构，复用已落地 inpaint）**
+
+- 第一段：现有 SDXL 只管版型、贴合、光影（步数可降到 20）
+- 第二段：高分辨率只对印花 ROI 做 `_sdxl_inpaint_repair`，参考为 warp 后的 SKU 图；接缝带 ∪ 印花 ROI，管线单例，身份锁不变
+
+**Phase 2（pixel-accurate 的支点）**
+
+- 大图案和文字用确定性几何投到人体：在 `_warp_garment` 上升级 OpenCV TPS 或 Farneback 光流，控制点来自 RTMPose 与衣身轮廓
+- 光影从生成图低频取回，按现有 `lit = LF_ref * shade_lf + HF_ref * shade_hf` 相乘
+- 该区域 RGB 来源记 `print_source=sku_warp`；失败回退现有网格 warp 并标复核档
+
+**Phase 3（质检，把筛选变成实测）**
+
+- 文字款：裁印花区 → 自有 OCR（缺省 Tesseract / PaddleOCR，均为 Apache 2.0）→ 与平铺图逐字比 → 不符低分踢回重跑（默认最多 3 seed）
+- 图案款：warp 参考 vs 结果做 SSIM
+- job 写入 `quality_score` 与 `delivery_tier=auto|review`
+
+### 交付档位（文案必须跟路线走）
+
+- **自动出图**：纯色、小胸标、规则重复印花，且质检分过线
+- **含人工复核/精修**：大面积图案、成段文字、不规则印花
+
+对外「pixel-accurate / actual SKU」只覆盖自动出图档。无条件担保印花款会把交付质量写成英文语境下的无条件承诺。
+
+规格正文：当前工作区 `.monkeycode/specs/print-fidelity-commercial-roadmap/requirements.md` 与 `design.md`。
 
 ## 实操调试小贴士
 

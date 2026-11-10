@@ -915,7 +915,7 @@ def api_push(job_id: str, body: PushBody, _: dict = Depends(require_admin)):
 def health():
     detail = engine_status()
     # 不向前端暴露本地绝对路径(weights_dir/idm_vton_dir/sdxl_dir)。
-    for _k in ("weights_dir", "idm_vton_dir", "sdxl_dir"):
+    for _k in ("weights_dir", "idm_vton_dir", "sdxl_dir", "fashn_dir"):
         detail.pop(_k, None)
     return {"ok": True, "engine": load_settings().get("engine"), "engine_detail": detail}
 
@@ -929,7 +929,9 @@ def license_status():
         "idm_vton_available": status["idm_vton_available"],
         "idm_vton_license": "CC BY-NC-SA 4.0",
         "idm_vton_commercial_use": "Forbidden",
+        "fashn_available": status.get("fashn_available", False),
         "sdxl_available": status["sdxl_available"],
+        "sdxl_inpaint": status.get("sdxl_inpaint", False),
         "ip_adapter_available": status["ip_adapter_available"],
         "gpu_available": status["gpu_available"],
         "current_engine": status["engine"],

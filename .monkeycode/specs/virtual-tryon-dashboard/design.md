@@ -1,7 +1,7 @@
 # Virtual Try-On Dashboard
 
 Feature Name: virtual-tryon-dashboard
-Updated: 2026-10-25
+Updated: 2026-11-09
 
 ## Description
 
@@ -127,6 +127,7 @@ graph TD
 [^4]: (engine selector) - [engine.py](./engine.py)
 [^5]: (SDXL pipeline) - [engine_sdxl.py](./engine_sdxl.py)
 [^6]: (store/state) - [store.py](./store.py)
+[^7]: (print fidelity commercial roadmap) - [print-fidelity-commercial-roadmap](../print-fidelity-commercial-roadmap/design.md)
 
 ## LoRA Training Baseline and Retraining Plan
 
@@ -166,3 +167,9 @@ MODEL=lora_family GROUPS=human bash training/run_train.sh
 - Notable detail if present (e.g. "ribbed cuffs", "concealed back zip")
 
 This retrain is blocked on GPU availability and is not actionable in the CPU-only development environment.
+
+## Print fidelity commercial roadmap
+
+Solid-color SKUs can pass the current SDXL path; prints, logos and text fail because the VAE latent path reinterprets high-frequency detail. That diagnosis and the cost-ranked fix live in a dedicated spec so the commercial engine stays inside the licensed stack (SDXL + ControlNet + IP-Adapter + RTMPose + self-owned warp/pattern_lock). IDM-VTON / DensePose / FASHN weights stay out of `LICENSE_MODE=commercial`.
+
+See `.monkeycode/specs/print-fidelity-commercial-roadmap/` (`requirements.md`, `design.md`) and `docs/SDXL_PIPELINE.md` section 「印花保真商用技术路线」.

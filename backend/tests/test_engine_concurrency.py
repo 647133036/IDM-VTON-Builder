@@ -24,6 +24,7 @@ def _install_fake_diffusers(monkeypatch, pipe, load_raises=False):
     diffusers.StableDiffusionXLControlNetPipeline = types.SimpleNamespace(
         from_pretrained=staticmethod(_pipe_from_pretrained)
     )
+    diffusers.StableDiffusionXLControlNetInpaintPipeline = diffusers.StableDiffusionXLControlNetPipeline
     monkeypatch.setitem(sys.modules, "diffusers", diffusers)
 
     torch = types.ModuleType("torch")

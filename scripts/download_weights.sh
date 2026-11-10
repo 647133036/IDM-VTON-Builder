@@ -17,12 +17,14 @@
 #   models/mediapipe/                     pose_landmarker_full.task
 #   models/rtmpose/                       rtmpose-m ckpt + cfg
 #   models/seg/                           u2net.onnx (rembg 主体掩膜)
+#   models/sdxl/sdxl_inpaint/             SDXL Inpaint 权重(可选兜底)
+#   models/fashn/                         FASHN VTON v1.5 + DWPose(商用主引擎)
 #
 # 用法:
 #   bash scripts/download_weights.sh                    # 全量
 #   ONLY=depth bash scripts/download_weights.sh         # 只补 depth 相关(controlnet_depth + dpt midas)
 # 环境变量:
-#   ONLY=name[,name]  只下指定组(sdxl_base|openpose|canny|depth|ip_adapter|image_encoder|lora|annotators|mediapipe|rtmpose|seg)
+#   ONLY=name[,name]  只下指定组(sdxl_base|openpose|canny|depth|ip_adapter|image_encoder|lora|annotators|mediapipe|rtmpose|seg|sdxl_inpaint|fashn)
 #   HF_ENDPOINT       默认 https://hf-mirror.com(大陆可达);海外机可清空走官方
 #   DRY_RUN=1         只打印将要下载什么,不实际下载
 #
@@ -35,6 +37,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 MODELS_DIR="${REPO_ROOT}/models"
 SDXL_DIR="${MODELS_DIR}/sdxl"
+FASHN_DIR="${MODELS_DIR}/fashn"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 
 echo "==> SDXL 换衣引擎权重下载"
@@ -190,6 +193,43 @@ if want seg; then
     echo "    WARN: u2net.onnx 下载失败(可选, 缺了走纯颜色压白)。"
 fi
 
+# ── FASHN VTON v1.5(商用主引擎, Apache-2.0) ────────────────────────────────
+# 只拉主模型 + DWPose/YOLOX 权重。fashn-human-parser(NVIDIA SegFormer)
+# 含商用限制, 不下载; 商用路径由 backend/engine_fashn.py 注入零张量 stub。
+if want fashn; then
+    echo "==> fashn (FASHN VTON v1.5 + DWPose, Apache-2.0)"
+    if have "${FASHN_DIR}/model.safetensors"; then
+        echo "    已存在, 跳过"
+    else
+        hf_dl "fashn-ai/fashn-vton-1.5" "model.safetensors" "${FASHN_DIR}"
+        hf_dl "fashn-ai/DWPose" "yolox_l.onnx" "${FASHN_DIR}/dwpose"
+        hf_dl "fashn-ai/DWPose" "dw-ll_ucoco_384.onnx" "${FASHN_DIR}/dwpose"
+    fi
+fi
+
+# ── SDXL Inpaint(可选兜底;缺时全图 ControlNet + degraded 标记) ────────────
+if want sdxl_inpaint; then
+    echo "==> sdxl_inpaint (stabilityai/stable-diffusion-xl-inpainting)"
+    if have "${SDXL_DIR}/sdxl_inpaint/model_index.json"; then
+        echo "    已存在, 跳过"
+    else
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "model_index.json" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "unet/*" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "vae/*" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "text_encoder/*" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "text_encoder_2/*" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "tokenizer/*" "${SDXL_DIR}/sdxl_inpaint"
+        hf_dl "stabilityai/stable-diffusion-xl-inpainting" \
+            "tokenizer_2/*" "${SDXL_DIR}/sdxl_inpaint"
+    fi
+fi
+
 # ── 完成校验(验 SDXL 引擎, 不是 legacy engine) ────────────────────────────
 echo ""
 echo "==> 完成!权重目录: ${MODELS_DIR}"
@@ -204,7 +244,10 @@ for f in \
     "${SDXL_DIR}/annotators/body_pose_model.pth" \
     "${SDXL_DIR}/annotators/dpt_hybrid-midas-501f0c75.pt" \
     "${MODELS_DIR}/rtmpose/rtmpose-m_coco.pth" \
-    "${MODELS_DIR}/seg/u2net.onnx" ; do
+    "${MODELS_DIR}/seg/u2net.onnx" \
+    "${FASHN_DIR}/model.safetensors" \
+    "${FASHN_DIR}/dwpose/yolox_l.onnx" \
+    "${FASHN_DIR}/dwpose/dw-ll_ucoco_384.onnx" ; do
     if have "$f"; then echo "      ✓ $f"; else echo "      ✗ 缺 $f"; fi
 done
 echo ""

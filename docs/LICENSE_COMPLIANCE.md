@@ -24,20 +24,29 @@ IDM-VTON 不可用于生产环境。需要替换为允许商用的模型：
 
 | 组件 | 许可 | 商用状态 |
 |------|------|----------|
-| Stable Diffusion XL | OpenRAIL-M | 允许商用 |
+| Stable Diffusion XL | OpenRAIL-M / Stability AI Community License | 允许商用（需注册 + NOTICE） |
 | ControlNet | OpenRAIL-M | 允许商用 |
 | IP-Adapter | Apache 2.0 | 允许商用 |
+| FASHN VTON v1.5（模型权重 + fashn_vton 代码） | Apache 2.0 | 允许商用 |
+| FASHN DWPose / YOLOX 权重 | Apache 2.0 | 允许商用 |
+| fashn-human-parser（NVIDIA SegFormer 权重） | NVIDIA Source Code License（§3.3 含商用限制） | **禁止商用，商用路径注入零张量 stub 代替** |
 | OpenPose | CC BY-NC-SA | 禁止商用 |
 | DensePose | 内部使用 | 需确认 |
 
 **推荐方案：**
 
-1. **SDXL + ControlNet + IP-Adapter** 组合
-   - 全部允许商用
-   - 需要自行训练换衣适配器
-   - 训练数据必须来源合法
+1. **FASHN VTON v1.5（像素空间、无需 mask、TPS + 扩散）** 优先
+   - Apache 2.0，允许商用；`segmentation_free=True` 强制关闭人体解析
+   - `LICENSE_MODE=commercial` 下 `backend/engine_fashn.py` 向 `sys.modules` 注入
+     零张量 `FashnHumanParser` stub，NVIDIA SegFormer 权重永不下载、永不加载
+   - 消费级 GPU 可跑（约 972M 参数）；大字母/图案仍走确定性 `pattern_lock` 贴印
 
-2. **联系 IDM-VTON 原作者**
+2. **SDXL + ControlNet Inpaint + IP-Adapter** 兜底
+   - 全部允许商用
+   - Inpaint 权重缺失时回退全图 ControlNet 并标记 degraded
+   - 需要自行训练换衣适配器；训练数据必须来源合法
+
+3. **联系 IDM-VTON 原作者**
    - 申请商业授权
    - 可能收费或拒绝
    - 需要书面协议
@@ -46,6 +55,8 @@ IDM-VTON 不可用于生产环境。需要替换为允许商用的模型：
    - 如 Replicate、Hugging Face Inference
    - 付费使用，合规风险由服务商承担
    - 成本高，但无需自行部署
+
+印花/logo/文字保真的分层修复（分辨率门闩、两段 inpaint、OpenCV TPS 贴印、OCR 质检）只允许走路径 B 的组件。完整约束见当前工作区 `.monkeycode/specs/print-fidelity-commercial-roadmap/` 与 `docs/SDXL_PIPELINE.md`「印花保真商用技术路线」。IDM-VTON GarmentNet、DensePose 权重、以及 fashn-human-parser（NVIDIA SegFormer 权重）不进入商用加载集；FASHN VTON v1.5 主模型权重与 `fashn_vton` 代码为 Apache 2.0，允许商用。
 
 ### 路径 C：混合策略
 

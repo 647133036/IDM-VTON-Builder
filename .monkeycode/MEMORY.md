@@ -171,10 +171,35 @@ Entries discovered by the Agent during task execution should follow this format:
     pattern constraints.
 
 [User Instruction Summary]
-- Date: 2026-11-06
-- Context: GPU 服务器(AutoDL)切换为"无卡开机"(CPU-only)模式期间的协作流程
+- Date: 2026-11-09
+- Context: GPU 服务器(AutoDL)按开机时长计费(用不用都收费); 用户对"按需多次往返 SSH 拉取产物导致实例空转计费"强烈不满
 - Category: Workflow & Collaboration
 - Instructions:
+  - AutoDL 实例开机即计费(含无卡开机, 但费率低): 每轮 GPU 推理完成后, 必须 ONE GO 用一条
+    tar+scp 命令批量拉取全部产物(结果图、c*_run.log、c*_debug/、run_cX.py、输入), 禁止按需多次往返拉取
+  - 拉取完成后立即提醒用户关机停止计费; AutoDL 关机保留磁盘数据, 漏拉的日志/debug 可在下次开机时补拉,
+    不值得为补拉让实例空转计费
   - 服务器可能处于无卡开机状态(无 GPU, nvidia-smi 报 No devices found), SSH/scp/CPU 推理仍可用
   - 先干完 CPU 能做的事: 本地修码+测试+推送、scp 同步、sha256 校验、CPU 上跑 detect/推断验证、备好重跑 harness
   - 需要 GPU 的任务(如 compose_tryon_sdxl 出图)明确告知用户, 等用户换有卡开机后再执行
+
+[Project Knowledge Summary]
+- Date: 2026-11-10
+- Context: Discovered by Agent while testing FASHN-first commercial engine path
+- Category: Testing Methods
+- Instructions:
+  - `engine_sdxl._get_sdxl_pipe` 内部调用模块级 `engine_status()`(depth 降级检查),
+    测试中必须同时 `monkeypatch.setattr(engine_sdxl, "engine_status", lambda force=False: {})`
+    和 `monkeypatch.setattr(engine_sdxl, "_engine_status_cache", None)`,否则进程缓存的
+    真实 `engine_status` 结果会让 depth 降级分支干扰断言。
+  - 测试中构造 fake SDXL 权重目录时, `*_safetensors` 文件写 `b"x"` 即可(文件存在性检查),
+    但 IP-Adapter 维度推断测试必须用真 `safetensors.torch.save_file` 写合法张量
+    (`_infer_ip_adapter_input_dim` 会 `safe_open` 读 shape)。
+  - `models/sdxl/lora/` 下有真实 LoRA 权重(`adapter_model.safetensors`),
+    `_get_sdxl_pipe` 的 lora_install_failed 复检(`lora_weight_path`)会命中;
+    测试中 mock `_load_trained_lora` 后, `lora_install_failed` 复检走真实 `lora_io`,
+    若 tmp_path 无 lora 目录则返回 None → 不误标降级。
+  - FASHN 商用路径: `engine_fashn._ensure_parser_stub()` 注入 `sys.modules["fashn_human_parser"]`
+    零张量 stub; `_patch_loaded_pipeline` 同步替换已加载的 `fashn_vton.pipeline` 中
+    `FashnHumanParser` 与 `CATEGORY_TO_BODY_COVERAGE` 引用, 确保 NVIDIA SegFormer 权重
+    永不下载。测试 `test_engine_fashn.py` 验证 stub 标志 `_atelier_commercial_stub=True`。

@@ -198,19 +198,22 @@ def _correct_skin_tone(
     res_skin = res_skin * (1 - face_mask)
     if not orig_skin.any():
         return result
-    # 发白手臂常掉出 YCbCr 窗:原图肤色位置在 result 上仍要拉回。
-    res_skin = np.maximum(res_skin, orig_skin)
-
-    # 新衣遮罩:长袖盖住原图手臂时,"原图肤色位置"兜底会把袖子像素染成
-    # 肤色(袖子发黄根因)。衣服区内不做统计也不做校正。
+    # 新衣遮罩: 校正贴回区内的生成肤色(胸口/手臂两个肤色根因),
+    # 衣料本身(非肤色)不拉, 避免袖子发黄。原图肤色位置兜底只用于
+    # 非衣料区(发白手臂掉出 YCbCr 窗时仍拉回)。
     if cloth_mask is not None:
         cm = np.asarray(cloth_mask)
         if cm.shape[:2] != (h, w):
             cm = np.array(Image.fromarray(cm.astype(np.uint8)).resize((w, h), Image.Resampling.BILINEAR))
-        not_cloth = ~(cm > 127)
-        res_skin = res_skin * not_cloth
+        in_cloth = cm > 127
+        fallback = orig_skin * (~in_cloth)
+        res_skin = np.maximum(res_skin * in_cloth, fallback)
         if not res_skin.any():
             return result
+    else:
+        res_skin = np.maximum(res_skin, orig_skin)
+    if not orig_skin.any():
+        return result
 
     orig_mean = orig[orig_skin > 0].mean(axis=0).astype(np.float32)
     res_mean = res[res_skin > 0].mean(axis=0).astype(np.float32)
@@ -1090,15 +1093,17 @@ def _init_rtmpose():
 
 
 def _detect_pose_keypoints(img: Image.Image) -> dict | None:
-    """关键点检测, 返回 hip/shoulder/knee/wrist 归一化坐标.
+    """关键点检测, 返回 hip/shoulder/knee/wrist(+wrist_l/wrist_r) 归一化坐标.
 
     优先 RTMPose-m (COCO 17 关键点, CPU 可跑, 精度优于 MediaPipe),
     回退 MediaPipe Pose, 再回退 None.
 
     Returns:
-        {"hip": (x, y, vis), "shoulder": ..., "knee": ..., "wrist": (x, y, vis)} 或 None.
+        {"hip": (x, y, vis), "shoulder": ..., "knee": ..., "wrist": (x, y, vis),
+         "wrist_l": (x, y, vis), "wrist_r": (x, y, vis)} 或 None.
         坐标归一化到 [0,1], vis 为 visibility 置信度.
-        wrist 供长袖手臂走廊用(衣袖区保留到腕部); 缺失时走廊逻辑静默跳过。
+        wrist 供长袖手臂走廊用(衣袖区保留到腕部); wrist_l/r 供袖条
+        按左右臂各自腕点定袖长(左右臂常不等高); 缺失时走廊逻辑静默跳过。
     """
     ckpt = Path(_RTMPOSE_ROOT) / "rtmpose-m_coco.pth"
     if ckpt.exists():
@@ -1227,13 +1232,27 @@ def _detect_pose_rtmpose(img: Image.Image) -> dict | None:
             (w, h),
         )
 
-        # COCO 17: 5=L_shoulder, 6=R_shoulder, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee,
-        # 7=L_wrist, 8=R_wrist(长袖手臂走廊用)。SimCC 无 vis, 硬编码 1.0; vis>=0.3 门
-        # 只对 MediaPipe 回退路径生效。
+        # COCO 17: 5=L_shoulder, 6=R_shoulder, 7=L_elbow, 8=R_elbow,
+        # 9=L_wrist, 10=R_wrist, 11=L_hip, 12=R_hip, 13=L_knee, 14=R_knee。
+        # c9 勘误: 旧代码把 7/8(肘)当腕 —— "wrist"=avg(7,8) 落在肘线
+        # (~0.50c), 袖条/走廊只到肘, 长袖出图读作中袖。真腕在 9/10。
+        # SimCC 无 vis, 硬编码 1.0; vis>=0.3 门只对 MediaPipe 回退路径生效。
         def avg(i, j):
             return (float((kx[i] + kx[j]) / 2), float((ky[i] + ky[j]) / 2), 1.0)
 
-        kp = {"hip": avg(11, 12), "shoulder": avg(5, 6), "knee": avg(13, 14), "wrist": avg(7, 8)}
+        def one(i):
+            return (float(kx[i]), float(ky[i]), 1.0)
+
+        kp = {
+            "hip": avg(11, 12),
+            "shoulder": avg(5, 6),
+            "knee": avg(13, 14),
+            "wrist": avg(9, 10),
+            "wrist_l": one(9),
+            "wrist_r": one(10),
+            "elbow_l": one(7),
+            "elbow_r": one(8),
+        }
         # 行32: SimCC 没有 vis, 上面硬编码 1.0 使下游 vis>=0.3 门变空操作 —— 错但落
         # 在 [0,1] 范围内的检测会被当成"rtmpose 源"采信(比 None 更糟)。加独立解剖学
         # 合理性校验: 关键点须在图内, 肩-髋-膝垂直有序且跨距够大; 不合理则拒收(None),
@@ -1357,7 +1376,16 @@ def _detect_pose_mediapipe(img: Image.Image) -> dict | None:
     wrist = avg_lm(15, 16)  # 15=L_wrist, 16=R_wrist (长袖手臂走廊用)
     if hip[2] < 0.3:
         return None
-    return {"hip": hip, "shoulder": shoulder, "knee": knee, "wrist": wrist}
+    return {
+        "hip": hip,
+        "shoulder": shoulder,
+        "knee": knee,
+        "wrist": wrist,
+        "wrist_l": (lm[15].x, lm[15].y, getattr(lm[15], "visibility", 0) or 0),
+        "wrist_r": (lm[16].x, lm[16].y, getattr(lm[16], "visibility", 0) or 0),
+        "elbow_l": (lm[13].x, lm[13].y, getattr(lm[13], "visibility", 0) or 0),
+        "elbow_r": (lm[14].x, lm[14].y, getattr(lm[14], "visibility", 0) or 0),
+    }
 
 
 def _estimate_waist_ratio(
@@ -1505,7 +1533,7 @@ def clothing_mask(
 
     这是「只换衣、锁身份」的遮罩:255=贴生成衣物,0=保留原图像素(脸/发/手/背景)。
     garment_extent(from detect_garment_extent)控制:
-      sleeve: long → 手臂走廊保留到腕(衣袖区); short → 只含大臂(当前默认);
+      sleeve: long → 手臂走廊保留到腕(衣袖区); short → 上臂含袖、肘下前臂挖出;
               sleeveless → 不含手臂
       hem: waist → 截线=腰; mid(中长款) → 腰+0.22(髋/大腿, tunic 级);
            long → tunic 腰+0.30 / upper 腰+0.18
@@ -1561,6 +1589,14 @@ def clothing_mask(
     # 截线优先级(写死, 有测试): top 品类(upper/auto/tunic) 一律腰线系, 不与 knee
     # 截断混用 —— knee_r 只服务 dress/onesie; hem=mid(中长款) 即使品类被显式
     # 定成 upper 也走 tunic 截线。
+    # 上衣截线兜底盖过裤头: 与 align_garment_to_pose 的 warp 框底同口径(pose
+    # 髋点 + 0.03h)。hem 分类为 waist 的上衣常实穿过腰(c10 实测 09263/09290
+    # 分类 waist → 截线在肚脐上 → 生成区漏肚脐, "腰间只盖裤头两边")。
+    _hip_cut_floor = -1
+    if garment_type in ("upper", "auto"):
+        _kp_hip = pose_kp.get("hip") if pose_kp else None
+        if _kp_hip and len(_kp_hip) >= 3 and _kp_hip[2] >= 0.3:
+            _hip_cut_floor = int(float(_kp_hip[1]) * h + 0.03 * h)
     if garment_type in ("upper", "auto", "tunic"):
         if garment_type == "tunic":
             _off = 0.30 if hem == "long" else 0.22
@@ -1575,6 +1611,14 @@ def clothing_mask(
         else:
             _off = 0.0
         cut_row = y0 + int(span * (waist_r + _off))
+        if _hip_cut_floor > cut_row:
+            logger.info(
+                "[clothing_mask:%s] hemcut floor: %d -> %d (cover waistband, pose hip)",
+                _dbg_tag,
+                cut_row,
+                _hip_cut_floor,
+            )
+            cut_row = _hip_cut_floor
         cloth[cut_row:] = 0
         _debug_dump_mask_stage(cloth * 255, img, "hemcut")
         logger.info(
@@ -1698,6 +1742,7 @@ def clothing_mask(
     # 皮肤像素 → 手臂皮肤标记为 0(保留原图),只有衣物区标记为 255(允许
     # 生成替换)。躯干中心不减 → 胸口 V 领露肤仍可被新衣物覆盖。
     # 长袖不减:新衣物需覆盖整条手臂,手臂皮肤应被生成结果替换。
+    # 短袖只挖肘下前臂,上臂留给袖料(整臂挖出 → 袖条无法贴回 → 04469 无袖)。
     # 用主体水平外扩 25% 定位手臂区(而非固定图像宽度比例)。
     if garment_type in ("upper", "auto", "tunic") and sleeve in ("short", "sleeveless"):
         skin = _detect_skin(arr)
@@ -1709,8 +1754,13 @@ def clothing_mask(
                 arm_w = max(8, int(subj_w * 0.25))
                 left_end = x0s + arm_w
                 right_start = x1s - arm_w
-                cloth[:, :left_end][skin[:, :left_end] > 0] = 0
-                cloth[:, right_start:][skin[:, right_start:] > 0] = 0
+                if sleeve == "short":
+                    elbow_row = y0 + int(span * 0.42)
+                    cloth[elbow_row:, :left_end][skin[elbow_row:, :left_end] > 0] = 0
+                    cloth[elbow_row:, right_start:][skin[elbow_row:, right_start:] > 0] = 0
+                else:
+                    cloth[:, :left_end][skin[:, :left_end] > 0] = 0
+                    cloth[:, right_start:][skin[:, right_start:] > 0] = 0
 
     try:
         import cv2
@@ -1937,24 +1987,32 @@ def _pattern_lock_overlay(
 ) -> Image.Image:
     """Warp 后的衣覆盖衣服区;生成图只提供褶皱光影(PLTON 频率分离)。
 
-    lighting = clamp(L_gen / L_ref, lighting_min, lighting_max)
+    lighting = 空间明暗场: LF(L_gen) 按衣料区中位数归一(不除 LF_ref, 防 ref
+    影棚阴影以倒数污染明暗场)
     shade_lf = 1 + (lighting - 1) * light_strength * lf_strength
     shade_hf = 1 + (lighting - 1) * light_strength * hf_strength
     lit = LF_ref * shade_lf + HF_ref * shade_hf
     底色按 lf_strength 调,花纹按 hf_strength 调(默认半强度,保对比度)。
     light_strength=0 时 lit=cloth_ref(纯贴图,快速回退基准)。
 
+    空间明暗场(修"贴上去"贴纸感, C13 三件实证): 旧实现逐像素亮度比钳 ±8%,
+    SDXL 的身体侧影/褶皱阴影(20-40% 明暗)被砍平 → 面料平光如贴纸。新实现:
+    双方 LF 比值按衣料区中位数归一 —— 全局亮暗差(SDXL 整件画亮/画暗、胸口
+    整片高光)被中位数吸收(胸口变白不回归), 只传空间相对明暗; 非对称钳制:
+    阴影宽(-38%, "穿上"的关键线索)、高光窄(+12%, 防发白)。
+
     环境变量:
       VTON_PATTERN_LOCK_LIGHT_STRENGTH  (1.0)  光照总闸:0=精确 ref,1=全效
       VTON_PATTERN_LOCK_LF_STRENGTH     (1.0)  底色光照响应系数(1=全强度)
       VTON_PATTERN_LOCK_HF_STRENGTH     (0.5)  花纹光照响应系数(0=不受光照,1=全强度)
-      VTON_PATTERN_LOCK_LF_BLUR_SIGMA   (8.0)  低频提取高斯 sigma
-      VTON_PATTERN_LOCK_LIGHTING_MIN    (0.75) 亮度比下限(clamp 作用于 lighting)
-      VTON_PATTERN_LOCK_LIGHTING_MAX    (1.25) 亮度比上限
+    VTON_PATTERN_LOCK_LF_BLUR_SIGMA   (8.0)  低频提取高斯 sigma
+      VTON_PATTERN_LOCK_LIGHTING_MIN    (0.62) 空间明暗场下限(阴影通道, 归一后)
+      VTON_PATTERN_LOCK_LIGHTING_MAX    (1.12) 空间明暗场上限(高光通道, 归一后)
       VTON_PATTERN_LOCK_SKIN_WEIGHT     (0.85) 肤色降权
       VTON_PATTERN_LOCK_FEATHER_PX      (5)    mask 边缘羽化像素
       VTON_PATTERN_LOCK_SKIP_WHITE_BG   (1)    跳过画布边缘连通白底
       VTON_PATTERN_LOCK_WHITE_THRESH    (245)  白底 RGB 判定阈值
+      VTON_PATTERN_LOCK_FOLD_GAIN       (0.45) gen 褶皱光影叠加强度(0=关)
     """
     import os
 
@@ -1965,8 +2023,8 @@ def _pattern_lock_overlay(
     lf_strength = _env_float("VTON_PATTERN_LOCK_LF_STRENGTH", 1.0, 0.0, 4.0)
     hf_strength = _env_float("VTON_PATTERN_LOCK_HF_STRENGTH", 0.5, 0.0, 4.0)
     lf_blur = _env_float("VTON_PATTERN_LOCK_LF_BLUR_SIGMA", 8.0, 0.0, 64.0)
-    light_min = _env_float("VTON_PATTERN_LOCK_LIGHTING_MIN", 0.75, 0.0, 4.0)
-    light_max = _env_float("VTON_PATTERN_LOCK_LIGHTING_MAX", 1.25, 0.0, 4.0)
+    light_min = _env_float("VTON_PATTERN_LOCK_LIGHTING_MIN", 0.62, 0.0, 4.0)
+    light_max = _env_float("VTON_PATTERN_LOCK_LIGHTING_MAX", 1.12, 0.0, 4.0)
     if light_min > light_max:
         # 行30: min>max 时 np.clip 把所有像素钉在 min(整体偏色)。交换并告警。
         logger.warning(
@@ -2004,10 +2062,17 @@ def _pattern_lock_overlay(
     # 衣物 alpha(来自 warp 出的 RGBA 参考): alpha=0 处(画布白底/无衣料区,
     # 如参考图没覆盖到的袖子区)不贴入 —— 否则白底整块贴到模特身上 = 袖子白晕/
     # 脖子灰带根因。白衣 alpha=1 照常贴(比白底启发式更准, 二者相乘双保险)。
+    # 必须取 A 通道: convert("L") 对 RGBA 取的是 RGB 亮度而非 alpha —— 深色
+    # 衣(藏青/墨绿, luma 65-90)贴回不透明度被压到 0.25-0.35, gen 像素(肚皮
+    # 肤色/白晕)透出 65%+, 漏肚脐/图案失真/结淡全由此出。
     if ref_alpha is not None:
-        _a = np.asarray(ref_alpha.convert("L"))
+        _a = np.asarray(ref_alpha.getchannel("A") if ref_alpha.mode in ("RGBA", "LA") else ref_alpha.convert("L"))
         if _a.shape[:2] != ref.shape[:2]:
             _a = np.array(Image.fromarray(_a).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR))
+        # 半透边缘(alpha<150)不贴: mask 膨胀核(kx~56px)会让 mask 越过面料
+        # 形边界, 半透 alpha(40-130)按 content 比例混入 = 袖缘浅蓝/杂色 fringe。
+        _a = _a.copy()
+        _a[_a < 150] = 0
         content = content * (_a.astype(np.float32) / 255.0)[..., None]
 
     mask_norm = (mask_f32 / 255.0)[..., None]
@@ -2025,17 +2090,47 @@ def _pattern_lock_overlay(
     skin_factor = 1.0
     if skin_u8.any():
         skin_factor = 1.0 - (skin_u8.astype(np.float32) / 255.0)[..., None] * skin_w
+        # 参考图有衣料的像素不降权: 袖条盖在生成裸臂上时仍贴袖料
+        # (旧逻辑按生成图肤色降权 85% → 长袖参考有袖、出图仍无袖)。
+        if ref_alpha is not None:
+            _fa = np.asarray(ref_alpha.getchannel("A") if ref_alpha.mode == "RGBA" else ref_alpha.convert("L"))
+            if _fa.shape[:2] != ref.shape[:2]:
+                _fa = np.array(Image.fromarray(_fa).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR))
+            fabric = (_fa > 40)[..., None]
+            skin_factor = np.where(fabric, np.ones_like(skin_factor), skin_factor)
 
     lf_ref = cv2.GaussianBlur(ref, (0, 0), lf_blur)
     hf_ref = ref - lf_ref
 
     gen_gray = gen[..., 0] * 0.299 + gen[..., 1] * 0.587 + gen[..., 2] * 0.114
-    ref_gray = ref[..., 0] * 0.299 + ref[..., 1] * 0.587 + ref[..., 2] * 0.114
-    lighting = np.clip(gen_gray / (ref_gray + 1.0), light_min, light_max)
+    # 身体尺度明暗场: gen 的 LF 亮度按衣料区中位数归一(不除 LF_ref ——
+    # C14 实测教训: 平铺 ref 自身带影棚阴影, 藏青照片 LF 暗至 5-20, 除法让
+    # ref 的拍摄光影以倒数混入比值场: 34% 像素钉在 +12% 高光帽、整件均值
+    # 压暗 10 而空间结构没涨)。ref 出 albedo, gen 出空间明暗, 各管各的;
+    # 中位数吸收 SDXL 全局亮暗差(胸口变白不回归), 非对称钳制: 阴影宽
+    # (-38%, "穿上"的关键线索)、高光窄(+12%, 防发白)。
+    lf_gen_gray = cv2.GaussianBlur(gen_gray, (0, 0), lf_blur)
+    fabric_px = (mask_f32 > 127) & (content[..., 0] > 0.5)
+    shade_med = float(np.median(lf_gen_gray[fabric_px])) if fabric_px.any() else float(np.median(lf_gen_gray))
+    lighting = np.clip(lf_gen_gray / max(shade_med, 0.05), light_min, light_max)
+    # 中位数归一只保中位=1: 左偏分布(暗尾)会整体压暗(C14 实测整件 -10)。
+    # 单次按"裁剪后均值"再归一, 残余压到 ±3%(病态双峰 ±8%); 不迭代到底
+    # —— 迭代收敛会把场的对比度压平(阴影被逐步抬回), 与传身体明暗相悖。
+    lit_px = lighting[fabric_px] if fabric_px.any() else lighting
+    lighting = np.clip(lighting / max(float(lit_px.mean()), 0.05), light_min, light_max)
 
     shade_lf = 1.0 + (lighting - 1.0) * ls * lf_strength
     shade_hf = 1.0 + (lighting - 1.0) * ls * hf_strength
     lit = np.clip(lf_ref * shade_lf[..., None] + hf_ref * shade_hf[..., None], 0, 255)
+
+    fold_gain = _env_float("VTON_PATTERN_LOCK_FOLD_GAIN", 0.45, 0.0, 1.5)
+    if fold_gain > 0:
+        # 贴回面料叠加 gen 的中频褶皱光影(带通, 零均值): 平铺面料获得生成
+        # 图的身体起伏/褶皱明暗 → "穿上去"而非"贴上去"(贴纸感根因之一是
+        # 全量贴回后面料完全平光)。带通整体零均值不引入提亮(胸口变白不
+        # 回归), 花纹仍被 HF 锁定。0=关闭(A/B 用)。
+        folds = cv2.GaussianBlur(gen_gray, (0, 0), 10.0) - cv2.GaussianBlur(gen_gray, (0, 0), 35.0)
+        lit = np.clip(lit + folds[..., None] * fold_gain, 0, 255)
 
     alpha = edge_weight * content * skin_factor
     out = np.nan_to_num(lit * alpha + gen * (1.0 - alpha), nan=0.0)
@@ -2127,7 +2222,9 @@ def reapply_garment_detail(
     # 白画布(常多于衣料像素)进 LAB 均值/方差会把整次颜色迁移拉白、失真;
     # 画布与衣料边界的高频梯度贴入模特会出白边晕染。
     if ref_alpha is not None:
-        _a = np.asarray(ref_alpha.convert("L"))
+        # 同 _pattern_lock_overlay: 必须取 A 通道。convert("L") 对 RGBA 取
+        # RGB 亮度, 深色衣 src_content 几乎全 False(→ 全图兜底统计被画布白拉偏)。
+        _a = np.asarray(ref_alpha.getchannel("A") if ref_alpha.mode in ("RGBA", "LA") else ref_alpha.convert("L"))
         if _a.shape[:2] != (h, w):
             _a = np.array(Image.fromarray(_a).resize((w, h), Image.Resampling.BILINEAR))
         src_content = _a > 127
