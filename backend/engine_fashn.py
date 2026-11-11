@@ -236,22 +236,12 @@ def compose_tryon_fashn(
     pattern_on = os.environ.get("VTON_PATTERN_LOCK", "1") != "0"
     lock_on = os.environ.get("VTON_LOCK_ID", "1") != "0"
     detail_applied = False
-    apply_mask = None
+    keep_mask = None
+    paste_mask = None
     cloth_ref = None
+    cloth_ref_alpha = None
     if (pattern_on or lock_on) and warp_enabled:
         try:
-            warp_canvas = max(result.size)
-            cloth_ref, cloth_ref_alpha = align_garment_to_pose(
-                garment_img,
-                audience,
-                ethnicity,
-                garment_type,
-                warp_canvas,
-            )
-            if cloth_ref.size != result.size:
-                cloth_ref = cloth_ref.resize(result.size, Image.Resampling.LANCZOS)
-                if cloth_ref_alpha is not None:
-                    cloth_ref_alpha = cloth_ref_alpha.resize(result.size, Image.Resampling.BILINEAR)
             subj = foreground_mask(result)
             shared = clothing_mask(
                 result,
@@ -259,13 +249,45 @@ def compose_tryon_fashn(
                 garment_extent=garment_extent,
                 subject_mask=subj,
             )
-            apply_mask = limit_mask_to_subject(shared, subj) if shared is not None else None
-            apply_mask, _kept = intersect_mask_with_garment_alpha(apply_mask, cloth_ref_alpha)
-            if pattern_on and apply_mask is not None:
+            drawn_mask = limit_mask_to_subject(shared, subj) if shared is not None else None
+            refit = None
+            if os.environ.get("VTON_FASHN_PRINT_ALIGN", "drawn") == "drawn" and drawn_mask is not None:
+                from preserve_refit import refit_cloth_to_drawn_garment
+
+                refit = refit_cloth_to_drawn_garment(garment_img, result.size, drawn_mask)
+            if refit is not None:
+                # 贴印对齐生成几何: 平铺衣 TPS 重投到 FASHN 画的衣服 bbox;
+                # 检测区即衣服边界, 纯裁剪(clip, 无并集); 贴印区=印花核心,
+                # 全衣料款回退整件贴回。贴印/保真分与衣服保护三 mask 解耦。
+                cloth_ref, cloth_ref_alpha = refit
+                from preserve_refit import clip_mask_to_garment_alpha, print_core_mask
+
+                keep_mask = clip_mask_to_garment_alpha(drawn_mask, cloth_ref_alpha)
+                paste_mask = print_core_mask(cloth_ref, keep_mask)
+                if paste_mask is None:
+                    paste_mask = keep_mask
+            else:
+                # 模板对齐(legacy 回退): warp 平铺衣到身体模板先验,
+                # 并集再裁剪(intersect)兜住宽松款悬垂面料。
+                warp_canvas = max(result.size)
+                cloth_ref, cloth_ref_alpha = align_garment_to_pose(
+                    garment_img,
+                    audience,
+                    ethnicity,
+                    garment_type,
+                    warp_canvas,
+                )
+                if cloth_ref.size != result.size:
+                    cloth_ref = cloth_ref.resize(result.size, Image.Resampling.LANCZOS)
+                    if cloth_ref_alpha is not None:
+                        cloth_ref_alpha = cloth_ref_alpha.resize(result.size, Image.Resampling.BILINEAR)
+                keep_mask, _kept = intersect_mask_with_garment_alpha(drawn_mask, cloth_ref_alpha)
+                paste_mask = keep_mask
+            if pattern_on and paste_mask is not None:
                 result = reapply_garment_detail(
                     result,
                     cloth_ref,
-                    apply_mask,
+                    paste_mask,
                     pattern_lock=True,
                     ref_alpha=cloth_ref_alpha,
                 )
@@ -274,27 +296,27 @@ def compose_tryon_fashn(
             logger.exception("FASHN pattern_lock/lock failed; keeping FASHN pixels")
             degraded_reasons.append("FASHN pattern_lock/lock failed")
 
-    # 保护贴回: 遮罩外(人脸/发丝/手/露肤手臂/背景)贴回源图像素,
-    # 遮罩内保留 FASHN 像素 + 贴印。手臂不会变白、胸口不会变白、发丝不会糊。
-    if lock_on and apply_mask is not None:
+    # 保护贴回: keep_mask 外(人脸/发丝/手/露肤手臂/背景)贴回源图像素,
+    # keep_mask 内保留 FASHN 像素 + 贴印。手臂不会变白、胸口不会变白、发丝不会糊。
+    if lock_on and keep_mask is not None:
         try:
             _feather = int(os.environ.get("VTON_PROTECT_FEATHER", "4"))
-            result = protect_inverse_refit(result, base_img, apply_mask, feather_px=_feather)
+            result = protect_inverse_refit(result, base_img, keep_mask, feather_px=_feather)
         except Exception:
             logger.exception("FASHN protect_inverse_refit failed; keeping FASHN pixels")
             degraded_reasons.append("FASHN protect_inverse_refit failed")
 
-    # 印花保真分 + 交付档位: 贴回区内 warp 参考与结果的灰度相关。
+    # 印花保真分 + 交付档位: 贴印区(paste_mask)内 warp 参考与结果的灰度相关。
     # pattern_lock 生效 → 高分 auto; 花纹/字母被重画或错位 → 低分 review。
     # 只算不写: 后续背景/缩放会替换 Image 对象丢掉 .info, 元数据统一在
     # 尾部元数据块写入(与 engine.py 同序), 否则 print_fidelity 会变 null。
     _pf_val = None
     _tier_val = None
-    if apply_mask is not None and cloth_ref is not None:
+    if paste_mask is not None and cloth_ref is not None:
         try:
             from quality_gate import delivery_tier, print_fidelity_score
 
-            _pf_val = print_fidelity_score(result, cloth_ref, apply_mask)
+            _pf_val = print_fidelity_score(result, cloth_ref, paste_mask)
             _tier_val = delivery_tier(_pf_val, sku_has_text=False)
         except Exception:
             logger.exception("FASHN print fidelity scoring failed; tier not set")
@@ -321,7 +343,7 @@ def compose_tryon_fashn(
     result.info["engine_degraded"] = bool(degraded_reason)
     result.info["degraded_reason"] = degraded_reason
     result.info["detail_applied"] = detail_applied
-    result.info["lock_identity"] = lock_on and apply_mask is not None
+    result.info["lock_identity"] = lock_on and keep_mask is not None
     result.info["fashn_category"] = category
     result.info["prewhiten"] = {"base": pw_base, "garment": pw_garment}
     if _pf_val is not None:

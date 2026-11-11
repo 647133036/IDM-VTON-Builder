@@ -408,3 +408,119 @@ def test_print_fidelity_score_size_mismatch_resizes_ref():
     mask = Image.new("L", (128, 128), 255)
     # 缩放后棋盘相位一致 → 高分
     assert quality_gate.print_fidelity_score(big, small, mask) > 0.9
+
+
+# ---------- print_core_mask ----------
+
+
+def test_print_core_mask_detects_logo_within_keep():
+    w, h = 96, 128
+    ref = Image.new("L", (w, h), 235)
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(ref)
+    d.ellipse((36, 48, 60, 72), fill=10)  # 深色 logo
+    keep = np.zeros((h, w), dtype=np.uint8)
+    keep[16:112, 12:84] = 255
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is not None
+    ys, xs = np.where(roi > 0)
+    # 高频响应 = logo 及其 blur halo(±6px) + grow_px(3): 容差 9px
+    assert xs.min() >= 27 and xs.max() <= 69
+    assert ys.min() >= 39 and ys.max() <= 81
+    # 不越出 keep 区
+    assert roi[:16, :].max() == 0 and roi[112:, :].max() == 0
+
+
+def test_print_core_mask_solid_returns_none():
+    ref = Image.new("L", (64, 64), 200)
+    keep = np.full((64, 64), 255, dtype=np.uint8)
+    assert preserve_refit.print_core_mask(ref, keep) is None
+
+
+def test_print_core_mask_resizes_keep_to_ref():
+    ref = Image.new("L", (64, 64), 235)
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(ref)
+    d.rectangle((28, 28, 36, 36), fill=0)
+    keep = np.full((128, 128), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is not None
+
+
+# ---------- clip_mask_to_garment_alpha ----------
+
+
+def test_clip_mask_to_garment_alpha_shrinks_without_union():
+    m = np.zeros((64, 64), dtype=np.uint8)
+    m[10:50, 10:50] = 255  # 大方框
+    alpha = Image.new("L", (64, 64), 0)
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(alpha)
+    d.ellipse((20, 20, 44, 44), fill=255)  # 小圆(衣料)
+    out = preserve_refit.clip_mask_to_garment_alpha(m, alpha, grow_px=0)
+    arr = np.asarray(out)
+    assert arr.shape == (64, 64)
+    # 圆外 且 mask=255 的位置必须被裁掉(证明是纯裁剪而非并集)
+    assert arr[12, 12] == 0
+    assert arr[32, 32] == 255
+    assert arr.max() <= 255
+    assert not np.array_equal(arr, m)
+
+
+def test_clip_mask_to_garment_alpha_none_passthrough():
+    m = np.full((32, 32), 255, dtype=np.uint8)
+    assert preserve_refit.clip_mask_to_garment_alpha(m, None) is m
+    assert preserve_refit.clip_mask_to_garment_alpha(None, Image.new("L", (32, 32), 255)) is None
+
+
+# ---------- refit_cloth_to_drawn_garment ----------
+
+
+def test_refit_cloth_to_drawn_garment_aligns_content_bbox():
+    # 平铺衣: 64x80 白底, 红色衣身在中间 (16,20)-(48,60)
+    g = Image.new("RGB", (64, 80), (255, 255, 255))
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(g)
+    d.rectangle((16, 20, 48, 60), fill=(200, 30, 30))
+    # 生成图 128x160, 检测衣料区在 (30,40)-(98,120)
+    drawn = np.zeros((160, 128), dtype=np.uint8)
+    drawn[40:121, 30:99] = 255
+    out = preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), drawn)
+    assert out is not None
+    rgb, rgba = out
+    assert rgb.size == (128, 160) and rgba.size == (128, 160)
+    a = np.asarray(rgba.split()[-1])
+    ys, xs = np.where(a > 10)
+    assert abs(xs.min() - 30) <= 2 and abs(xs.max() - 98) <= 2
+    assert abs(ys.min() - 40) <= 2 and abs(ys.max() - 120) <= 2
+
+
+def test_refit_cloth_to_drawn_garment_solid_garment_uses_full_bbox():
+    # 无白底纯色衣: garment_alpha 可能全零 → 回退整图 bbox, 仍应成功重投
+    g = Image.new("RGB", (64, 80), (30, 120, 220))
+    drawn = np.zeros((160, 128), dtype=np.uint8)
+    drawn[40:121, 30:99] = 255
+    out = preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), drawn)
+    assert out is not None
+    a = np.asarray(out[1].split()[-1])
+    assert a.max() > 10
+    ys, xs = np.where(a > 10)
+    assert abs(xs.min() - 30) <= 2 and abs(xs.max() - 98) <= 2
+    assert abs(ys.min() - 40) <= 2 and abs(ys.max() - 120) <= 2
+
+
+def test_refit_cloth_to_drawn_garment_degenerate_masks_return_none():
+    g = Image.new("RGB", (64, 80), (200, 30, 30))
+    # 全画布 drawn(比例守卫) → None
+    full = np.full((160, 128), 255, dtype=np.uint8)
+    assert preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), full) is None
+    # 过小区域 → None
+    tiny = np.zeros((160, 128), dtype=np.uint8)
+    tiny[70:74, 60:66] = 255
+    assert preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), tiny) is None
+    # 尺寸不匹配 → None
+    assert preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), np.full((80, 64), 255, dtype=np.uint8)) is None

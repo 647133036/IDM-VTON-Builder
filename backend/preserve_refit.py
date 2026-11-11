@@ -154,6 +154,18 @@ def tps_warp(
         G = np.hstack([np.ones((len(gx), 1)), gx])
         src_coords = G @ aff + K_g @ w_coeff
 
+        # 采样越界裁剪前先记 valid 掩膜: np.clip 会把画布外采样点硬夹到
+        # 源图边缘(边缘涂抹), 对 alpha 全开的纯色衣会把整张画布涂满;
+        # 越界像素必须显式清零(透明), 不能复用边缘值。
+        # 半像素容差: TPS 数值噪声让边界锚点坐标出现 -1e-6 / (w-1)+1e-6,
+        # 严格 >=0 会把本该有效的边界像素清零(锚点对齐回归)。
+        valid = (
+            (src_coords[:, 0] >= -0.5)
+            & (src_coords[:, 0] <= w - 0.5)
+            & (src_coords[:, 1] >= -0.5)
+            & (src_coords[:, 1] <= h - 0.5)
+        ).reshape(canvas_h, canvas_w)
+
         sx = np.clip(src_coords[:, 0], 0, w - 1).astype(np.float32).reshape(canvas_h, canvas_w)
         sy = np.clip(src_coords[:, 1], 0, h - 1).astype(np.float32).reshape(canvas_h, canvas_w)
 
@@ -162,6 +174,7 @@ def tps_warp(
         warped = cv2.remap(
             arr, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0)
         )
+        warped[~valid] = 0
         return Image.fromarray(warped.astype(np.uint8), "RGBA")
     except Exception:
         logger.exception("tps_warp failed; falling back to LANCZOS resize")
@@ -241,6 +254,169 @@ def detect_print_roi(
     except Exception:
         logger.exception("detect_print_roi failed")
         return None
+
+
+def print_core_mask(
+    cloth_ref: Image.Image,
+    keep_mask: np.ndarray | Image.Image,
+    hf_thresh: float = 12.0,
+    min_area_frac: float = 0.004,
+    grow_px: int = 3,
+) -> np.ndarray | None:
+    """印花核心区(全量掩膜, 非边界带): warp 参考图在保留区内的高频区。
+
+    与 detect_print_roi(dilate-erode 边界带, 供局部 inpaint)互补:
+    本函数返回印花本体(logo/字母/大图案/纹理)的实心区, 作为确定性
+    贴印区域与印花保真分的测区; grow_px 外扩盖住抗锯齿缝并裁回
+    keep_mask, 不越出衣料。纯色款(高频不足)返回 None, 调用方回退
+    整件衣料贴回。
+
+    Args:
+        cloth_ref: warp 后的 SKU 参考图 (RGB/RGBA)
+        keep_mask: 衣料保留区掩膜 (L/ndarray, 255=衣料)
+        hf_thresh: 高频能量阈值(0-255 灰度差)
+        min_area_frac: 核心区面积占比下限, 低于此返回 None
+        grow_px: 核心区外扩像素(边缘覆盖), 0=不扩
+
+    Returns:
+        uint8 核心区掩膜(255=贴印区), 纯色/失败返回 None
+    """
+    try:
+        import cv2
+
+        ref = np.asarray(cloth_ref.convert("L"), dtype=np.float32)
+        mask = np.asarray(keep_mask)
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        if mask.shape[:2] != ref.shape[:2]:
+            mask = np.array(
+                Image.fromarray(mask.astype("uint8")).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
+            )
+        blur = cv2.GaussianBlur(ref, (0, 0), 4.0)
+        hf = np.abs(ref - blur)
+        roi = ((hf > hf_thresh) & (mask > 127)).astype(np.uint8) * 255
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        roi = cv2.morphologyEx(roi, cv2.MORPH_OPEN, k)
+        roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k)
+        if float(roi.mean()) / 255.0 < min_area_frac:
+            return None
+        if grow_px > 0:
+            ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow_px * 2 + 1, grow_px * 2 + 1))
+            roi = np.minimum(cv2.dilate(roi, ke), mask.astype(np.uint8))
+        return roi
+    except Exception:
+        logger.exception("print_core_mask failed")
+        return None
+
+
+def clip_mask_to_garment_alpha(
+    apply_mask: np.ndarray | Image.Image | None,
+    ref_alpha: Image.Image | None,
+    grow_px: int = 6,
+) -> np.ndarray | Image.Image | None:
+    """mask ∩ 衣料 alpha(膨胀余量): 纯裁剪, 不并集不外扩。
+
+    与 intersect_mask_with_garment_alpha 相反方向的守卫: 那个把 mask
+    并上实心 alpha 再裁(为 SDXL 模板路径兜住宽松款悬垂面料), 本函数
+    只做 min(mask, dilate(alpha)) —— FASHN 路径衣服由生成器画定,
+    检测区就是衣服边界, 再向模板 alpha 形并集会把贴印推进空气里
+    (GPU 实测 apply 0.161→0.3685, 印花重影)。
+    """
+    if apply_mask is None or ref_alpha is None:
+        return apply_mask
+    try:
+        import cv2
+    except ImportError:
+        return apply_mask
+    m = np.asarray(apply_mask)
+    if m.ndim == 3:
+        m = m[..., 0]
+    h, w = m.shape
+    ra_src = ref_alpha.getchannel("A") if ref_alpha.mode == "RGBA" else ref_alpha.convert("L")
+    ra = np.asarray(ra_src, dtype=np.uint8)
+    if ra.shape != (h, w):
+        ra = np.asarray(ra_src.resize((w, h), Image.Resampling.BILINEAR), dtype=np.uint8)
+    ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (max(1, grow_px) * 2 + 1, max(1, grow_px) * 2 + 1))
+    ra_dil = cv2.dilate(ra, ke)
+    return np.minimum(m, ra_dil)
+
+
+def refit_cloth_to_drawn_garment(
+    garment: Image.Image,
+    canvas_size: tuple[int, int],
+    drawn_mask: np.ndarray | Image.Image,
+) -> tuple[Image.Image, Image.Image] | None:
+    """把平铺衣重投到生成器实际画的衣服几何(bbox 八锚点 TPS)。
+
+    身体模板先验(torso_box)与 FASHN 实际画的衣服存在落位/比例差,
+    模板 warp 的衣料形直接当贴回区会把印花贴到空气里(重影/气泡感,
+    GPU 实测 fidelity 0.847)。这里以生成图检测出的衣服区(drawn_mask)
+    bbox 为目标, 四角+四边中点共 8 锚点 TPS 把平铺衣投到同一几何,
+    贴印/保真分全部以新几何为准; 生成图检测区即衣服边界, 后续用
+    clip_mask_to_garment_alpha 纯裁剪(不并集)。
+
+    Args:
+        garment: 平铺衣 RGB (白底商品图)
+        canvas_size: 生成图尺寸 (w, h)
+        drawn_mask: 生成图检测出的衣服区 (L/ndarray, 255=衣服)
+
+    Returns:
+        (RGB 白底参考, RGBA alpha 参考) 同 align_garment_to_pose 口径;
+        drawn_mask 无效/退化/TPS 失败时 None, 调用方回退模板路径。
+    """
+    try:
+        from engine import garment_alpha
+    except ImportError:
+        logger.debug("refit_cloth_to_drawn_garment: engine.garment_alpha unavailable")
+        return None
+    m = np.asarray(drawn_mask)
+    if m.ndim == 3:
+        m = m[..., 0]
+    if m.shape[:2] != (canvas_size[1], canvas_size[0]):
+        logger.warning("refit_cloth_to_drawn_garment: mask shape %s != canvas %s", m.shape, canvas_size)
+        return None
+    ys, xs = np.where(m > 127)
+    if len(ys) < 16:
+        return None
+    dx0, dx1 = float(xs.min()), float(xs.max())
+    dy0, dy1 = float(ys.min()), float(ys.max())
+    cw, ch = float(canvas_size[0]), float(canvas_size[1])
+    dw, dh = dx1 - dx0, dy1 - dy0
+    if dw < 8 or dh < 8:
+        return None
+    if not (0.04 <= dw / cw <= 0.95 and 0.05 <= dh / ch <= 0.98):
+        logger.info("refit_cloth_to_drawn_garment: drawn bbox degenerate (%.2f, %.2f); fallback", dw / cw, dh / ch)
+        return None
+
+    g = garment.convert("RGBA")
+    if int(g.split()[-1].getextrema()[0]) >= 250:
+        alpha_ch = garment_alpha(garment)
+        # 纯色无白底: 色距 alpha 可能全零, 回退实心衣料(整图即内容)
+        if np.asarray(alpha_ch).max() <= 10:
+            alpha_ch = Image.new("L", g.size, 255)
+        g.putalpha(alpha_ch)
+    a = np.asarray(g.split()[-1])
+    ays, axs = np.where(a > 10)
+    if len(ays) == 0:
+        axs = np.array([0, g.size[0] - 1])
+        ays = np.array([0, g.size[1] - 1])
+    sx0, sx1 = float(axs.min()), float(axs.max())
+    sy0, sy1 = float(ays.min()), float(ays.max())
+    sw, sh = max(1.0, sx1 - sx0), max(1.0, sy1 - sy0)
+
+    fracs = [(0.0, 0.0), (0.5, 0.0), (1.0, 0.0), (0.0, 0.5), (1.0, 0.5), (0.0, 1.0), (0.5, 1.0), (1.0, 1.0)]
+    src_pts = [(sx0 + fx * sw, sy0 + fy * sh) for fx, fy in fracs]
+    dst_pts = [(dx0 + fx * dw, dy0 + fy * dh) for fx, fy in fracs]
+    try:
+        warped = tps_warp(g, src_pts, dst_pts, canvas_size)
+    except Exception:
+        logger.exception("refit_cloth_to_drawn_garment: tps failed; fallback to template path")
+        return None
+    if warped.mode != "RGBA":
+        warped = warped.convert("RGBA")
+    out = Image.new("RGB", canvas_size, (255, 255, 255))
+    out.paste(warped, (0, 0), warped)
+    return out, warped
 
 
 def optical_flow_refit(

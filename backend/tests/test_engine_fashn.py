@@ -191,3 +191,150 @@ def test_compose_tryon_fashn_fidelity_survives_bg_and_resize(monkeypatch, tmp_pa
     assert "print_fidelity" in out.info, "fidelity lost across background/resize transforms"
     assert out.info["print_fidelity"] == 1.0
     assert out.info["delivery_tier"] == "auto"
+
+
+def _fake_fashn(monkeypatch, tmp_path):
+    """共享夹具: FakePipeline 输出 32x32, 全部平台钩子可控。"""
+    import engine_fashn
+    from PIL import Image as PILImage
+
+    class FakePipeline:
+        def __init__(self, weights_dir):
+            pass
+
+        def __call__(self, **kwargs):
+            return types.SimpleNamespace(images=[PILImage.new("RGB", (32, 32), (9, 9, 9))])
+
+    fake_mod = types.ModuleType("fashn_vton")
+    fake_mod.TryOnPipeline = FakePipeline
+    monkeypatch.setitem(sys.modules, "fashn_vton", fake_mod)
+    monkeypatch.setattr(engine_fashn, "FASHN_DIR", tmp_path)
+    monkeypatch.setattr(engine_fashn, "_fashn_state", {"pipe": None})
+    return engine_fashn, PILImage
+
+
+def test_compose_fashn_drawn_align_uses_refit_and_decoupled_masks(monkeypatch, tmp_path):
+    """VTON_FASHN_PRINT_ALIGN=drawn(默认): 贴印几何走 TPS 重投, 三 mask 解耦。
+
+    贴印区(paste_mask)=印花核心 ∩ keep; 保护(protect)拿 keep_mask(纯裁剪);
+    模板路径(align_garment_to_pose)必须不被触碰。退化 drawn_mask(全画布)
+    自动回退模板路径由既有 fidelity 测试覆盖。
+    """
+    import engine_sdxl
+    import numpy as np
+    import platform_presets
+    import preserve_refit
+    import prewhiten as prewhiten_mod
+
+    engine_fashn, PILImage = _fake_fashn(monkeypatch, tmp_path)
+    monkeypatch.setenv("VTON_PATTERN_LOCK", "1")
+    monkeypatch.setenv("VTON_WARP", "1")
+    monkeypatch.setenv("VTON_PROTECT_FEATHER", "4")
+
+    def _no_template(*a, **k):
+        raise AssertionError("drawn path must not call align_garment_to_pose")
+
+    monkeypatch.setattr(engine_sdxl, "align_garment_to_pose", _no_template)
+    monkeypatch.setattr(engine_sdxl, "crop_garment_to_content", lambda img: img)
+    monkeypatch.setattr(engine_sdxl, "infer_auto_garment_type", lambda ext: "dress")
+    monkeypatch.setattr(prewhiten_mod, "prewhiten_input", lambda img: (img, {"status": "already_white"}))
+    monkeypatch.setattr(platform_presets, "detect_garment_extent", lambda img: None)
+    monkeypatch.setattr(
+        platform_presets, "foreground_mask", lambda img: np.full((img.size[1], img.size[0]), 255, dtype=np.uint8)
+    )
+
+    drawn = np.zeros((32, 32), dtype=np.uint8)
+    drawn[10:26, 8:24] = 255
+    monkeypatch.setattr(platform_presets, "clothing_mask", lambda result, **k: drawn.copy())
+
+    reapply_masks = []
+
+    def _reapply(result, ref, mask, **k):
+        reapply_masks.append(np.asarray(mask).copy())
+        return ref.convert("RGB")
+
+    monkeypatch.setattr(platform_presets, "reapply_garment_detail", _reapply)
+
+    protect_masks = []
+
+    def _protect(result, base, mask, feather_px=4):
+        protect_masks.append(np.asarray(mask).copy())
+        return result
+
+    monkeypatch.setattr(preserve_refit, "protect_inverse_refit", _protect)
+    monkeypatch.setattr(platform_presets, "force_white_background", lambda result, subject_mask=None: result)
+
+    garment = tmp_path / "g.png"
+    flat = PILImage.new("RGB", (24, 32), (255, 255, 255))
+    from PIL import ImageDraw
+
+    ImageDraw.Draw(flat).rectangle((6, 8, 18, 24), fill=(200, 30, 30))
+    flat.save(garment)
+    person = tmp_path / "p.png"
+    PILImage.new("RGB", (40, 60), (10, 20, 30)).save(person)
+
+    out = engine_fashn.compose_tryon_fashn(person, garment, "women", "dress", 48, "white", "western_europe")
+    assert out.info["engine"] == "fashn-vton"
+    assert out.info["detail_applied"] is True
+    # 三 mask 解耦: 贴印区来自印花核心(实心红块内容平坦 → 边界环核心),
+    # 且不越出 keep; protect 拿到的整件衣料 keep(裁到 alpha)
+    assert len(reapply_masks) == 1 and len(protect_masks) == 1
+    paste = reapply_masks[0]
+    keep = protect_masks[0]
+    assert paste.sum() > 0
+    assert np.asarray(paste & keep).sum() == paste.sum()
+    assert keep.sum() < 255 * 32 * 32, "keep must be clipped, not full canvas"
+    # 贴印区与 keep 在 drawn bbox 内
+    ys, xs = np.where(keep > 0)
+    assert xs.min() >= 8 and xs.max() < 24 and ys.min() >= 10 and ys.max() < 26
+    assert out.info["print_fidelity"] == 1.0
+    assert out.info["delivery_tier"] == "auto"
+    assert out.info["lock_identity"] is True
+
+
+def test_compose_fashn_template_align_env_restores_legacy(monkeypatch, tmp_path):
+    """VTON_FASHN_PRINT_ALIGN=template: 显式回退模板路径, 语义与旧版一致。"""
+    import engine_sdxl
+    import numpy as np
+    import platform_presets
+    import preserve_refit
+    import prewhiten as prewhiten_mod
+
+    engine_fashn, PILImage = _fake_fashn(monkeypatch, tmp_path)
+    monkeypatch.setenv("VTON_FASHN_PRINT_ALIGN", "template")
+    monkeypatch.setenv("VTON_PATTERN_LOCK", "1")
+    monkeypatch.setenv("VTON_WARP", "1")
+
+    ref = PILImage.new("RGBA", (32, 32), (200, 10, 10, 255))
+    alpha = PILImage.new("L", (32, 32), 255)
+    calls = []
+
+    def _align(*a, **k):
+        calls.append(1)
+        return ref, alpha
+
+    monkeypatch.setattr(engine_sdxl, "align_garment_to_pose", _align)
+    monkeypatch.setattr(engine_sdxl, "crop_garment_to_content", lambda img: img)
+    monkeypatch.setattr(engine_sdxl, "infer_auto_garment_type", lambda ext: "dress")
+    monkeypatch.setattr(prewhiten_mod, "prewhiten_input", lambda img: (img, {"status": "already_white"}))
+    monkeypatch.setattr(platform_presets, "detect_garment_extent", lambda img: None)
+    monkeypatch.setattr(
+        platform_presets, "foreground_mask", lambda img: np.full((img.size[1], img.size[0]), 255, dtype=np.uint8)
+    )
+    drawn = np.zeros((32, 32), dtype=np.uint8)
+    drawn[10:26, 8:24] = 255
+    monkeypatch.setattr(platform_presets, "clothing_mask", lambda result, **k: drawn.copy())
+    monkeypatch.setattr(engine_sdxl, "intersect_mask_with_garment_alpha", lambda m, a: (m, 1))
+    monkeypatch.setattr(platform_presets, "reapply_garment_detail", lambda result, r, mask, **k: r.convert("RGB"))
+    monkeypatch.setattr(preserve_refit, "protect_inverse_refit", lambda r, b, m, feather_px=4: r)
+    monkeypatch.setattr(platform_presets, "force_white_background", lambda result, subject_mask=None: result)
+
+    person = tmp_path / "p.png"
+    garment = tmp_path / "g.png"
+    PILImage.new("RGB", (40, 60), (10, 20, 30)).save(person)
+    PILImage.new("RGB", (24, 32), (200, 10, 10)).save(garment)
+
+    out = engine_fashn.compose_tryon_fashn(person, garment, "women", "dress", 48, "white", "western_europe")
+    assert calls, "template env must route through align_garment_to_pose"
+    assert out.info["print_fidelity"] == 1.0
+    assert out.info["delivery_tier"] == "auto"
