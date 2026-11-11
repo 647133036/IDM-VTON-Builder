@@ -127,32 +127,49 @@ def tps_warp(
         # 逆向 TPS: 以目标锚点为节点、源锚点为值, 求 g: 画布坐标 -> 平铺图坐标,
         # remap 时对每个画布像素取 g 求采样位置(逆向映射, 高频印花不走样)。
         # Bookstein 方程组: [[K, P^T], [P, 0]] (n+3)x(n+3), P = [1; x; y] (3, n)。
+        #
+        # 坐标归一化: 像素尺度下 K 项 ~ r^2 log r (1e6) 与 P 项 (~1e2) 混尺度,
+        # cond(M) 实测 ~1e13, 同锚点跨 LAPACK 版本解发散(GPU r5 实测 warp 塌成
+        # 斜条, fidelity 0.498)。统一缩到 [0,1]^2 求解再反缩放, 节点精确性不变。
         n = len(src)
+        dst_min = dst.min(axis=0)
+        dst_rng = np.maximum(dst.max(axis=0) - dst_min, 1e-9)
+        src_min = src.min(axis=0)
+        src_rng = np.maximum(src.max(axis=0) - src_min, 1e-9)
+        dst_n = (dst - dst_min) / dst_rng
+        src_n = (src - src_min) / src_rng
+
         K = np.zeros((n, n))
         for i in range(n):
             for j in range(n):
-                K[i, j] = _rbf_kernel(dst[i], dst[j])
-        P = np.vstack([np.ones((1, n)), dst.T])
+                K[i, j] = _rbf_kernel(dst_n[i], dst_n[j])
+        P = np.vstack([np.ones((1, n)), dst_n.T])
         M = np.zeros((n + 3, n + 3))
         M[:n, :n] = K
         M[:n, n:] = P.T
         M[n:, :n] = P
         rhs = np.zeros((n + 3, 2))
-        rhs[:n, :] = src
+        rhs[:n, :] = src_n
         sol = np.linalg.solve(M, rhs)
+        # 求解守卫: 病态锚点(共线/重复)可能静默解出垃圾, 残差检查兜底,
+        # 触发即抛错走 LANCZOS 回退, 不把烂映射交给贴印。
+        _resid = float(np.abs(M @ sol - rhs).max())
+        if not np.isfinite(_resid) or _resid > 1e-6:
+            raise ValueError(f"TPS solve residual too large: {_resid}")
         w_coeff = sol[:n, :]
         aff = sol[n:, :]
 
         # 生成目标像素网格
         xg, yg = np.meshgrid(np.arange(canvas_w, dtype=np.float64), np.arange(canvas_h, dtype=np.float64))
         gx = np.stack([xg, yg], axis=-1).reshape(-1, 2)
+        gx_n = (gx - dst_min) / dst_rng
 
         # TPS 映射: 目标画布 -> 源平铺图
         K_g = np.zeros((len(gx), n))
         for i in range(n):
-            K_g[:, i] = _rbf_kernel_batch(gx, dst[i])
-        G = np.hstack([np.ones((len(gx), 1)), gx])
-        src_coords = G @ aff + K_g @ w_coeff
+            K_g[:, i] = _rbf_kernel_batch(gx_n, dst_n[i])
+        G = np.hstack([np.ones((len(gx), 1)), gx_n])
+        src_coords = (G @ aff + K_g @ w_coeff) * src_rng + src_min
 
         # 采样越界裁剪前先记 valid 掩膜: np.clip 会把画布外采样点硬夹到
         # 源图边缘(边缘涂抹), 对 alpha 全开的纯色衣会把整张画布涂满;
@@ -414,6 +431,16 @@ def refit_cloth_to_drawn_garment(
         return None
     if warped.mode != "RGBA":
         warped = warped.convert("RGBA")
+    # 覆盖率守卫: warp 塌缩(数值病态/锚点退化)时 alpha 只剩零散斜条,
+    # 贴印/保真分会拿到稀疏 sliver(GPU r5 实测 frac 0.011 vs 预期 0.14,
+    # fidelity 0.498); 低于 dst bbox 面积 x 源内容填充率的一半即判失败,
+    # 回退模板路径。
+    wa = np.asarray(warped.split()[-1])
+    dst_frac = (dw * dh) / (cw * ch)
+    src_fill = len(axs) / max(1.0, sw * sh)
+    if float((wa > 10).mean()) < 0.5 * dst_frac * src_fill:
+        logger.warning("refit_cloth_to_drawn_garment: warped coverage collapsed; fallback to template path")
+        return None
     out = Image.new("RGB", canvas_size, (255, 255, 255))
     out.paste(warped, (0, 0), warped)
     return out, warped

@@ -524,3 +524,72 @@ def test_refit_cloth_to_drawn_garment_degenerate_masks_return_none():
     assert preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), tiny) is None
     # 尺寸不匹配 → None
     assert preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), np.full((80, 64), 255, dtype=np.uint8)) is None
+
+
+def test_tps_warp_large_scale_rect_anchors_stable():
+    """服务器尺度回归(r5): 1441x2086 平铺衣 8 锚点 warp 到 576x768 画布。
+
+    像素尺度 Bookstein cond~1e13 跨 LAPACK 版本解发散, 归一化后必须
+    覆盖率健康(接近 dst bbox x 源填充率)且 bbox 对齐。
+    """
+    w, h = 1441, 2086
+    rgb = np.full((h, w, 4), (255, 255, 255, 0), dtype=np.uint8)
+    rgb[46:2041, 46:1395, :3] = (200, 30, 30)
+    rgb[46:2041, 46:1395, 3] = 255
+    ref = Image.fromarray(rgb, "RGBA")
+    src = [(46, 46), (720, 46), (1395, 46), (46, 1043), (1395, 1043), (46, 2040), (720, 2040), (1395, 2040)]
+    dst = [(164, 192), (286, 192), (409, 192), (164, 352), (409, 352), (164, 512), (286, 512), (409, 512)]
+    out = preserve_refit.tps_warp(ref, src, dst, (576, 768))
+    a = np.asarray(out.split()[-1])
+    frac = float((a > 10).mean())
+    src_fill = ((1395 - 46) * (2041 - 46)) / (w * h)
+    dst_frac = (409 - 164) * (512 - 192) / (576 * 768)
+    assert frac >= 0.5 * src_fill * dst_frac, f"warped coverage collapsed: {frac}"
+    ys, xs = np.where(a > 10)
+    assert abs(xs.min() - 164) <= 3 and abs(xs.max() - 409) <= 3
+    assert abs(ys.min() - 192) <= 3 and abs(ys.max() - 512) <= 3
+
+
+def test_tps_warp_bad_solve_falls_back(monkeypatch):
+    """求解守卫: LAPACK 静默出垃圾解时残差检查抛错 → LANCZOS 回退。"""
+    ref = Image.new("RGBA", (100, 200), (200, 100, 50, 255))
+    src = [(0, 0), (100, 0), (100, 200), (0, 200)]
+    dst = [(0, 0), (64, 0), (64, 64), (0, 64)]
+    real_solve = np.linalg.solve
+
+    def _garbage_solve(a_, b_):
+        sol = real_solve(a_, b_)
+        return sol * 1e6 + 123.0
+
+    monkeypatch.setattr(np.linalg, "solve", _garbage_solve)
+    out = preserve_refit.tps_warp(ref, src, dst, (64, 64))
+    assert out.size == (64, 64)
+    # 回退是 LANCZOS resize: 纯色图四角 alpha 仍在
+    assert np.asarray(out)[0, 0, 3] > 127
+
+
+def test_tps_warp_collinear_anchors_fall_back():
+    """病态锚点(共线): 系统奇异/残差超限 → 回退 resize 而非垃圾 warp。"""
+    ref = Image.new("RGBA", (100, 200), (200, 100, 50, 255))
+    src = [(0, 0), (50, 0), (100, 0), (0, 200)]
+    dst = [(0, 0), (32, 0), (64, 0), (0, 64)]
+    out = preserve_refit.tps_warp(ref, src, dst, (64, 64))
+    assert out.size == (64, 64)
+
+
+def test_refit_cloth_to_drawn_garment_rejects_collapsed_warp(monkeypatch):
+    """覆盖率守卫: warp 塌成稀疏斜条时 refit 判失败返回 None(回退模板)。"""
+    g = Image.new("RGB", (64, 80), (255, 255, 255))
+    from PIL import ImageDraw
+
+    ImageDraw.Draw(g).rectangle((16, 20, 48, 60), fill=(200, 30, 30))
+    drawn = np.zeros((160, 128), dtype=np.uint8)
+    drawn[40:121, 30:99] = 255
+
+    def _collapse(ref_img, src, dst, canvas_size):
+        arr = np.zeros((canvas_size[1], canvas_size[0], 4), dtype=np.uint8)
+        arr[:, 60:62, 3] = 255
+        return Image.fromarray(arr, "RGBA")
+
+    monkeypatch.setattr(preserve_refit, "tps_warp", _collapse)
+    assert preserve_refit.refit_cloth_to_drawn_garment(g, (128, 160), drawn) is None
