@@ -35,13 +35,13 @@ def test_protect_inverse_refit_telea_boundary_smooths():
     result, source, mask = _make_pair()
     out = preserve_refit.protect_inverse_refit(result, source, mask, feather_px=3)
     arr = np.array(out)
-    # 边界带 Telea 后, 中间行 28-35 列(边界 ±4px) 应全为 0(源图色,
-    # 因为源图全黑, 结果全白, Telea 在边界带填黑)
     h, w = arr.shape[:2]
     mid = w // 2
-    band = arr[h // 2, mid - 4 : mid + 4, 0]
-    # 边界带被 Telea 平滑后, 不应有 255(结果白) 残留
-    assert (band < 128).all(), f"boundary band should be smoothed to source color, got {band}"
+    # Telea 只修保护侧边界薄环(mask 边缘外 feather_px=3, 即 mid..mid+2):
+    # apply 侧保持生成白, 环内产生白→黑过渡, 环外贴源图黑。
+    assert (arr[h // 2, mid - 4 : mid, 0] == 255).all(), "apply side of band must keep generated pixels"
+    assert arr[h // 2, mid : mid + 3, 0].min() < 255, "ring must be Telea-smoothed transition"
+    assert arr[h // 2, mid + 5, 0] == 0, "beyond ring must be pasted source pixels"
 
 
 def test_protect_inverse_refit_feather_zero_no_telea():
@@ -54,6 +54,22 @@ def test_protect_inverse_refit_feather_zero_no_telea():
     # mid-2 在重绘区(左半 mask=255), 应保留结果白; mid+2 在保护区(右半 mask=0), 贴源图黑
     assert arr[h // 2, mid - 2, 0] == 255
     assert arr[h // 2, mid + 2, 0] == 0
+
+
+def test_protect_inverse_refit_telea_preserves_apply_interior():
+    """Telea 只许修边界薄环; apply 区内部必须保留生成像素。
+
+    GPU 回归: 此前把整块膨胀区当 inpaint 掩膜, TELEA 把整件衣服
+    从四周白背景重建, apply 区 0.37 画布全部变白(白漏斗)。
+    """
+    result, source, mask = _make_pair()
+    out = preserve_refit.protect_inverse_refit(result, source, mask, feather_px=3)
+    arr = np.array(out)
+    w = arr.shape[1]
+    # apply 区内部(左半, 远离边界带): 保持 result 全白
+    assert arr[:, : w // 2 - 8].mean() > 250, "apply interior must keep generated pixels"
+    # 保护区内部(右半, 远离边界带): 贴回 source 全黑
+    assert arr[:, w // 2 + 8 :].mean() < 5
 
 
 def test_protect_inverse_refit_size_mismatch_resizes_source():

@@ -83,6 +83,12 @@ def _ensure_parser_stub() -> None:
         "Right-arm": 15,
         "Bag": 16,
         "Scarf": 17,
+        # agnostic.py 深路径索引的部位键 (seg_free=True 不消费, 结构兼容)
+        "arms": 18,
+        "torso": 19,
+        "legs": 20,
+        "hands": 21,
+        "feet": 22,
     }
     stub.BODY_COVERAGE_TO_FASHN_LABELS = {}
     stub.FASHN_LABELS_TO_IDS = {}

@@ -59,9 +59,13 @@ def protect_inverse_refit(
 
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (feather_px * 2 + 1, feather_px * 2 + 1))
             dilated = cv2.dilate(mask, k)
-            boundary = (dilated > 20).astype(np.uint8) * 255
-            protect_mask = ((mask <= 20) | (boundary > 20)).astype(np.uint8)
-            protect_mask[boundary > 20] = 0  # 边界带不进保护, 留给 Telea
+            dilated = cv2.dilate(mask, k)
+            # 边界带 = 膨胀带 - 原始遮罩 (薄环)。此前误把整块膨胀区传给
+            # cv2.inpaint, TELEA 把整件衣服当待修复区, 从四周白背景重建
+            # 出白色糊块 (GPU 实测: apply 区 0.37 画布全部变白)。
+            boundary = ((dilated > 20) & (mask <= 20)).astype(np.uint8) * 255
+            protect_mask = (mask <= 20).astype(np.uint8)
+            protect_mask[boundary > 0] = 0  # 边界带不进保护, 留给 Telea
         except ImportError:
             protect_mask = (mask <= 20).astype(np.uint8)
             boundary = None
