@@ -500,9 +500,12 @@ def ghost_print_mask(
                 ex = np.array(
                     Image.fromarray(ex.astype("uint8")).resize((gen.shape[1], gen.shape[0]), Image.Resampling.BILINEAR)
                 )
-            cand = cand & (
-                cv2.dilate((ex > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))) == 0
-            )
+            # 排除环 9px(与核心场自身外扩对齐)而非 19: 场(hull+9)与鬼场
+            # (≥core+9, 场末 dilate9 回填)必须无缝衔接, 否则 9-19px 环带内
+            # FASHN 银白残影两头都不清理(r9b GPU 视觉验收: 印花轮廓被
+            # 白色不规则边缘切割); 环带成分 ~10px 宽, 腐蚀 1px 后仍可成核。
+            ex_d = cv2.dilate((ex > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+            cand = cand & (ex_d == 0)
         if float(cand.sum()) < 32:
             return None
         er = cv2.erode(cand.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
