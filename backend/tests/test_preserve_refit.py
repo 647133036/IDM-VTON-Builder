@@ -117,6 +117,32 @@ def test_tps_warp_fewer_than_4_anchors_falls_back():
     assert out.size == (64, 64)  # 回退 LANCZOS resize
 
 
+def test_tps_warp_broken_solve_falls_back_to_lstsq(monkeypatch):
+    """GPU 服务器 OpenBLAS ILP64 的 LAPACK gesv 在良态 11x11 上返回垃圾
+    (实测 cond 20 残差 2.7117555, r6-r8 冒烟全部静默 LANCZOS, fidelity
+    卡 0.85 平台): solve 残差越限时必须换 lstsq(SVD 路径实测 1.3e-15)
+    重试, 良态锚点不得走 LANCZOS 回退。
+    """
+    import numpy as _np
+
+    ref = Image.new("RGBA", (100, 200), (200, 100, 50, 255))
+    src = [(0, 0), (100, 0), (100, 200), (0, 200)]
+    dst = [(0, 0), (64, 0), (64, 64), (0, 64)]
+
+    real_solve = _np.linalg.solve
+
+    def _broken_solve(M, rhs):
+        real_solve(M, rhs)  # 校验矩阵本身良态
+        return _np.full_like(rhs, 0.5)  # 仿真服务器 LAPACK 返回垃圾
+
+    monkeypatch.setattr(_np.linalg, "solve", _broken_solve)
+    out = preserve_refit.tps_warp(ref, src, dst, (64, 64))
+    assert out.size == (64, 64)
+    arr = np.array(out)
+    # lstsq 换道成功: 画布四角 alpha 来自 ref 四角, 非全图 LANCZOS 塌缩
+    assert arr[0, 0, 3] > 127 and arr[0, -1, 3] > 127 and arr[-1, 0, 3] > 127 and arr[-1, -1, 3] > 127
+
+
 def test_tps_warp_mismatched_anchors_falls_back():
     ref = Image.new("RGBA", (100, 200), (200, 100, 50, 255))
     src = [(0, 0), (100, 0), (100, 200), (0, 200)]

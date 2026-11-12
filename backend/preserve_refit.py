@@ -155,7 +155,15 @@ def tps_warp(
         # 触发即抛错走 LANCZOS 回退, 不把烂映射交给贴印。
         _resid = float(np.abs(M @ sol - rhs).max())
         if not np.isfinite(_resid) or _resid > 1e-6:
-            raise ValueError(f"TPS solve residual too large: {_resid}")
+            # 换道重试: GPU 服务器 OpenBLAS ILP64 的 LAPACK gesv 内核在
+            # 良态矩阵上返回垃圾(实测 cond 20 的 11x11 残差 2.7117555,
+            # 与冒烟日志逐位一致; r6-r8 GPU 因此全部静默回退 LANCZOS,
+            # fidelity 卡 0.85 平台), 同库 SVD 路径(lstsq) 残差 1.3e-15
+            # 正常。solve 失败先换 lstsq, 真病态锚点才抛错。
+            sol, *_ = np.linalg.lstsq(M, rhs, rcond=None)
+            _resid = float(np.abs(M @ sol - rhs).max())
+            if not np.isfinite(_resid) or _resid > 1e-6:
+                raise ValueError(f"TPS solve residual too large: {_resid}")
         w_coeff = sol[:n, :]
         aff = sol[n:, :]
 
