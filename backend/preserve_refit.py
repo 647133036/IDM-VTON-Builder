@@ -303,7 +303,7 @@ def print_core_mask(
         cloth_ref: warp 后的 SKU 参考图 (RGB/RGBA)
         keep_mask: 衣料保留区掩膜 (L/ndarray, 255=衣料)
         color_thresh: 与基色的欧氏色距阈值(0-255 RGB 尺度)
-        min_area_frac: 核心区面积占画布比下限, 低于此返回 None
+        min_area_frac: 候选/核心区面积占衣料区(keep)比下限, 低于此返回 None
         grow_px: 核心区外扩像素(边缘覆盖), 0=不扩
 
     Returns:
@@ -320,9 +320,19 @@ def print_core_mask(
             mask = np.array(
                 Image.fromarray(mask.astype("uint8")).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
             )
-        ka = (mask > 127).reshape(-1)
+        # keep 内缩 4px + cand 腐蚀 3px 合计清 warp 白边距环: keep 的
+        # dilate(alpha,6) 外沿是纯白画布 RGB(近中性+大色距, 会成环状
+        # cand, 其凸包=整件衣 → 恒等整件贴回), 环宽=6px; 内缩 4px 留
+        # 2px 残环由 cand 腐蚀(3px)清零。不能用衣料 alpha 门槛: 白墨
+        # 印花与画布同色, garment_alpha 把笔触判成 alpha=0 透明洞(实测
+        # min 0), 满印墨迹网连通触边, 任何 alpha 拓扑内外判定无解;
+        # 内缩 8px 会误杀贴边真印花且小画布占比失真。
+        ka_img = (mask > 127).astype(np.uint8)
+        ka_inner = cv2.erode(ka_img, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+        ka = ka_inner.reshape(-1)
         if ka.sum() < 64:
             return None
+        keep_area = float(np.asarray(mask > 127).sum())
         px = ref.reshape(-1, 3)
         base = np.median(px[ka], axis=0)
         dist = np.linalg.norm(px - base, axis=-1)
@@ -336,38 +346,189 @@ def print_core_mask(
         # "像素自身带显著色度"(褶皱在灰衣上是纯亮度变化, 天然无色度)
         base_neutral = float(base.max() - base.min()) < 15.0
         px_chromatic = n_px > 25.0
-        cand = (ka & (dist > color_thresh) & (neutral | hue_shift | (base_neutral & px_chromatic))).reshape(
-            ref.shape[:2]
-        )
-        if float(cand.mean()) < min_area_frac:
+        # 亮向约束(彩色基色): 近中性印花必须比基色亮。深褶阴影脱饱和后
+        # 同样过 dist+neutral 轴(1536 实测腹部 188x193 暗块), 亮度方向是
+        # 印花(亮)/阴影(暗)的本质分界; 黑印花款回退整件贴回仍交付。
+        bright = np.ones_like(neutral) if base_neutral else px.mean(-1) >= float(base.mean()) + 10.0
+        cand = ka & (dist > color_thresh) & ((neutral & bright) | hue_shift | (base_neutral & px_chromatic))
+        cand = cand.reshape(ref.shape[:2])
+        # 候选/核心门槛按衣料区(keep)占比而非画布占比: FASHN 原生 576x768 画布下
+        # warp 把印花面积缩 16 倍, 画布占比门把真印花判成纯色(r8 GPU 实测 core=None
+        # 回退整件贴回, 印花全程被 hf/folds 调制融化)。衣料占比跨工作分辨率不变;
+        # 绝对下限只拦纯噪声, 实质过滤由腐蚀+成分级 150px 面积门承担。
+        if float(cand.sum()) < max(16.0, min_area_frac * keep_area):
             return None
         c8 = cand.astype(np.uint8) * 255
-        ke5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        er = cv2.erode(c8, ke5)
+        # cand 腐蚀只清 1px 噪声: 白墨笔触本身仅 3-4px 细, 半径 2 的腐蚀
+        # 把笔触网打成碎末(实测 135 个 <160px 碎片, 全过不了面积门 → 误判
+        # 纯色); keep 内缩 4px 残下的 2px 白环由成分级 bbox 跨度门拒绝。
+        er = cv2.erode(c8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
         if er.max() == 0:
             return None
         num, lab, stats, _ = cv2.connectedComponentsWithStats((er > 0).astype(np.uint8))
         if num <= 1:
             return None
-        areas = stats[1:, cv2.CC_STAT_AREA]
-        floor = max(150.0, 0.08 * float(areas.max()))
-        keep_ids = [
-            i + 1
-            for i in range(num - 1)
-            if float(areas[i]) >= floor
-            and min(int(stats[i + 1, cv2.CC_STAT_WIDTH]), int(stats[i + 1, cv2.CC_STAT_HEIGHT])) >= 8
-        ]
-        if not keep_ids:
+        # keep(dilated-alpha) 外沿的纯白画布残环: 环宽仅 2px(内缩 4px 后)
+        # 但包围整件衣, 凸包=整件 → 恒等整件贴回(灾难)。成分 bbox 跨过
+        # keep 尺寸 70% 即拒: 真印花(胸印花 bbox 39%)安全余量充足。
+        k_ys, k_xs = np.where(ka_img)
+        k_w = float(k_xs.max() - k_xs.min())
+        k_h = float(k_ys.max() - k_ys.min())
+        # 成分级纹理门(笔触/高光判别): 白色印花笔触与丝绸高光斑在颜色轴上
+        # 不可分(同为亮中性+大色距, GPU 实测高光斑全过 v3.1 颜色轴), 只有
+        # 纹理可分 —— 笔触=边缘高能, 高光=平滑梯度。测度带 = cand ∩ 成分
+        # 支撑(dilate23) 减成分自身: 印花候选的边界笔触/实心 logo 的边界
+        # 落在带内(canny 边缘线就在 cand 边界上, erode 成分中心距自身边界
+        # 天然 ≥3px, 固定外环带会错过边缘线), 高光斑梯度平缓 canny 不点火
+        # (大面积实心 logo 的边缘密度不会被面积稀释)。
+        gray = np.asarray(cloth_ref.convert("L"), dtype=np.uint8)
+        if gray.shape[:2] != ref.shape[:2]:
+            gray = np.asarray(cloth_ref.convert("L").resize((ref.shape[1], ref.shape[0])), dtype=np.uint8)
+        edges = cv2.Canny(cv2.GaussianBlur(gray, (3, 3), 0), 30, 90) > 0
+        kd_out = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (23, 23))
+        cand_b = cand.copy()
+        # 面积门用绝对 150px: 0.08x最大成分的相对门在有大型种子时
+        # 把中尺寸印花片段(下腹印花腐蚀碎片)整批误杀(实测丢 2/4 印花);
+        # 粉尘(≤20px)由绝对门拦, 大结构由 bbox 跨度门+纹理门+亮向轴拦。
+        floor = 150.0
+        seeds = np.zeros(ref.shape[:2], dtype=np.uint8)
+        for i in range(1, num):
+            if float(stats[i, cv2.CC_STAT_AREA]) < floor:
+                continue
+            if min(int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])) < 8:
+                continue
+            if float(stats[i, cv2.CC_STAT_WIDTH]) > 0.7 * k_w or float(stats[i, cv2.CC_STAT_HEIGHT]) > 0.7 * k_h:
+                continue
+            comp = (lab == i).astype(np.uint8)
+            band = cand_b & (cv2.dilate(comp, kd_out) > 0) & (lab != i)
+            if band.sum() < 32:
+                continue
+            # canny 密度单判据: 笔触≥11%/实心logo边界≈49%(GPU+合成实测),
+            # 高光斑≤2.1% —— 5% 门两侧各余量一倍; 拉普拉斯能量对边缘
+            # 锐度敏感(LANCZOS 软化后 15.8 与高光 14 同档), 不做门槛。
+            if float(edges[band].mean()) * 100.0 < 5.0:
+                continue
+            seeds[lab == i] = 1
+        # 种子发芽: 笔触网被 cand 腐蚀(1px)碎成大量 <floor 片段, 但整个
+        # 网络在 cand 上连通 —— 种子所在的 cand 成分整块并入, 碎片随
+        # 种子复活(实测: 只用腐蚀成分会丢 60% 印花面积, 鬼影残留);
+        # 噪声粉尘与种子不相交, 留在门外。凸包按 cand 成分逐个填充:
+        # 细笔触印花只贴笔触会留 FASHN 鬼影(NCC -0.4), 凸包=印花场
+        # 整场贴参考原样。
+        if seeds.max() == 0:
             return None
-        sel = np.isin(lab, keep_ids).astype(np.uint8) * 255
-        if float((sel > 0).mean()) < min_area_frac:
+        _cnum, clab, _, _ = cv2.connectedComponentsWithStats((cand_b > 0).astype(np.uint8))
+        sel_ids = {int(v) for v in np.unique(clab[seeds > 0])} - {0}
+        hulls = []
+        for cid in sel_ids:
+            pts = np.column_stack(np.where(clab == cid))
+            if len(pts) < 32:
+                continue
+            hull = cv2.convexHull(pts[:, ::-1].astype(np.int32).reshape(-1, 1, 2))
+            hulls.append(hull)
+        if not hulls:
             return None
-        roi = cv2.dilate(sel, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        field = np.zeros(ref.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(field, hulls, 255)
+        if float((field > 0).sum()) < max(32.0, min_area_frac * keep_area):
+            return None
+        roi = cv2.dilate(field, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
         if grow_px > 0:
             roi = cv2.dilate(roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow_px * 2 + 1, grow_px * 2 + 1)))
         return np.minimum(roi, mask.astype(np.uint8))
     except Exception:
         logger.exception("print_core_mask failed")
+        return None
+
+
+def ghost_print_mask(
+    gen_img: Image.Image,
+    cloth_ref: Image.Image,
+    keep_mask: np.ndarray | Image.Image,
+    exclude_mask: np.ndarray | Image.Image | None = None,
+) -> np.ndarray | None:
+    """生成图上的印花鬼影检测区(FASHN 自绘印花与 TPS 贴印几何错位时擦除用)。
+
+    FASHN 生成器按自己的理解摆放印花(实测比平铺几何偏上), 贴印核心只盖
+    TPS 映射位置 → 生成图的鬼影整套暴露在核心场之外(视觉验收: 上方
+    半透明猴头重影)。本函数在生成图上找鬼影笔画: 同色轴(亮中性+大色距,
+    基色取参考图衣料区中位数 —— prewhiten 已证两图基色一致)+ bbox
+    跨度门(整件环状结构); 无纹理门(生成图丝绸渲染处处带噪, 鬼影 4.3
+    与高光 4.5 lapE 同档, 实测色轴零高光假阳性)。调用方用参考内容
+    贴回该区(ref 在此处是干净底色, folds/hf 默认保身体光影) 即完成擦除。
+
+    Returns:
+        uint8 掩膜(255=鬼影擦除区), 无检出/失败返回 None
+    """
+    try:
+        import cv2
+
+        gen = np.asarray(gen_img.convert("RGB"), dtype=np.float32)
+        ref = np.asarray(cloth_ref.convert("RGB"), dtype=np.float32)
+        mask = np.asarray(keep_mask)
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        if mask.shape[:2] != gen.shape[:2]:
+            mask = np.array(
+                Image.fromarray(mask.astype("uint8")).resize((gen.shape[1], gen.shape[0]), Image.Resampling.BILINEAR)
+            )
+        ka_img = (mask > 127).astype(np.uint8)
+        ka_inner = cv2.erode(ka_img, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))) > 0
+        ka = ka_inner.reshape(-1)
+        if ka.sum() < 64:
+            return None
+        px_ref = ref.reshape(-1, 3)
+        base = np.median(px_ref[ka], axis=0)
+        px = gen.reshape(-1, 3)
+        dist = np.linalg.norm(px - base, axis=-1)
+        neutral = (px.max(-1) - px.min(-1)) < 40.0
+        bright = px.mean(-1) >= float(base.mean()) + 10.0
+        cand = (ka & (dist > 60.0) & (neutral & bright)).reshape(gen.shape[:2])
+        if exclude_mask is not None:
+            ex = np.asarray(exclude_mask)
+            if ex.ndim == 3:
+                ex = ex[..., 0]
+            if ex.shape[:2] != gen.shape[:2]:
+                ex = np.array(
+                    Image.fromarray(ex.astype("uint8")).resize((gen.shape[1], gen.shape[0]), Image.Resampling.BILINEAR)
+                )
+            cand = cand & (
+                cv2.dilate((ex > 127).astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))) == 0
+            )
+        if float(cand.sum()) < 32:
+            return None
+        er = cv2.erode(cand.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        if er.max() == 0:
+            return None
+        num, lab, stats, _ = cv2.connectedComponentsWithStats((er > 0).astype(np.uint8))
+        if num <= 1:
+            return None
+        k_ys, k_xs = np.where(ka_img)
+        k_w = float(k_xs.max() - k_xs.min())
+        k_h = float(k_ys.max() - k_ys.min())
+        # 无纹理门: 生成图丝绸渲染处处带噪(lapE 鬼影 4.3-5.2 vs 高光 4.5,
+        # canny10/30 0.7-18% vs 7.8% 同档互叠), 纹理无法区分; 色轴已足:
+        # 生成图暖调高光(230,215,175 类)不过中性轴, 实测 gen 侧 cand 只有
+        # 鬼影+印花残迹, 零高光假阳性。擦除语义兜底: 贴回 ref+LF —— ref
+        # 有的内容重画为正确版本, ref 没有的才是擦幻觉。
+        hulls = []
+        for i in range(1, num):
+            if float(stats[i, cv2.CC_STAT_AREA]) < 150:
+                continue
+            if min(int(stats[i, cv2.CC_STAT_WIDTH]), int(stats[i, cv2.CC_STAT_HEIGHT])) < 8:
+                continue
+            if float(stats[i, cv2.CC_STAT_WIDTH]) > 0.7 * k_w or float(stats[i, cv2.CC_STAT_HEIGHT]) > 0.7 * k_h:
+                continue
+            pts = np.column_stack(np.where(lab == i))
+            hulls.append(cv2.convexHull(pts[:, ::-1].astype(np.int32).reshape(-1, 1, 2)))
+        if not hulls:
+            return None
+        field = np.zeros(gen.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(field, hulls, 255)
+        roi = cv2.dilate(field, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
+        return np.minimum(roi, mask.astype(np.uint8))
+    except Exception:
+        logger.exception("ghost_print_mask failed")
         return None
 
 
@@ -456,6 +617,40 @@ def refit_cloth_to_drawn_garment(
         # 纯色无白底: 色距 alpha 可能全零, 回退实心衣料(整图即内容)
         if np.asarray(alpha_ch).max() <= 10:
             alpha_ch = Image.new("L", g.size, 255)
+        else:
+            # 白墨印花洞修复: 四角背景色估计把与画布同色的印花笔触判成
+            # 透明(真实 SKU alpha 实测 min 0), 贴回 content 门把笔触整
+            # 个跳过 → 只贴笔触间基色, 白印花全程留 FASHN 鬼影(r9 GPU
+            # 实测 alpha<0.5 区 NCC 0.05, |diff| 102)。
+            # 连通性(任何 alpha 阈值)在此失败: 满印 SKU 笔触网触到衣料
+            # 轮廓, 画布/羽化/笔触连成一个边框连通块(GPU 实测 holes=0)。
+            # 改用 solid 质量(alpha>=150)洪泛: 从边框外洪泛 alpha<150 的
+            # 外部区域, 被芥末黄质量包围而未触达的 = 内部洞(印花/白色
+            # 部件), 补实心并连带 3px 笔触羽化。
+            try:
+                import cv2
+
+                a_np = np.asarray(alpha_ch).copy()
+                h_, w_ = a_np.shape
+                edge = np.zeros((h_, w_), dtype=bool)
+                edge[0, :] = a_np[0, :] < 150
+                edge[-1, :] = a_np[-1, :] < 150
+                edge[:, 0] = a_np[:, 0] < 150
+                edge[:, -1] = a_np[:, -1] < 150
+                if edge.any():
+                    _ys, _xs = np.where(edge)
+                    seed_x, seed_y = int(_xs[0]), int(_ys[0])
+                    ff = (a_np >= 150).astype(np.uint8)
+                    ffmask = np.zeros((h_ + 2, w_ + 2), np.uint8)
+                    cv2.floodFill(ff, ffmask, (seed_x, seed_y), 2)
+                    holes = (ff == 0) & (a_np < 150)
+                    if holes.any():
+                        _k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+                        raise_px = cv2.dilate(holes.astype(np.uint8), _k3) > 0
+                        a_np[raise_px & (a_np < 150)] = 255
+                        alpha_ch = Image.fromarray(a_np)
+            except Exception:  # noqa: BLE001
+                logger.debug("refit alpha hole repair skipped")
         g.putalpha(alpha_ch)
     a = np.asarray(g.split()[-1])
     ays, axs = np.where(a > 10)

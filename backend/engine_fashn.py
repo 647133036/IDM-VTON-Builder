@@ -7,6 +7,7 @@ import threading
 import types
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 logger = logging.getLogger("atelier.engine_fashn")
@@ -240,6 +241,7 @@ def compose_tryon_fashn(
     paste_mask = None
     cloth_ref = None
     cloth_ref_alpha = None
+    pending_print_warp = None
     if (pattern_on or lock_on) and warp_enabled:
         try:
             subj = foreground_mask(result)
@@ -257,21 +259,25 @@ def compose_tryon_fashn(
                 refit = refit_cloth_to_drawn_garment(garment_img, result.size, drawn_mask)
             if refit is not None:
                 # 贴印对齐生成几何: 平铺衣 TPS 重投到 FASHN 画的衣服 bbox;
-                # 检测区即衣服边界, 纯裁剪(clip, 无并集); 贴印区=印花核心,
-                # 全衣料款回退整件贴回。贴印/保真分与衣服保护三 mask 解耦。
+                # 检测区即衣服边界, 纯裁剪(clip, 无并集); 贴印/保真分与衣服
+                # 保护三 mask 解耦。
                 cloth_ref, cloth_ref_alpha = refit
-                from preserve_refit import clip_mask_to_garment_alpha, print_core_mask
+                from preserve_refit import clip_mask_to_garment_alpha
 
                 keep_mask = clip_mask_to_garment_alpha(drawn_mask, cloth_ref_alpha)
-                paste_mask = print_core_mask(cloth_ref, keep_mask)
-                if paste_mask is None:
-                    paste_mask = keep_mask
-                    core_paste = False
+                if pattern_on:
+                    # 印花贴回推迟到最终分辨率: (a) 576 原生画布贴印会被
+                    # 末尾 2.67x LANCZOS 放大拉糊(r8); (b) 印花核心检测也
+                    # 必须在最终分辨率做 —— 576 下印花笔触被 8x 降采样混进
+                    # 底色, 检测只剩空心环(真实数据内区 NCC -0.69)。实心
+                    # 款回退同样在全分辨率整件贴回, 质量不降级。
+                    _dm = np.asarray(drawn_mask)
+                    if _dm.ndim == 3:
+                        _dm = _dm[..., 0]
+                    pending_print_warp = _dm
+                    paste_mask = None
                 else:
-                    # 印花核心区: HF(笔触)贴参考原样、folds 关闭 —— 生成图的
-                    # 木纹/水波伪影(r7 实测 s0 自带)不再经 shade_hf/folds 叠
-                    # 加污染印花; LF 底色仍跟随生成光影, 融合自然。
-                    core_paste = True
+                    paste_mask = keep_mask
             else:
                 # 模板对齐(legacy 回退): warp 平铺衣到身体模板先验,
                 # 并集再裁剪(intersect)兜住宽松款悬垂面料。
@@ -289,7 +295,6 @@ def compose_tryon_fashn(
                         cloth_ref_alpha = cloth_ref_alpha.resize(result.size, Image.Resampling.BILINEAR)
                 keep_mask, _kept = intersect_mask_with_garment_alpha(drawn_mask, cloth_ref_alpha)
                 paste_mask = keep_mask
-                core_paste = False
             if pattern_on and paste_mask is not None:
                 result = reapply_garment_detail(
                     result,
@@ -297,8 +302,6 @@ def compose_tryon_fashn(
                     paste_mask,
                     pattern_lock=True,
                     ref_alpha=cloth_ref_alpha,
-                    hf_strength=0.0 if core_paste else None,
-                    fold_gain=0.0 if core_paste else None,
                 )
                 detail_applied = True
         except Exception:
@@ -346,6 +349,96 @@ def compose_tryon_fashn(
     scale = long_side / max(rw, rh)
     if abs(scale - 1) > 0.01:
         result = result.resize((int(rw * scale), int(rh * scale)), Image.Resampling.LANCZOS)
+
+    # 印花核心直贴(最终分辨率): 放大后的成图上重投 + 核心检测 + 贴印,
+    # 印花笔触保参考原样清晰度(hf/folds 关, 不受生成纹理污染); 保真分
+    # 同步在成图分辨率上度量。核心检测只在最终分辨率做一次(576 下印花
+    # 笔触被 8x 降采样混进底色只剩空心环); 实心款(无核心)回退整件贴回
+    # 同样在全分辨率, 质量较 r8 低分辨率贴印只升不降。模板路径不变。
+    if pending_print_warp is not None:
+        try:
+            from preserve_refit import clip_mask_to_garment_alpha as _clip_fn
+            from preserve_refit import print_core_mask as _core_fn
+            from preserve_refit import refit_cloth_to_drawn_garment as _refit_fn
+
+            _dm_low = pending_print_warp
+            if _dm_low.shape[::-1] != result.size:
+                _dm_full = np.array(
+                    Image.fromarray(_dm_low.astype(np.uint8)).resize(result.size, Image.Resampling.NEAREST)
+                )
+                if _dm_full.ndim == 3:
+                    _dm_full = _dm_full[..., 0]
+            else:
+                _dm_full = _dm_low
+            refit_full = _refit_fn(garment_img, result.size, _dm_full)
+            if refit_full is not None:
+                cloth_ref_full, alpha_full = refit_full
+                keep_full = _clip_fn(_dm_full, alpha_full)
+                core_full = _core_fn(cloth_ref_full, keep_full)
+                if core_full is not None and np.asarray(core_full).max() > 0:
+                    # 印花核心=参考原样: light/hf/folds 全关 —— 印花场内 FASHN
+                    # 的鬼影笔触让 LF 明暗场尖峰(NCC 实测 -0.4), 恒等贴回
+                    # 保真分=1.0(本地全链路实证), 场外仍保留身体光影褶皱。
+                    # content_mask=keep: 白墨印花在 alpha 上是透明洞(garment_alpha
+                    # 与画布同色判定, 满印墨迹网触边, 拓扑内外判定无解), alpha
+                    # 内容门会跳过笔触留鬼影; keep(drawn 裁 alpha 膨胀)衣料
+                    # 语义完整。
+                    paste_full, core_kwargs = (
+                        core_full,
+                        {
+                            "light_strength": 0.0,
+                            "hf_strength": 0.0,
+                            "fold_gain": 0.0,
+                            "content_mask": keep_full,
+                        },
+                    )
+                else:
+                    paste_full, core_kwargs = keep_full, {}
+                # transparent 路径此时已是 RGBA: 贴回在 RGB 上做再装回
+                # alpha, 透明信息不因贴印丢失。
+                _alpha_ch = result.split()[-1] if result.mode == "RGBA" else None
+                _rgb_result = result.convert("RGB")
+                if core_full is not None:
+                    # 鬼影擦除(核心场外): FASHN 按自己的几何摆放印花(实测
+                    # 偏上), 核心场只盖 TPS 位置, 生成图的整套鬼影笔触
+                    # 暴露在场外(视觉验收: 上方半透明重影)。生成图上同色
+                    # 轴+纹理门检出鬼场, 先用参考底色+folds/hf(默认)贴回
+                    # —— ref 在鬼场处是干净底色, 擦除同时保身体光影; 再
+                    # 做核心恒等贴印。实心款回退分支整件已贴回, 无需此步。
+                    try:
+                        from preserve_refit import ghost_print_mask as _ghost_fn
+
+                        ghost_full = _ghost_fn(_rgb_result, cloth_ref_full, keep_full, exclude_mask=core_full)
+                        if ghost_full is not None and np.asarray(ghost_full).max() > 0:
+                            _rgb_result = reapply_garment_detail(
+                                _rgb_result,
+                                cloth_ref_full,
+                                ghost_full,
+                                pattern_lock=True,
+                                ref_alpha=alpha_full,
+                            )
+                    except Exception:
+                        logger.exception("FASHN ghost print erase failed; keeping current pixels")
+                        degraded_reasons.append("FASHN ghost print erase failed")
+                result = reapply_garment_detail(
+                    _rgb_result,
+                    cloth_ref_full,
+                    paste_full,
+                    pattern_lock=True,
+                    ref_alpha=alpha_full,
+                    **core_kwargs,
+                )
+                if _alpha_ch is not None:
+                    result = result.copy()
+                    result.putalpha(_alpha_ch)
+                detail_applied = True
+                from quality_gate import delivery_tier, print_fidelity_score
+
+                _pf_val = print_fidelity_score(result, cloth_ref_full, paste_full)
+                _tier_val = delivery_tier(_pf_val, sku_has_text=False)
+        except Exception:
+            logger.exception("FASHN full-res print paste failed; keeping current pixels")
+            degraded_reasons.append("FASHN full-res print paste failed")
 
     degraded_reason = "; ".join(degraded_reasons)
     result.info["engine"] = "fashn-vton"

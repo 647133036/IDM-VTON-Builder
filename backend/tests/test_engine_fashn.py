@@ -193,8 +193,8 @@ def test_compose_tryon_fashn_fidelity_survives_bg_and_resize(monkeypatch, tmp_pa
     assert out.info["delivery_tier"] == "auto"
 
 
-def _fake_fashn(monkeypatch, tmp_path):
-    """共享夹具: FakePipeline 输出 32x32, 全部平台钩子可控。"""
+def _fake_fashn(monkeypatch, tmp_path, size=(32, 32)):
+    """共享夹具: FakePipeline 输出可控尺寸, 全部平台钩子可控。"""
     import engine_fashn
     from PIL import Image as PILImage
 
@@ -203,7 +203,7 @@ def _fake_fashn(monkeypatch, tmp_path):
             pass
 
         def __call__(self, **kwargs):
-            return types.SimpleNamespace(images=[PILImage.new("RGB", (32, 32), (9, 9, 9))])
+            return types.SimpleNamespace(images=[PILImage.new("RGB", size, (9, 9, 9))])
 
     fake_mod = types.ModuleType("fashn_vton")
     fake_mod.TryOnPipeline = FakePipeline
@@ -226,7 +226,7 @@ def test_compose_fashn_drawn_align_uses_refit_and_decoupled_masks(monkeypatch, t
     import preserve_refit
     import prewhiten as prewhiten_mod
 
-    engine_fashn, PILImage = _fake_fashn(monkeypatch, tmp_path)
+    engine_fashn, PILImage = _fake_fashn(monkeypatch, tmp_path, size=(96, 96))
     monkeypatch.setenv("VTON_PATTERN_LOCK", "1")
     monkeypatch.setenv("VTON_WARP", "1")
     monkeypatch.setenv("VTON_PROTECT_FEATHER", "4")
@@ -243,8 +243,8 @@ def test_compose_fashn_drawn_align_uses_refit_and_decoupled_masks(monkeypatch, t
         platform_presets, "foreground_mask", lambda img: np.full((img.size[1], img.size[0]), 255, dtype=np.uint8)
     )
 
-    drawn = np.zeros((32, 32), dtype=np.uint8)
-    drawn[10:26, 8:24] = 255
+    drawn = np.zeros((96, 96), dtype=np.uint8)
+    drawn[16:80, 16:64] = 255
     monkeypatch.setattr(platform_presets, "clothing_mask", lambda result, **k: drawn.copy())
 
     reapply_masks = []
@@ -265,31 +265,126 @@ def test_compose_fashn_drawn_align_uses_refit_and_decoupled_masks(monkeypatch, t
     monkeypatch.setattr(platform_presets, "force_white_background", lambda result, subject_mask=None: result)
 
     garment = tmp_path / "g.png"
-    flat = PILImage.new("RGB", (24, 32), (255, 255, 255))
+    # 仿真平铺结构(与真实 SKU 同构): 白底 + 芥末黄衣 + 微灰白印花。
+    # 尺寸按真实比例: 羽化/腐蚀等像素级常数在微型图上占比失真。
+    flat = PILImage.new("RGB", (64, 80), (255, 255, 255))
     from PIL import ImageDraw
 
-    ImageDraw.Draw(flat).rectangle((6, 8, 18, 24), fill=(200, 30, 30))
+    d = ImageDraw.Draw(flat)
+    d.rectangle((8, 8, 56, 72), fill=(216, 198, 151))
+    d.rectangle((22, 28, 42, 48), fill=(238, 234, 226))
     flat.save(garment)
     person = tmp_path / "p.png"
     PILImage.new("RGB", (40, 60), (10, 20, 30)).save(person)
 
-    out = engine_fashn.compose_tryon_fashn(person, garment, "women", "dress", 48, "white", "western_europe")
+    out = engine_fashn.compose_tryon_fashn(person, garment, "women", "dress", 144, "white", "western_europe")
     assert out.info["engine"] == "fashn-vton"
     assert out.info["detail_applied"] is True
-    # 三 mask 解耦: 贴印区来自印花核心(实心红块内容平坦 → 边界环核心),
-    # 且不越出 keep; protect 拿到的整件衣料 keep(裁到 alpha)
+    # 三 mask 解耦: 贴印区=印花核心, 贴印推迟到最终分辨率(96→144)执行;
+    # protect 拿到原生 96 的整件衣料 keep(裁到 alpha)。
     assert len(reapply_masks) == 1 and len(protect_masks) == 1
     paste = reapply_masks[0]
     keep = protect_masks[0]
     assert paste.sum() > 0
-    assert np.asarray(paste & keep).sum() == paste.sum()
-    assert keep.sum() < 255 * 32 * 32, "keep must be clipped, not full canvas"
-    # 贴印区与 keep 在 drawn bbox 内
+    assert paste.shape[0] == 144, "print paste must run at final resolution"
+    keep_full = np.array(PILImage.fromarray(keep).resize((paste.shape[1], paste.shape[0]), PILImage.Resampling.NEAREST))
+    assert np.asarray((paste > 0) & (keep_full > 0)).sum() == (paste > 0).sum()
+    assert keep.sum() < 255 * 96 * 96, "keep must be clipped, not full canvas"
+    # keep(protect 区)在 drawn bbox 内, 原生 96 分辨率
     ys, xs = np.where(keep > 0)
-    assert xs.min() >= 8 and xs.max() < 24 and ys.min() >= 10 and ys.max() < 26
-    assert out.info["print_fidelity"] == 1.0
+    assert xs.min() >= 16 and xs.max() < 64 and ys.min() >= 16 and ys.max() < 80
+    # 贴印核心落在白印花 warp 后的位置(96 尺度 core bbox (26,32)-(53,60) → 144 尺度 x1.5)
+    pys, pxs = np.where(paste > 0)
+    assert pxs.min() >= 39 - 10 and pxs.max() <= 80 + 10, (pxs.min(), pxs.max())
+    assert pys.min() >= 48 - 10 and pys.max() <= 90 + 10, (pys.min(), pys.max())
+    # NCC 浮点舍入: 贴印区=参考原样 → 分数 ≈ 1.0
+    assert out.info["print_fidelity"] > 0.999, out.info["print_fidelity"]
     assert out.info["delivery_tier"] == "auto"
     assert out.info["lock_identity"] is True
+
+
+def test_compose_fashn_ghost_print_erased_before_core_paste(monkeypatch, tmp_path):
+    """FASHN 自绘印花偏移出核心场(r9 真实数据: 上方半透明重影): 生成图上
+    检出鬼场 → 先默认参数贴回擦除(ref 底色+保光影), 再核心恒等贴印;
+    无鬼影 SKU(fake 输出全暗)保持单次贴印(前测 len==1 已守住)。
+    """
+    import engine_sdxl
+    import numpy as np
+    import platform_presets
+    import preserve_refit
+    import prewhiten as prewhiten_mod
+    from PIL import Image as PILImage
+    from PIL import ImageDraw
+
+    # fake 输出: 芥末黄整幅 + 上方白墨鬼影(FASHN 把印花画偏, 576 原生糊化)
+    fake_out = PILImage.new("RGB", (96, 96), (216, 198, 151))
+    ImageDraw.Draw(fake_out).rectangle((24, 18, 44, 38), fill=(238, 234, 226))
+
+    class GhostPipeline:
+        def __init__(self, weights_dir):
+            pass
+
+        def __call__(self, **kwargs):
+            return types.SimpleNamespace(images=[fake_out])
+
+    import sys as _sys
+
+    import engine_fashn
+
+    fake_mod = types.ModuleType("fashn_vton")
+    fake_mod.TryOnPipeline = GhostPipeline
+    monkeypatch.setitem(_sys.modules, "fashn_vton", fake_mod)
+    monkeypatch.setattr(engine_fashn, "FASHN_DIR", tmp_path)
+    monkeypatch.setattr(engine_fashn, "_fashn_state", {"pipe": None})
+    monkeypatch.setenv("VTON_PATTERN_LOCK", "1")
+    monkeypatch.setenv("VTON_WARP", "1")
+    monkeypatch.setenv("VTON_PROTECT_FEATHER", "4")
+    monkeypatch.setattr(engine_sdxl, "crop_garment_to_content", lambda img: img)
+    monkeypatch.setattr(engine_sdxl, "infer_auto_garment_type", lambda ext: "dress")
+    monkeypatch.setattr(prewhiten_mod, "prewhiten_input", lambda img: (img, {"status": "already_white"}))
+    monkeypatch.setattr(platform_presets, "detect_garment_extent", lambda img: None)
+    monkeypatch.setattr(
+        platform_presets, "foreground_mask", lambda img: np.full((img.size[1], img.size[0]), 255, dtype=np.uint8)
+    )
+    drawn = np.zeros((96, 96), dtype=np.uint8)
+    drawn[16:80, 16:64] = 255
+    monkeypatch.setattr(platform_presets, "clothing_mask", lambda result, **k: drawn.copy())
+
+    reapply_calls = []
+
+    def _reapply(result, ref, mask, **k):
+        reapply_calls.append((np.asarray(mask).copy(), dict(k)))
+        return ref.convert("RGB")
+
+    monkeypatch.setattr(platform_presets, "reapply_garment_detail", _reapply)
+    monkeypatch.setattr(preserve_refit, "protect_inverse_refit", lambda r, b, m, feather_px=4: r)
+    monkeypatch.setattr(platform_presets, "force_white_background", lambda result, subject_mask=None: result)
+
+    garment = tmp_path / "g.png"
+    flat = PILImage.new("RGB", (64, 80), (255, 255, 255))
+    d = ImageDraw.Draw(flat)
+    d.rectangle((8, 8, 56, 72), fill=(216, 198, 151))
+    # 印花在下半部: 核心场与上方鬼影拉开 >dilate19 的距离
+    d.rectangle((22, 48, 42, 66), fill=(238, 234, 226))
+    flat.save(garment)
+    person = tmp_path / "p.png"
+    PILImage.new("RGB", (40, 60), (10, 20, 30)).save(person)
+
+    out = engine_fashn.compose_tryon_fashn(person, garment, "women", "dress", 144, "white", "western_europe")
+    assert out.info["detail_applied"] is True
+    assert "ghost" not in out.info.get("degraded_reason", ""), out.info.get("degraded_reason")
+    # 鬼影擦除(先, 默认参数保光影) + 核心恒等贴印(后, light/hf/folds 全关)
+    assert len(reapply_calls) == 2, f"expect ghost erase + core paste, got {len(reapply_calls)}"
+    ghost_mask, ghost_kw = reapply_calls[0]
+    core_mask, core_kw = reapply_calls[1]
+    assert ghost_mask.shape[0] == 144 and core_mask.shape[0] == 144
+    assert ghost_kw.get("light_strength", 1.0) != 0.0, "鬼场擦除必须保身体光影(默认参数)"
+    assert core_kw.get("light_strength") == 0.0 and core_kw.get("fold_gain") == 0.0
+    # 鬼场盖住鬼影本体(96 尺度 (24,18)-(44,38) → 144 x1.5), 不侵入核心
+    assert ghost_mask[42, 51] > 0, "鬼影本体中心必须在擦除场内"
+    gys, _gxs = np.where(ghost_mask > 0)
+    cys, _cxs = np.where(core_mask > 0)
+    assert gys.max() < cys.min(), "鬼场(上方)与核心场(下方)必须分离"
 
 
 def test_compose_fashn_template_align_env_restores_legacy(monkeypatch, tmp_path):

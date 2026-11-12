@@ -2014,6 +2014,7 @@ def _pattern_lock_overlay(
     ref_alpha: Image.Image | None = None,
     hf_strength: float | None = None,
     fold_gain: float | None = None,
+    content_mask: np.ndarray | None = None,
 ) -> Image.Image:
     """Warp 后的衣覆盖衣服区;生成图只提供褶皱光影(PLTON 频率分离)。
 
@@ -2089,13 +2090,29 @@ def _pattern_lock_overlay(
     else:
         content = np.ones((*ref.shape[:2], 1), dtype=np.float32)
 
+    # content_mask(目标侧 keep 二值内容门)整体取代 alpha 内容门: 白墨印花
+    # 与画布同色时 garment_alpha 把笔触判成 alpha=0 透明洞(真实 SKU 实测
+    # min 0), alpha 门把笔触整个跳过 → 白印花全程留生成鬼影。keep 由
+    # drawn mask 裁 alpha 膨胀而来, 衣料边界语义完整, 笔触(衣料内部低
+    # alpha)照贴; 画布白混入风险由 keep 的 dilate(alpha) 裁剪兜住。
+    _cm_arr = None
+    if content_mask is not None:
+        _cm_arr = np.asarray(content_mask)
+        if _cm_arr.ndim == 3:
+            _cm_arr = _cm_arr[..., 0]
+        if _cm_arr.shape[:2] != ref.shape[:2]:
+            _cm_arr = np.array(
+                Image.fromarray(_cm_arr.astype("uint8")).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
+            )
+        content = (_cm_arr > 127).astype(np.float32)[..., None]
+
     # 衣物 alpha(来自 warp 出的 RGBA 参考): alpha=0 处(画布白底/无衣料区,
     # 如参考图没覆盖到的袖子区)不贴入 —— 否则白底整块贴到模特身上 = 袖子白晕/
     # 脖子灰带根因。白衣 alpha=1 照常贴(比白底启发式更准, 二者相乘双保险)。
     # 必须取 A 通道: convert("L") 对 RGBA 取的是 RGB 亮度而非 alpha —— 深色
     # 衣(藏青/墨绿, luma 65-90)贴回不透明度被压到 0.25-0.35, gen 像素(肚皮
     # 肤色/白晕)透出 65%+, 漏肚脐/图案失真/结淡全由此出。
-    if ref_alpha is not None:
+    if ref_alpha is not None and content_mask is None:
         _a = np.asarray(ref_alpha.getchannel("A") if ref_alpha.mode in ("RGBA", "LA") else ref_alpha.convert("L"))
         if _a.shape[:2] != ref.shape[:2]:
             _a = np.array(Image.fromarray(_a).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR))
@@ -2122,7 +2139,12 @@ def _pattern_lock_overlay(
         skin_factor = 1.0 - (skin_u8.astype(np.float32) / 255.0)[..., None] * skin_w
         # 参考图有衣料的像素不降权: 袖条盖在生成裸臂上时仍贴袖料
         # (旧逻辑按生成图肤色降权 85% → 长袖参考有袖、出图仍无袖)。
-        if ref_alpha is not None:
+        # content_mask 优先: 白墨笔触在 alpha 上是 0(透明洞), 用 alpha
+        # 豁免会把笔触判成无衣料 → 肤色降权把笔触贴回压到 15%。
+        if _cm_arr is not None:
+            fabric = (_cm_arr > 40)[..., None]
+            skin_factor = np.where(fabric, np.ones_like(skin_factor), skin_factor)
+        elif ref_alpha is not None:
             _fa = np.asarray(ref_alpha.getchannel("A") if ref_alpha.mode == "RGBA" else ref_alpha.convert("L"))
             if _fa.shape[:2] != ref.shape[:2]:
                 _fa = np.array(Image.fromarray(_fa).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR))
@@ -2178,6 +2200,7 @@ def reapply_garment_detail(
     ref_alpha: Image.Image | None = None,
     hf_strength: float | None = None,
     fold_gain: float | None = None,
+    content_mask: np.ndarray | None = None,
 ) -> Image.Image:
     """AI 出骨架光影,代码保商品纹理颜色。
 
@@ -2233,7 +2256,15 @@ def reapply_garment_detail(
         # 上游已 fail-loud log, 这里保底回退到高频柔光路径而非裸生成图。
         try:
             return _pattern_lock_overlay(
-                gen, ref, mask, skin, light_strength, ref_alpha=ref_alpha, hf_strength=hf_strength, fold_gain=fold_gain
+                gen,
+                ref,
+                mask,
+                skin,
+                light_strength,
+                ref_alpha=ref_alpha,
+                hf_strength=hf_strength,
+                fold_gain=fold_gain,
+                content_mask=content_mask,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("pattern_lock overlay failed (%s); falling back to softlight path", exc)

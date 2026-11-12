@@ -5,7 +5,7 @@ import os
 import numpy as np
 import preserve_refit
 import quality_gate
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # ---------- protect_inverse_refit ----------
 
@@ -471,7 +471,8 @@ def test_print_core_mask_drops_small_button_fragments():
     # 主印花区存在; 顶部亮点区(y<40)必须被清掉
     assert float((roi[:40, :] > 0).mean()) == 0.0
     ys, _xs = np.where(roi > 0)
-    assert ys.min() >= 42
+    # hull 现从 cand(而非腐蚀成分)起算: 上缘 50-dilate9(4)-grow6(6)=40
+    assert ys.min() >= 40
 
 
 def test_print_core_mask_resizes_keep_to_ref():
@@ -487,6 +488,174 @@ def test_print_core_mask_resizes_keep_to_ref():
     # logo (20,20)-(44,44) + 腐蚀/膨胀容差 ±8px, 且不越出画布
     assert 12 <= xs.min() <= 28 and 36 <= xs.max() <= 52
     assert 12 <= ys.min() <= 28 and 36 <= ys.max() <= 52
+
+
+def test_print_core_mask_scale_invariant_garment_fraction():
+    """核心门槛按衣料区占比而非画布占比(r8 GPU: 576x768 画布把印花缩 16 倍面积,
+    画布占比门把真印花判成纯色回退整件贴回, 印花全程被 hf/folds 融化)。
+
+    同一内容在 2x 尺度下: 小画布(衣料占比高但画布占比低)必须同样检出。
+    """
+    # 小尺度: 96x128 画布, 衣料占 50%, 印花占衣料 ~5% → 画布占比仅 2.5%
+    w, h = 96, 128
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(ref)
+    d.rectangle((32, 40, 44, 100), fill=(250, 249, 246))
+    keep = np.zeros((h, w), dtype=np.uint8)
+    keep[:, : w // 2] = 255
+    roi_small = preserve_refit.print_core_mask(ref, keep)
+    # 大尺度 2x: 内容一致, 印花的画布占比同样低, 门槛语义不变
+    ref2 = ref.resize((w * 2, h * 2), Image.Resampling.LANCZOS)
+    keep2 = np.zeros((h * 2, w * 2), dtype=np.uint8)
+    keep2[:, :w] = 255
+    roi_large = preserve_refit.print_core_mask(ref2, keep2)
+    assert roi_small is not None, "小画布下印花不应被画布占比门槛误杀"
+    assert roi_large is not None
+    assert (roi_small > 0).sum() > 0 and (roi_large > 0).sum() > 0
+
+
+def test_print_core_mask_boundary_halo_excluded_interior_print_kept():
+    """keep 内缩 8px 替代 alpha 门(r9 GPU: 白墨印花与画布同色, garment_alpha
+    把笔触判成 alpha=0 透明洞, alpha 门把笔触整个跳过留鬼影; 满印墨迹网连通
+    触边, 任何 alpha 拓扑内外判定无解)。
+
+    衣料内部低 alpha 白墨笔触必须照常检出; 贴 keep 边界的晕圈羽化带被内缩清除。
+    """
+    from PIL import ImageDraw
+
+    w, h = 96, 128
+    # 内部白印花 alpha=0(透明洞语义): 必须检出
+    ref = Image.new("RGBA", (w, h), (216, 198, 151, 255))
+    ImageDraw.Draw(ref).rectangle((32, 44, 60, 96), fill=(250, 249, 246, 0))
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is not None, "内部低 alpha 白墨印花必须检出(透明洞不是真透明)"
+    assert (np.asarray(roi) > 0).sum() > 0
+    # 贴 keep 边界的白边距环(环宽 6px = dilate6; 内缩 4px+cand 腐蚀 3px
+    # 合计清零): 必须清除, 否则环状 cand 的凸包=整件衣
+    ref2 = Image.new("RGBA", (w, h), (216, 198, 151, 255))
+    ImageDraw.Draw(ref2).rectangle((42, 44, 48, 96), fill=(250, 249, 246, 0))
+    roi2 = preserve_refit.print_core_mask(ref2, keep)
+    assert roi2 is None, "贴 keep 边界的白边距环必须被内缩+腐蚀清除"
+
+
+def test_print_core_mask_rejects_dark_neutral_slab():
+    """深褶阴影脱饱和后同样过 dist+neutral 轴(1536 实测腹部 188x193 暗块混入)。
+    彩色基色下近中性候选必须比基色亮(印花亮/阴影暗); 白印花照常检出。
+    """
+    from PIL import ImageDraw
+
+    w, h = 96, 128
+    ref = Image.new("RGB", (w, h), (216, 198, 151))  # 芥末黄基色, mean 188
+    d = ImageDraw.Draw(ref)
+    # 暗中性块: dist≈180 + max-min=15<40 → 无亮向约束时会混入核心
+    d.rectangle((30, 44, 58, 96), fill=(95, 90, 80))
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is None, "深褶脱饱和暗块不得进入印花核心"
+    # 对照: 白印花(亮向通过)照常检出
+    ref2 = Image.new("RGB", (w, h), (216, 198, 151))
+    ImageDraw.Draw(ref2).rectangle((30, 44, 58, 96), fill=(250, 249, 246))
+    roi2 = preserve_refit.print_core_mask(ref2, keep)
+    assert roi2 is not None and (roi2 > 0).sum() > 0
+
+
+def test_print_core_mask_fills_stroke_outline_footprint():
+    """细笔触印花(白墨巴洛克类)候选像素只有轮廓线: 凸包填充后核心必须覆盖
+    笔触之间的内部区域, 否则只贴笔触会留 FASHN 鬼影(真实数据 NCC -0.4)。
+    """
+    from PIL import ImageDraw
+
+    w, h = 128, 160
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    d = ImageDraw.Draw(ref)
+    # 56x48 矩形轮廓线(5px 白笔触): cand 只有轮廓, 内部是基色
+    d.rectangle((36, 56, 92, 104), outline=(250, 249, 246), width=5)
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is not None, "细笔触印花不得因低 fill 被判纯色"
+    roi = np.asarray(roi)
+    # 轮廓内部(笔触之间)必须被凸包场覆盖
+    assert roi[80, 64] > 0, "hull 场必须覆盖笔触内部(鬼影残留区)"
+    assert (roi > 0).sum() > 2000, "核心应是填充场而非仅轮廓线"
+
+
+def test_print_core_mask_drops_smooth_sheen_patches():
+    """丝绸高光斑与白色印花在颜色轴上不可分(同为亮中性+大色距), 只有纹理
+    可分: 高光斑软梯度边界 canny 不点火, 纹理门清空全部成分 → 判纯色。
+    """
+    from PIL import ImageDraw
+
+    w, h = 128, 160
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    d = ImageDraw.Draw(ref)
+    for cx, cy in ((48, 50), (84, 60), (60, 100)):
+        d.ellipse((cx - 14, cy - 10, cx + 14, cy + 10), fill=(234, 228, 209))
+    # 软化边界成平缓梯度(高光斑的真实形态): canny(30,90) 不点火
+    ref = ref.filter(ImageFilter.GaussianBlur(6))
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is None, "平滑高光斑不得进入印花核心"
+
+
+# ---------- ghost_print_mask ----------
+
+
+def test_ghost_print_mask_detects_offset_ghost_print():
+    """FASHN 自绘印花与 TPS 几何错位(r9 真实数据: 上方半透明猴头重影):
+    生成图上偏移+糊化的白印花必须检出为鬼场, 且不侵入核心场。
+    """
+    from PIL import ImageDraw
+
+    w, h = 128, 160
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    # ref: 基色 + 下半部白印花(=核心场)
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    ImageDraw.Draw(ref).rectangle((36, 96, 92, 140), fill=(250, 249, 246))
+    core = preserve_refit.print_core_mask(ref, keep)
+    assert core is not None
+    # gen: 同基色 + 上方偏移鬼影(576 原生+2x 放大 → 糊化), 仿真 FASHN
+    gen = Image.new("RGB", (w, h), (216, 198, 151))
+    ImageDraw.Draw(gen).rectangle((40, 20, 88, 64), fill=(238, 234, 226))
+    gen = gen.filter(ImageFilter.GaussianBlur(2))
+    ghost = preserve_refit.ghost_print_mask(gen, ref, keep, exclude_mask=core)
+    assert ghost is not None, "偏移鬼影必须检出(视觉验收: 半透明重影暴露在场外)"
+    ghost = np.asarray(ghost)
+    assert ghost[42, 64] > 0, "鬼影本体中心必须在擦除场内"
+    assert ghost[118, 64] == 0, "鬼场不得侵入核心印花场(恒等贴印区)"
+
+
+def test_ghost_print_mask_none_when_gen_matches_ref():
+    """生成图与参考一致(无鬼影): 核心场外无候选 → None, 不触发擦除。"""
+    from PIL import ImageDraw
+
+    w, h = 128, 160
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    ImageDraw.Draw(ref).rectangle((36, 96, 92, 140), fill=(250, 249, 246))
+    core = preserve_refit.print_core_mask(ref, keep)
+    assert core is not None
+    ghost = preserve_refit.ghost_print_mask(ref, ref, keep, exclude_mask=core)
+    assert ghost is None, "无鬼影时不得产生擦除场"
+
+
+def test_ghost_print_mask_rejects_whole_garment_candidate():
+    """整件级亮中性候选(白化渲染/整件环): bbox 跨度门拦截 → None,
+    否则凸包=整件衣, 擦除语义退化为整件贴回。
+    """
+    from PIL import ImageDraw
+
+    w, h = 128, 160
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    core = preserve_refit.print_core_mask(ref, keep)
+    assert core is None
+    gen = Image.new("RGB", (w, h), (216, 198, 151))
+    ImageDraw.Draw(gen).rectangle((5, 10, 123, 150), fill=(234, 232, 228))
+    ghost = preserve_refit.ghost_print_mask(gen, ref, keep, exclude_mask=None)
+    assert ghost is None, "整件级候选必须被 bbox 跨度门拦截"
 
 
 # ---------- clip_mask_to_garment_alpha ----------
