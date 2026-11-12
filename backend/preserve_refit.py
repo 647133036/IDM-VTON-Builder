@@ -276,23 +276,34 @@ def detect_print_roi(
 def print_core_mask(
     cloth_ref: Image.Image,
     keep_mask: np.ndarray | Image.Image,
-    hf_thresh: float = 12.0,
+    color_thresh: float = 60.0,
     min_area_frac: float = 0.004,
     grow_px: int = 3,
 ) -> np.ndarray | None:
-    """印花核心区(全量掩膜, 非边界带): warp 参考图在保留区内的高频区。
+    """印花核心区: 与衣料基色色距大的近中性色/异色相实心块。
 
-    与 detect_print_roi(dilate-erode 边界带, 供局部 inpaint)互补:
-    本函数返回印花本体(logo/字母/大图案/纹理)的实心区, 作为确定性
-    贴印区域与印花保真分的测区; grow_px 外扩盖住抗锯齿缝并裁回
-    keep_mask, 不越出衣料。纯色款(高频不足)返回 None, 调用方回退
-    整件衣料贴回。
+    v1 高频带把门襟/纽扣/褶皱全当印花(GPU r6 视觉验收: 门襟中线纵向
+    拉丝); v2 基色色距过滤挡不住同色相褶皱阴影(真丝暗褶的色度偏移
+    同样 >40)。v3 三轴联合, 商用印花语义:
+    1) 色距 > color_thresh: 与 keep 区基色(中位 RGB)欧氏距离足够大;
+    2) 近中性色(像素 RGB max-min < 40): 白/灰/黑印花, 面料同色相的
+       褶皱阴影天然带面料色度, 不满足;
+    3) 或色相偏移(像素色度向量与基色色度向量夹角 > 30 度): 彩色印花;
+       褶皱阴影沿基色色相方向变暗/变亮, 色相守恒, 被排除。
+    形态过滤: 3px 腐蚀存活 + 连通域面积 >= max(150, 8% 最大块) +
+    bbox 短边 >= 8px(细缝线/纽扣碎片即便膨胀串联也会先在成分级被杀)。
+    回膨胀(恢复腐蚀 + grow_px 外扩盖抗锯齿缝), 裁回 keep_mask。
+
+    与 detect_print_roi(dilate-erode 边界带, 供局部 inpaint)互补,
+    本函数返回印花本体实心区, 作为确定性贴印区域与印花保真分测区。
+    纯色款/同色相暗褶面料(全中性灰底的深褶有残留风险)返回 None,
+    调用方回退整件衣料贴回。
 
     Args:
         cloth_ref: warp 后的 SKU 参考图 (RGB/RGBA)
         keep_mask: 衣料保留区掩膜 (L/ndarray, 255=衣料)
-        hf_thresh: 高频能量阈值(0-255 灰度差)
-        min_area_frac: 核心区面积占比下限, 低于此返回 None
+        color_thresh: 与基色的欧氏色距阈值(0-255 RGB 尺度)
+        min_area_frac: 核心区面积占画布比下限, 低于此返回 None
         grow_px: 核心区外扩像素(边缘覆盖), 0=不扩
 
     Returns:
@@ -301,7 +312,7 @@ def print_core_mask(
     try:
         import cv2
 
-        ref = np.asarray(cloth_ref.convert("L"), dtype=np.float32)
+        ref = np.asarray(cloth_ref.convert("RGB"), dtype=np.float32)
         mask = np.asarray(keep_mask)
         if mask.ndim == 3:
             mask = mask[..., 0]
@@ -309,18 +320,52 @@ def print_core_mask(
             mask = np.array(
                 Image.fromarray(mask.astype("uint8")).resize((ref.shape[1], ref.shape[0]), Image.Resampling.BILINEAR)
             )
-        blur = cv2.GaussianBlur(ref, (0, 0), 4.0)
-        hf = np.abs(ref - blur)
-        roi = ((hf > hf_thresh) & (mask > 127)).astype(np.uint8) * 255
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        roi = cv2.morphologyEx(roi, cv2.MORPH_OPEN, k)
-        roi = cv2.morphologyEx(roi, cv2.MORPH_CLOSE, k)
-        if float(roi.mean()) / 255.0 < min_area_frac:
+        ka = (mask > 127).reshape(-1)
+        if ka.sum() < 64:
             return None
+        px = ref.reshape(-1, 3)
+        base = np.median(px[ka], axis=0)
+        dist = np.linalg.norm(px - base, axis=-1)
+        neutral = (px.max(-1) - px.min(-1)) < 40.0
+        cv_px = px - px.mean(-1, keepdims=True)
+        cv_base = base - float(base.mean())
+        n_px = np.linalg.norm(cv_px, axis=-1)
+        cos = (cv_px @ cv_base) / np.maximum(n_px * float(np.linalg.norm(cv_base)), 1e-6)
+        hue_shift = cos < 0.866
+        # 灰基色(白/灰衣)的 cv_base≈0, 色相轴失效: 彩色印花改判
+        # "像素自身带显著色度"(褶皱在灰衣上是纯亮度变化, 天然无色度)
+        base_neutral = float(base.max() - base.min()) < 15.0
+        px_chromatic = n_px > 25.0
+        cand = (ka & (dist > color_thresh) & (neutral | hue_shift | (base_neutral & px_chromatic))).reshape(
+            ref.shape[:2]
+        )
+        if float(cand.mean()) < min_area_frac:
+            return None
+        c8 = cand.astype(np.uint8) * 255
+        ke5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        er = cv2.erode(c8, ke5)
+        if er.max() == 0:
+            return None
+        num, lab, stats, _ = cv2.connectedComponentsWithStats((er > 0).astype(np.uint8))
+        if num <= 1:
+            return None
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        floor = max(150.0, 0.08 * float(areas.max()))
+        keep_ids = [
+            i + 1
+            for i in range(num - 1)
+            if float(areas[i]) >= floor
+            and min(int(stats[i + 1, cv2.CC_STAT_WIDTH]), int(stats[i + 1, cv2.CC_STAT_HEIGHT])) >= 8
+        ]
+        if not keep_ids:
+            return None
+        sel = np.isin(lab, keep_ids).astype(np.uint8) * 255
+        if float((sel > 0).mean()) < min_area_frac:
+            return None
+        roi = cv2.dilate(sel, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
         if grow_px > 0:
-            ke = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow_px * 2 + 1, grow_px * 2 + 1))
-            roi = np.minimum(cv2.dilate(roi, ke), mask.astype(np.uint8))
-        return roi
+            roi = cv2.dilate(roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (grow_px * 2 + 1, grow_px * 2 + 1)))
+        return np.minimum(roi, mask.astype(np.uint8))
     except Exception:
         logger.exception("print_core_mask failed")
         return None

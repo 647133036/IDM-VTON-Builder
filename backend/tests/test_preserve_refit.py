@@ -415,38 +415,78 @@ def test_print_fidelity_score_size_mismatch_resizes_ref():
 
 def test_print_core_mask_detects_logo_within_keep():
     w, h = 96, 128
-    ref = Image.new("L", (w, h), 235)
+    ref = Image.new("RGB", (w, h), (235, 233, 231))
     from PIL import ImageDraw
 
     d = ImageDraw.Draw(ref)
-    d.ellipse((36, 48, 60, 72), fill=10)  # 深色 logo
+    d.ellipse((36, 48, 60, 72), fill=(200, 30, 30))  # 红色 logo(异色相)
     keep = np.zeros((h, w), dtype=np.uint8)
     keep[16:112, 12:84] = 255
     roi = preserve_refit.print_core_mask(ref, keep)
     assert roi is not None
     ys, xs = np.where(roi > 0)
-    # 高频响应 = logo 及其 blur halo(±6px) + grow_px(3): 容差 9px
-    assert xs.min() >= 27 and xs.max() <= 69
-    assert ys.min() >= 39 and ys.max() <= 81
+    # 腐蚀 3px + 回膨胀 4px + grow 3px: 外扩 ≈ 7px 容差
+    assert xs.min() >= 29 and xs.max() <= 67
+    assert ys.min() >= 41 and ys.max() <= 79
     # 不越出 keep 区
     assert roi[:16, :].max() == 0 and roi[112:, :].max() == 0
 
 
 def test_print_core_mask_solid_returns_none():
-    ref = Image.new("L", (64, 64), 200)
+    ref = Image.new("RGB", (64, 64), (200, 200, 200))
     keep = np.full((64, 64), 255, dtype=np.uint8)
     assert preserve_refit.print_core_mask(ref, keep) is None
 
 
-def test_print_core_mask_resizes_keep_to_ref():
-    ref = Image.new("L", (64, 64), 235)
+def test_print_core_mask_excludes_same_hue_folds():
+    """褶皱阴影沿基色色相方向变暗 → 必须排除; 白印花(近中性)保留。"""
+    w, h = 96, 128
+    ref = Image.new("RGB", (w, h), (216, 198, 151))  # 芥末黄基色
     from PIL import ImageDraw
 
     d = ImageDraw.Draw(ref)
-    d.rectangle((28, 28, 36, 36), fill=0)
+    d.rectangle((20, 40, 34, 100), fill=(140, 120, 75))  # 同色相深褶(长条)
+    d.rectangle((50, 50, 80, 84), fill=(250, 249, 246))  # 白色印花
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is not None
+    _ys, xs = np.where(roi > 0)
+    # 只有白印花区, 褶皱长条(<=x=34)必须为空
+    assert 43 <= xs.min() <= 57 and xs.max() <= 87
+
+
+def test_print_core_mask_drops_small_button_fragments():
+    """纽扣碎片/小亮点按面积下限过滤, 不进贴印区(防膨胀串联成结构带)。"""
+    w, h = 96, 128
+    ref = Image.new("RGB", (w, h), (216, 198, 151))
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(ref)
+    d.ellipse((40, 50, 78, 88), fill=(250, 249, 246))  # 主印花
+    for cy in (30, 50, 70, 90):  # 门襟小亮点(纽扣)
+        d.ellipse((46, cy - 2, 52, cy + 4), fill=(240, 240, 240))
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is not None
+    # 主印花区存在; 顶部亮点区(y<40)必须被清掉
+    assert float((roi[:40, :] > 0).mean()) == 0.0
+    ys, _xs = np.where(roi > 0)
+    assert ys.min() >= 42
+
+
+def test_print_core_mask_resizes_keep_to_ref():
+    ref = Image.new("RGB", (64, 64), (235, 233, 231))
+    from PIL import ImageDraw
+
+    d = ImageDraw.Draw(ref)
+    d.rectangle((20, 20, 44, 44), fill=(200, 30, 30))
     keep = np.full((128, 128), 255, dtype=np.uint8)
     roi = preserve_refit.print_core_mask(ref, keep)
     assert roi is not None
+    ys, xs = np.where(roi > 0)
+    # logo (20,20)-(44,44) + 腐蚀/膨胀容差 ±8px, 且不越出画布
+    assert 12 <= xs.min() <= 28 and 36 <= xs.max() <= 52
+    assert 12 <= ys.min() <= 28 and 36 <= ys.max() <= 52
 
 
 # ---------- clip_mask_to_garment_alpha ----------
