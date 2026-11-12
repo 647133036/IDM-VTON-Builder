@@ -266,6 +266,12 @@ def compose_tryon_fashn(
                 paste_mask = print_core_mask(cloth_ref, keep_mask)
                 if paste_mask is None:
                     paste_mask = keep_mask
+                    core_paste = False
+                else:
+                    # 印花核心区: HF(笔触)贴参考原样、folds 关闭 —— 生成图的
+                    # 木纹/水波伪影(r7 实测 s0 自带)不再经 shade_hf/folds 叠
+                    # 加污染印花; LF 底色仍跟随生成光影, 融合自然。
+                    core_paste = True
             else:
                 # 模板对齐(legacy 回退): warp 平铺衣到身体模板先验,
                 # 并集再裁剪(intersect)兜住宽松款悬垂面料。
@@ -283,6 +289,7 @@ def compose_tryon_fashn(
                         cloth_ref_alpha = cloth_ref_alpha.resize(result.size, Image.Resampling.BILINEAR)
                 keep_mask, _kept = intersect_mask_with_garment_alpha(drawn_mask, cloth_ref_alpha)
                 paste_mask = keep_mask
+                core_paste = False
             if pattern_on and paste_mask is not None:
                 result = reapply_garment_detail(
                     result,
@@ -290,6 +297,8 @@ def compose_tryon_fashn(
                     paste_mask,
                     pattern_lock=True,
                     ref_alpha=cloth_ref_alpha,
+                    hf_strength=0.0 if core_paste else None,
+                    fold_gain=0.0 if core_paste else None,
                 )
                 detail_applied = True
         except Exception:

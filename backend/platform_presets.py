@@ -2012,6 +2012,8 @@ def _pattern_lock_overlay(
     skin_u8: np.ndarray,
     light_strength: float,
     ref_alpha: Image.Image | None = None,
+    hf_strength: float | None = None,
+    fold_gain: float | None = None,
 ) -> Image.Image:
     """Warp 后的衣覆盖衣服区;生成图只提供褶皱光影(PLTON 频率分离)。
 
@@ -2049,7 +2051,7 @@ def _pattern_lock_overlay(
     ls_val = _env_float("VTON_PATTERN_LOCK_LIGHT_STRENGTH", light_strength, 0.0, 1.0)
     ls = float(np.clip(ls_val, 0.0, 1.0))
     lf_strength = _env_float("VTON_PATTERN_LOCK_LF_STRENGTH", 1.0, 0.0, 4.0)
-    hf_strength = _env_float("VTON_PATTERN_LOCK_HF_STRENGTH", 0.5, 0.0, 4.0)
+    hf_strength = _env_float("VTON_PATTERN_LOCK_HF_STRENGTH", 0.5 if hf_strength is None else hf_strength, 0.0, 4.0)
     lf_blur = _env_float("VTON_PATTERN_LOCK_LF_BLUR_SIGMA", 8.0, 0.0, 64.0)
     light_min = _env_float("VTON_PATTERN_LOCK_LIGHTING_MIN", 0.62, 0.0, 4.0)
     light_max = _env_float("VTON_PATTERN_LOCK_LIGHTING_MAX", 1.12, 0.0, 4.0)
@@ -2151,7 +2153,7 @@ def _pattern_lock_overlay(
     shade_hf = 1.0 + (lighting - 1.0) * ls * hf_strength
     lit = np.clip(lf_ref * shade_lf[..., None] + hf_ref * shade_hf[..., None], 0, 255)
 
-    fold_gain = _env_float("VTON_PATTERN_LOCK_FOLD_GAIN", 0.45, 0.0, 1.5)
+    fold_gain = _env_float("VTON_PATTERN_LOCK_FOLD_GAIN", 0.45 if fold_gain is None else fold_gain, 0.0, 1.5)
     if fold_gain > 0:
         # 贴回面料叠加 gen 的中频褶皱光影(带通, 零均值): 平铺面料获得生成
         # 图的身体起伏/褶皱明暗 → "穿上去"而非"贴上去"(贴纸感根因之一是
@@ -2174,6 +2176,8 @@ def reapply_garment_detail(
     pattern_lock: bool = False,
     light_strength: float = 1.0,
     ref_alpha: Image.Image | None = None,
+    hf_strength: float | None = None,
+    fold_gain: float | None = None,
 ) -> Image.Image:
     """AI 出骨架光影,代码保商品纹理颜色。
 
@@ -2228,7 +2232,9 @@ def reapply_garment_detail(
         # 行29: overlay 调用无守卫, 坏 env 值崩了 → 整步退回裸 SDXL(静默丢商品纹理)。
         # 上游已 fail-loud log, 这里保底回退到高频柔光路径而非裸生成图。
         try:
-            return _pattern_lock_overlay(gen, ref, mask, skin, light_strength, ref_alpha=ref_alpha)
+            return _pattern_lock_overlay(
+                gen, ref, mask, skin, light_strength, ref_alpha=ref_alpha, hf_strength=hf_strength, fold_gain=fold_gain
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("pattern_lock overlay failed (%s); falling back to softlight path", exc)
 

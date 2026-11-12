@@ -512,6 +512,45 @@ def test_pattern_lock_transfers_gen_folds_onto_flat_ref(monkeypatch):
     assert abs(out[20, 60][0] - out0[20, 60][0]) <= 8, "远离褶皱带不应被改变"
 
 
+def test_pattern_lock_print_core_kwargs_disable_hf_and_folds(monkeypatch):
+    """compose 印花核心区贴回: hf_strength=0/fold_gain=0 = 贴参考原样笔触。
+
+    参数语义与 LIGHT_STRENGTH 同模式: None 走默认, 显式值等价 env 覆盖。
+    生成图的褶皱带通(folds)与 HF 光影调制不再污染贴回的印花笔触
+    (r7 实测 s0 木纹经 folds/shade_hf 叠加把印花洗成半透明)。
+    """
+    for key in (
+        "VTON_PATTERN_LOCK_LIGHTING_MIN",
+        "VTON_PATTERN_LOCK_LIGHTING_MAX",
+        "VTON_PATTERN_LOCK_LIGHT_STRENGTH",
+        "VTON_PATTERN_LOCK_LF_STRENGTH",
+        "VTON_PATTERN_LOCK_HF_STRENGTH",
+        "VTON_PATTERN_LOCK_SKIN_WEIGHT",
+        "VTON_PATTERN_LOCK_SKIP_WHITE_BG",
+        "VTON_PATTERN_LOCK_WHITE_THRESH",
+        "VTON_PATTERN_LOCK_FOLD_GAIN",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    w = h = 120
+    ref = Image.new("RGB", (w, h), (150, 150, 150))
+    a = np.full((h, w), 255, dtype=np.uint8)
+    ref_alpha = Image.merge("RGBA", (*ref.split(), Image.fromarray(a)))
+    mask = np.full((h, w), 255, dtype=np.uint8)
+    g = np.full((h, w, 3), 180, dtype=np.uint8)
+    g[50:70, :] = 90  # gen 上一条横褶阴影带
+    gen = Image.fromarray(g)
+    kw = dict(pattern_lock=True, ref_alpha=ref_alpha)
+    a_out = np.asarray(reapply_garment_detail(gen, ref, mask, **kw)).astype(float)
+    b_out = np.asarray(reapply_garment_detail(gen, ref, mask, hf_strength=0.0, fold_gain=0.0, **kw)).astype(float)
+    monkeypatch.setenv("VTON_PATTERN_LOCK_HF_STRENGTH", "0")
+    monkeypatch.setenv("VTON_PATTERN_LOCK_FOLD_GAIN", "0")
+    c_out = np.asarray(reapply_garment_detail(gen, ref, mask, **kw)).astype(float)
+    assert np.array_equal(b_out, c_out), "hf/fold kwargs 未按 env 覆盖语义生效"
+    assert b_out[60, 60][0] - a_out[60, 60][0] >= 10, "folds 关闭后褶皱带不应再叠加变暗"
+    # folds 带通零均值: 带内变暗、带外(sigma35 泄漏)轻微回亮; 关闭后带外不应更暗。
+    assert b_out[20, 60][0] - a_out[20, 60][0] <= 2, "远离褶皱带不应出现新的变暗"
+
+
 def test_pattern_lock_transfers_spatial_shading_and_absorbs_global_lift(monkeypatch):
     """空间身体明暗要传到贴回面料, 全局亮暗差被中位数吸收(修"贴上去"贴纸感)。
 
