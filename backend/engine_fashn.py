@@ -405,30 +405,42 @@ def compose_tryon_fashn(
                 _alpha_ch = result.split()[-1] if result.mode == "RGBA" else None
                 _rgb_result = result.convert("RGB")
                 if core_full is not None:
+                    # 鬼场检测必须先于色调匹配: 鬼影亮笔触(+178 vs 衣身 94)
+                    # 在 keep 内占 ~10%, 采样区含它会污染中位数(r11 GPU 实测
+                    # 采样中位数 104 vs 真衣身 52, 匹配参考亮 +47, 擦除带
+                    # 只修一半)。ghost 检测只依赖 gen/cloth_ref/keep, 与
+                    # 色调匹配无依赖, 顺序可安全对调。
+                    try:
+                        from preserve_refit import ghost_print_mask as _ghost_fn
+
+                        ghost_full = _ghost_fn(_rgb_result, cloth_ref_full, keep_full, exclude_mask=core_full)
+                    except Exception:
+                        logger.exception("FASHN ghost print detect failed; skipping erase")
+                        ghost_full = None
+                        degraded_reasons.append("FASHN ghost print detect failed")
                     # 色调匹配(r10 GPU 实测: gen 衣身 [117,103,69] vs 平铺 ref
                     # [220,206,168], 差百余灰阶): 直接贴参考, 鬼场擦除带与
                     # 核心场内衣料都比生成图衣身亮 +100 → 视觉验收"印花周
                     # 围一圈发白发光轮廓带"。先统一把参考逐通道平移到生成
-                    # 图衣身色调; 鬼场/核心场分别按各自语义取用。
+                    # 图衣身色调; 鬼场/核心场分别按各自语义取用。采样区
+                    # 同时避开核心场与鬼场(各自外扩余量由函数内部自适应)。
+                    _avoid_list = [np.asarray(core_full)]
+                    if ghost_full is not None and np.asarray(ghost_full).max() > 0:
+                        _avoid_list.append(np.asarray(ghost_full))
                     try:
                         from preserve_refit import match_ref_tone as _tone_fn
 
-                        _ref_matched = _tone_fn(
-                            _rgb_result, cloth_ref_full, keep_full, avoid_mask=np.asarray(core_full)
-                        )
+                        _ref_matched = _tone_fn(_rgb_result, cloth_ref_full, keep_full, avoid_mask=_avoid_list)
                     except Exception:
                         logger.exception("FASHN tone match failed; using raw ref")
                         _ref_matched = cloth_ref_full
                     # 鬼影擦除(核心场外): FASHN 按自己的几何摆放印花(实测
                     # 偏上), 核心场只盖 TPS 位置, 生成图的整套鬼影笔触
-                    # 暴露在场外(视觉验收: 上方半透明重影)。生成图上同色轴
-                    # 检出鬼场, 用色调匹配参考+恒等参数贴回 —— 恒等 (光/褶
-                    # 全关) 防 gen 鬼影区的明暗场/褶皱带通把鬼影形状搬回。
-                    # 实心款回退分支整件已贴回, 无需此步。
+                    # 暴露在场外(视觉验收: 上方半透明重影)。用色调匹配
+                    # 参考+恒等参数贴回 —— 恒等 (光/褶全关) 防 gen 鬼影区
+                    # 的明暗场/褶皱带通把鬼影形状搬回。实心款回退分支整件
+                    # 已贴回, 无需此步。
                     try:
-                        from preserve_refit import ghost_print_mask as _ghost_fn
-
-                        ghost_full = _ghost_fn(_rgb_result, cloth_ref_full, keep_full, exclude_mask=core_full)
                         if ghost_full is not None and np.asarray(ghost_full).max() > 0:
                             _rgb_result = reapply_garment_detail(
                                 _rgb_result,
