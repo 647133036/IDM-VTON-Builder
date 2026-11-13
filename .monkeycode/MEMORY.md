@@ -261,3 +261,30 @@ Entries discovered by the Agent during task execution should follow this format:
   - GPU 冒烟脚本: `scripts/gpu/smoke_print_pipeline.py`(服务器布局 /root/vton/repo
     + /root/autodl-tmp/vton_combo 样图), 一条命令验证 engine_status + FASHN 出图
     + 保真分档 + 多 seed 择优。
+
+[Project Knowledge Summary]
+- Date: 2026-11-13
+- Context: Discovered by Agent while fixing GPU smoke r9 (fidelity 0.871 → 0.9663 PASS)
+- Category: Troubleshooting & Debugging
+- Instructions:
+  - AutoDL 服务器 conda numpy 1.23.5 (OpenBLAS ILP64) 的 `np.linalg.solve`(LAPACK
+    gesv) 在良态矩阵上返回垃圾: Bookstein 归一化 8 锚点 TPS 的 11x11 系统 cond 20,
+    solve 残差 2.71175554767862(与冒烟日志逐位一致), 同库 `np.linalg.lstsq`(SVD
+    路径) 残差 1.3e-15 正常。沙箱 numpy 2.4.6 两者都正常。结论: 服务器端数值求解
+    必须带残差守卫 + lstsq 换道重试(已实装 preserve_refit.tps_warp), 全库唯一
+    solve 调用点就是 tps_warp。r6-r8 GPU fidelity 卡 0.85 平台的根因即此(守卫
+    触发后静默回退 LANCZOS, 印花贴在几何错位位置), 非算法问题。
+  - 服务器脚本必须显式用 `/root/miniconda3/bin/python`: 裸 `python3` 是系统
+    python, 无 numpy/torch, 冒烟秒退 ModuleNotFoundError。nohup setsid bash
+    非登录 shell 不会加载 conda PATH, sed 替换脚本内 python3 为绝对路径是
+    最稳做法(smoke_launch_261110.sh / collect_smoke_261110.sh 均已替换)。
+  - 冒烟成败判据: 日志结论行 `print_fidelity >= 0.9 auto 档, PASS`; 结果以
+    `result.info.print_fidelity` 为准。GPU 冒烟全程 4-6 分钟, 显存峰值 ~6-8G,
+    用户看到"显存才用 6g 现已停"= 正常跑完(非失败), 先查日志再下结论。
+  - 服务器 python 探针/TCP 往返偶发 SSH 节流(kex_exchange_identification):
+    轮询间隔 ≥100s; 快速连续 SSH 会拿空响应, 误判成任务未完成。
+  - 收集流程: 服务器侧 `collect_smoke_261110.sh` 打一个 tar(日志+结果+输入+环境),
+    单 scp 拉回 /tmp/opencode/gpu_results/<round>/, 符合用户一次性拉取要求。
+  - 冒烟脚本第二段 `VTON_MULTI_SEED=3` 直调 `engine.compose_tryon` 输出
+    `multiseed: {}` 是结构使然(multiseed 由 worker.run_multiseed 写 info,
+    引擎层不写), 非失败信号; PASS 只看单 seed 段。

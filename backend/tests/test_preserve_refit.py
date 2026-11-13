@@ -436,6 +436,34 @@ def test_print_fidelity_score_size_mismatch_resizes_ref():
     assert quality_gate.print_fidelity_score(big, small, mask) > 0.9
 
 
+def test_print_fidelity_score_white_ink_strokes_isolated():
+    """白墨印花笔触区优先: 场内衣料被引擎色调重调(r11, 生成图衣身暗于平铺
+    照片)不算失真; 笔触原样→高分, 笔触错位→低分。全场 NCC 会把预期
+    重调算成失真误杀 auto 档(实测 0.894<0.9)。
+    """
+    from PIL import ImageDraw
+
+    w, h = 160, 160
+    ref = Image.new("RGB", (w, h), (215, 197, 149))
+    d = ImageDraw.Draw(ref)
+    d.ellipse((30, 40, 70, 80), fill=(255, 255, 255))
+    d.ellipse((90, 100, 130, 140), fill=(250, 250, 248))
+    mask = Image.new("L", (w, h), 255)
+
+    # out1: 衣料按生成图色调重调(暗), 笔触原样 → 引擎 r11 语义, 应高分
+    out1 = Image.new("RGB", (w, h), (117, 103, 69))
+    d1 = ImageDraw.Draw(out1)
+    d1.ellipse((30, 40, 70, 80), fill=(255, 255, 255))
+    d1.ellipse((90, 100, 130, 140), fill=(250, 250, 248))
+    assert quality_gate.print_fidelity_score(out1, ref, mask) > 0.9
+
+    # out2: 笔触挪到无交集位置(错位), 衣料同 out1 → 笔触保真被击穿, 低分
+    out2 = Image.new("RGB", (w, h), (117, 103, 69))
+    d2 = ImageDraw.Draw(out2)
+    d2.ellipse((110, 20, 150, 60), fill=(255, 255, 255))
+    assert quality_gate.print_fidelity_score(out2, ref, mask) < 0.5
+
+
 # ---------- print_core_mask ----------
 
 
@@ -567,6 +595,39 @@ def test_print_core_mask_boundary_halo_excluded_interior_print_kept():
     assert roi2 is None, "贴 keep 边界的白边距环必须被内缩+腐蚀清除"
 
 
+def test_print_core_mask_rejects_boundary_straddling_hull():
+    """贴边印花 all-or-nothing(r10 GPU 2048 实测: 下腹印花成分凸包 84% 入
+    keep 硬区, content 门切出半张印花, 半贴半留发糊 → 视觉"右手图案没保真")。
+
+    cand 被 erode(keep,9) 保证在硬区 9px 内, 但 U 形成分的**凸包填充**按凸性
+    桥过 keep 的凹口/曲边 → 场骑出硬区。凸包填充入硬区 <95% 整场拒绝;
+    无凹口(全界内)同款印花照常检出(对照组)。
+    """
+    from PIL import ImageDraw
+
+    w, h = 96, 128
+    strokes = [  # U 形白墨笔画(两列+顶桥), 全部画在 keep 硬区内
+        (32, 84, 38, 103),
+        (58, 84, 64, 103),
+        (32, 84, 64, 90),
+    ]
+    ref = Image.new("RGB", (w, h), (150, 150, 150))
+    d = ImageDraw.Draw(ref)
+    for box in strokes:
+        d.rectangle(box, fill=(255, 255, 255))
+    keep = np.zeros((h, w), dtype=np.uint8)
+    keep[16:112, 12:84] = 255
+    keep[100:112, 40:56] = 0  # keep 下边界的裙摆状凹口(凸包桥过处)
+    roi = preserve_refit.print_core_mask(ref, keep)
+    assert roi is None, "凸包填充骑 keep 硬区 <95% 必须整场拒绝(半贴比不贴更糟)"
+    # 对照: 同一印花, keep 无凹口(全界内) → 正常检出
+    keep2 = np.zeros((h, w), dtype=np.uint8)
+    keep2[16:112, 12:84] = 255
+    roi2 = preserve_refit.print_core_mask(ref, keep2)
+    assert roi2 is not None, "全界内 U 形白墨笔画必须照常检出"
+    assert (np.asarray(roi2) > 0).sum() > 0
+
+
 def test_print_core_mask_rejects_dark_neutral_slab():
     """深褶阴影脱饱和后同样过 dist+neutral 轴(1536 实测腹部 188x193 暗块混入)。
     彩色基色下近中性候选必须比基色亮(印花亮/阴影暗); 白印花照常检出。
@@ -682,6 +743,43 @@ def test_ghost_print_mask_rejects_whole_garment_candidate():
     ImageDraw.Draw(gen).rectangle((5, 10, 123, 150), fill=(234, 232, 228))
     ghost = preserve_refit.ghost_print_mask(gen, ref, keep, exclude_mask=None)
     assert ghost is None, "整件级候选必须被 bbox 跨度门拦截"
+
+
+# ---------- match_ref_tone ----------
+
+
+def test_match_ref_tone_shifts_ref_to_gen_tone():
+    """生成图衣身比平铺参考暗百余灰阶(r10 GPU 实测): 匹配后 ref 应贴到
+    生成图色调, 否则擦除带比衣身亮一圈(视觉"发白轮廓带")。
+    """
+    w, h = 128, 160
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    gen = Image.new("RGB", (w, h), (100, 90, 80))
+    ref = Image.new("RGB", (w, h), (210, 200, 190))
+    out = preserve_refit.match_ref_tone(gen, ref, keep)
+    arr = np.asarray(out, np.float32)
+    assert abs(arr[..., 0].mean() - 100) < 3
+    assert abs(arr[..., 1].mean() - 90) < 3
+    assert abs(arr[..., 2].mean() - 80) < 3
+
+
+def test_match_ref_tone_avoid_zone_excluded_from_sampling():
+    """avoid 场(核心/鬼场)外扩后覆盖全部 keep → 采样不足 → 原样返回。"""
+    w, h = 128, 160
+    keep = np.full((h, w), 255, dtype=np.uint8)
+    avoid = np.full((h, w), 255, dtype=np.uint8)
+    gen = Image.new("RGB", (w, h), (100, 90, 80))
+    ref = Image.new("RGB", (w, h), (210, 200, 190))
+    out = preserve_refit.match_ref_tone(gen, ref, keep, avoid_mask=avoid)
+    assert np.asarray(out).tobytes() == np.asarray(ref).tobytes(), "采样不足必须原样返回"
+
+
+def test_match_ref_tone_size_mismatch_returns_original():
+    """gen/ref 尺寸不一致(链路异常): 原样返回不贴错位色调。"""
+    gen = Image.new("RGB", (64, 64), (100, 90, 80))
+    ref = Image.new("RGB", (32, 32), (210, 200, 190))
+    out = preserve_refit.match_ref_tone(gen, ref, np.full((64, 64), 255, dtype=np.uint8))
+    assert np.asarray(out).tobytes() == np.asarray(ref).tobytes()
 
 
 # ---------- clip_mask_to_garment_alpha ----------

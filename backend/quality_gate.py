@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 
+import cv2
 import numpy as np
 from PIL import Image
 
@@ -157,6 +158,50 @@ def print_fidelity_score(
     # (只看参考侧: composite 路径的接触阴影会抬高结果侧方差, 不算失真)
     if float(gc.std()) < 6.0:
         return 1.0
+
+    # 白墨/亮色印花: 笔触区优先(语义: 印花保真=笔触保真)。凸包核心场
+    # 95% 是笔触间的参考衣料, 引擎 r11 起按生成图衣身色调重调场内衣料
+    # (视觉"印花一圈发光"根由), 全场 NCC 把预期重调算成失真(实测
+    # 0.894<0.9 误杀 auto 档); 笔触被重画/错位才是真失真。参考侧亮
+    # (min>=225)且低彩度(spread<=35)判笔触, 在参考**原始分辨率**上判
+    # (缩放振铃会在边缘伪亮); 占比过低/暗色印花退回全场。逐连通成分各
+    # 自归一: 整组笔触近乎常数白(254)时全局 NCC 分母失稳(r10 实测回退
+    # 全场 0.84 误杀), 每个印花图案内部对比才是保真信号。
+    _c0 = np.asarray(cloth_ref.convert("RGB"), np.float32)
+    _s0 = (_c0.min(axis=-1) >= 225) & ((_c0.max(axis=-1) - _c0.min(axis=-1)) <= 35)
+    if _s0.shape[:2] != r.shape[:2]:
+        _s0 = (
+            np.asarray(
+                Image.fromarray((_s0 * 255).astype(np.uint8)).resize((r.shape[1], r.shape[0]), Image.Resampling.NEAREST)
+            )
+            > 127
+        )
+    strokes = zone & _s0
+    n_stroke = int(strokes.sum())
+    if n_stroke >= 400 and n_stroke * 50 >= int(zone.sum()):
+        _gray_f = r[..., :3].mean(axis=2)
+        _gray_c = c[..., :3].mean(axis=2)
+        _sn, _slab, _sstat, _ = cv2.connectedComponentsWithStats(strokes.astype(np.uint8), 8)
+        _w_sum = 0.0
+        _ncc_sum = 0.0
+        for _i in range(1, _sn):
+            if int(_sstat[_i, cv2.CC_STAT_AREA]) < 64:
+                continue
+            _cm = _slab == _i
+            _fs = _gray_f[_cm]
+            _cs = _gray_c[_cm]
+            if float(_cs.std()) < 3.0:
+                # 参考侧该成分为常数(纯白块): 比较均值贴齐度
+                _ncc_i = 1.0 if abs(float(_fs.mean()) - float(_cs.mean())) < 10.0 else -1.0
+            else:
+                _fa = _fs - _fs.mean()
+                _ca = _cs - _cs.mean()
+                _ncc_i = float((_fa * _ca).sum() / (np.sqrt((_fa * _fa).sum() * (_ca * _ca).sum()) + 1e-9))
+            _w = float(_sstat[_i, cv2.CC_STAT_AREA])
+            _w_sum += _w
+            _ncc_sum += _ncc_i * _w
+        if _w_sum > 0:
+            return max(0.0, min(1.0, (_ncc_sum / _w_sum + 1.0) / 2.0))
 
     gr_n = (gr - gr.mean()) / (gr.std() + 1e-6)
     gc_n = (gc - gc.mean()) / (gc.std() + 1e-6)

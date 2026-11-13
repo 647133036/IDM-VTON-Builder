@@ -2015,6 +2015,7 @@ def _pattern_lock_overlay(
     hf_strength: float | None = None,
     fold_gain: float | None = None,
     content_mask: np.ndarray | None = None,
+    feather_px: float | None = None,
 ) -> Image.Image:
     """Warp 后的衣覆盖衣服区;生成图只提供褶皱光影(PLTON 频率分离)。
 
@@ -2065,7 +2066,7 @@ def _pattern_lock_overlay(
         )
         light_min, light_max = min(light_min, light_max), max(light_min, light_max)
     skin_w = _env_float("VTON_PATTERN_LOCK_SKIN_WEIGHT", 0.85, 0.0, 1.0)
-    feather = _env_float("VTON_PATTERN_LOCK_FEATHER_PX", 5, 1.0, 64.0)
+    feather = _env_float("VTON_PATTERN_LOCK_FEATHER_PX", 5 if feather_px is None else float(feather_px), 1.0, 64.0)
     skip_white = os.environ.get("VTON_PATTERN_LOCK_SKIP_WHITE_BG", "1") == "1"
     white_thresh = _env_float("VTON_PATTERN_LOCK_WHITE_THRESH", 245, 128, 255)
 
@@ -2201,6 +2202,7 @@ def reapply_garment_detail(
     hf_strength: float | None = None,
     fold_gain: float | None = None,
     content_mask: np.ndarray | None = None,
+    feather_px: float | None = None,
 ) -> Image.Image:
     """AI 出骨架光影,代码保商品纹理颜色。
 
@@ -2265,6 +2267,7 @@ def reapply_garment_detail(
                 hf_strength=hf_strength,
                 fold_gain=fold_gain,
                 content_mask=content_mask,
+                feather_px=feather_px,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("pattern_lock overlay failed (%s); falling back to softlight path", exc)

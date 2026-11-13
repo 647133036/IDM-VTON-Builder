@@ -433,6 +433,16 @@ def print_core_mask(
             if len(pts) < 32:
                 continue
             hull = cv2.convexHull(pts[:, ::-1].astype(np.int32).reshape(-1, 1, 2))
+            # 贴边印花 all-or-nothing 拒绝: 种子成分在 cand 层(keep 内缩 9px)
+            # 永远全界内, 但凸包填充按凸性跨过 keep 硬边界 —— 跨界场贴回时
+            # 被 content 门(keep>127)+roi 软边切成半张印花, 比不贴更糟
+            # (r10 GPU 2048 实测下腹印花 84% 入界 → 半贴半留发糊, 视觉
+            # "右手图案没保真"; 1536 下该印花不检出反而干净)。凸包填充
+            # 骑 keep 硬区 ≥95% 才收, 否则整场拒绝。
+            _pf = np.zeros(ref.shape[:2], dtype=np.uint8)
+            cv2.fillPoly(_pf, [hull], 255)
+            if float(ka_img[_pf > 0].mean()) < 0.95:
+                continue
             hulls.append(hull)
         if not hulls:
             return None
@@ -541,6 +551,133 @@ def ghost_print_mask(
     except Exception:
         logger.exception("ghost_print_mask failed")
         return None
+
+
+def match_ref_tone(
+    gen_img: Image.Image,
+    cloth_ref: Image.Image,
+    keep_mask: np.ndarray | Image.Image,
+    avoid_mask: np.ndarray | Image.Image | list[np.ndarray | Image.Image] | None = None,
+    sample_radius: int = 45,
+    min_sample_px: int = 3000,
+) -> Image.Image:
+    """把平铺参考衣料逐通道色调平移到生成图衣身色调(鬼影擦除贴回前的预处理)。
+
+    FASHN 对同件衣服的明暗诠释与平铺照片差异巨大(r10 GPU 实测: gen 衣身
+    [117,103,69] vs ref [220,206,168], 相差百余灰阶), 直接把参考贴回生成
+    图, 擦除带比周围衣身亮 +100 灰阶 → 视觉验收"印花周围一圈发白发光
+    轮廓带"。修法: 在远离核心场/鬼场的干净衣身采样区, 取两图逐通道中位
+    数做差, 平移参考整体 —— ref 是 TPS 落位后的同构图, 空间逐像素对应;
+    folds/hf 光影由调用方贴回时叠加在匹配后的底色上。
+
+    Args:
+        avoid_mask: 采样需避开的场(核心场/鬼场), 单掩膜或掩膜列表
+        sample_radius: avoid 外扩像素(避开场边过渡带), 小画布按边长自适应收窄
+        min_sample_px: 采样区低于该像素数时不做匹配, 原样返回(小画布按
+            keep 像素 2% 自适应放宽, 下限 120px)
+
+    Returns:
+        色调匹配后的 RGB PIL 图; 采样不足/失败返回原 cloth_ref
+    """
+    try:
+        import cv2
+
+        gen = np.asarray(gen_img.convert("RGB"), np.float32)
+        ref = np.asarray(cloth_ref.convert("RGB"), np.float32)
+        if gen.shape[:2] != ref.shape[:2]:
+            logger.warning("match_ref_tone: gen/ref 尺寸不一致, 跳过色调匹配")
+            return cloth_ref
+        keep = np.asarray(keep_mask)
+        if keep.ndim == 3:
+            keep = keep[..., 0]
+        zone = keep > 127
+        keep_px = int(zone.sum())
+        hh, ww = gen.shape[:2]
+        radius = min(sample_radius, max(4, min(hh, ww) // 24))
+        min_px = min(min_sample_px, max(120, keep_px // 50))
+        if avoid_mask is not None:
+            avoid_list = avoid_mask if isinstance(avoid_mask, (list, tuple)) else [avoid_mask]
+            combined = np.zeros(gen.shape[:2], dtype=np.uint8)
+            for m in avoid_list:
+                a = np.asarray(m)
+                if a.ndim == 3:
+                    a = a[..., 0]
+                combined = np.maximum(combined, (a > 0).astype(np.uint8))
+            if combined.max() > 0:
+                dil = cv2.dilate(
+                    combined, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+                )
+                zone = zone & (dil == 0)
+        if int(zone.sum()) < min_px:
+            logger.info("match_ref_tone: 干净采样区 %dpx 不足 %dpx, 跳过", int(zone.sum()), min_px)
+            return cloth_ref
+        gen_med = np.median(gen[zone], axis=0)
+        ref_med = np.median(ref[zone], axis=0)
+        delta = gen_med - ref_med
+        matched = np.clip(ref + delta, 0, 255).astype(np.uint8)
+        logger.info(
+            "match_ref_tone: gen %s / ref %s -> delta %s",
+            np.round(gen_med, 1),
+            np.round(ref_med, 1),
+            np.round(delta, 1),
+        )
+        return Image.fromarray(matched)
+    except Exception:
+        logger.exception("match_ref_tone failed")
+        return cloth_ref
+
+
+def blend_core_ref_tone(
+    cloth_ref: Image.Image,
+    core_mask: np.ndarray | Image.Image,
+    matched_ref: Image.Image,
+    bright_thresh: int = 225,
+    chroma_thresh: int = 35,
+) -> Image.Image:
+    """核心场贴回参考混合: 白墨笔触保持原样, 场内衣料像素换成色调匹配版。
+
+    核心场 = 逐成分凸包(笔触+笔触间/周边衣料)。整场恒等贴回会把平铺
+    照片的亮衣料(r10 实测 198+) 拍上生成图的暗衣身(96), 印花外围一圈
+    发光 —— 视觉验收"印花周围发白轮廓带"的主源。白墨笔触本身是客观
+    亮色(印刷品不受衣料明暗影响), 必须保持原样, 否则印花发灰。
+
+    笔触判定(参考侧): 亮(bright_thresh)且低彩度(chroma_thresh) ——
+    真丝底色 (215,197,149) min=149 不入, 高光 (240,226,180) min=180
+    不入, 白墨 (255,255,255)/(247,246,240) 入。
+
+    Returns:
+        混合后的 RGB PIL 图; matched_ref 与 cloth_ref 一致时直接返回后者
+    """
+    try:
+        ref = np.asarray(cloth_ref.convert("RGB"))
+        mat = np.asarray(matched_ref.convert("RGB"))
+        if ref.shape != mat.shape:
+            logger.warning("blend_core_ref_tone: ref/matched 形状不一致, 用原始参考")
+            return cloth_ref
+        if np.array_equal(ref, mat):
+            return cloth_ref
+        core = np.asarray(core_mask)
+        if core.ndim == 3:
+            core = core[..., 0]
+        zone = core > 127
+        if not zone.any():
+            return cloth_ref
+        strokes = zone & (ref.min(axis=-1) >= bright_thresh) & ((ref.max(axis=-1) - ref.min(axis=-1)) <= chroma_thresh)
+        # 从原始参考出发只混场内: 场外像素保持原样(引擎只取 core 场内,
+        # 但混合图自身语义应自洽 —— 核心参考=原参考+场内衣料色调匹配)。
+        blended = ref.copy()
+        zone_cloth = zone & ~strokes
+        blended[zone_cloth] = mat[zone_cloth]
+        logger.info(
+            "blend_core_ref_tone: core %dpx 中笔触保持 %dpx (%.0f%%), 其余用色调匹配版",
+            int(zone.sum()),
+            int(strokes.sum()),
+            strokes.sum() / max(zone.sum(), 1) * 100,
+        )
+        return Image.fromarray(blended)
+    except Exception:
+        logger.exception("blend_core_ref_tone failed")
+        return cloth_ref
 
 
 def clip_mask_to_garment_alpha(

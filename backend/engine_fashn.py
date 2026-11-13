@@ -390,6 +390,12 @@ def compose_tryon_fashn(
                             "hf_strength": 0.0,
                             "fold_gain": 0.0,
                             "content_mask": keep_full,
+                            # 细笔触印花羽化 1px: 鬼场/整件贴回 5px 羽化平滑
+                            # 大块接缝, 但核心场恒等贴印的印花笔触本身仅 3-4px
+                            # 宽, 5px 距离场把笔触 alpha 压到 0.2-0.4, 白墨
+                            # 印花半透发灰(r10 GPU 逐成分 NCC 实测)。identity
+                            # 贴印的 crisp 印花边缘语义本来就该干净利落。
+                            "feather_px": 1.0,
                         },
                     )
                 else:
@@ -399,12 +405,26 @@ def compose_tryon_fashn(
                 _alpha_ch = result.split()[-1] if result.mode == "RGBA" else None
                 _rgb_result = result.convert("RGB")
                 if core_full is not None:
+                    # 色调匹配(r10 GPU 实测: gen 衣身 [117,103,69] vs 平铺 ref
+                    # [220,206,168], 差百余灰阶): 直接贴参考, 鬼场擦除带与
+                    # 核心场内衣料都比生成图衣身亮 +100 → 视觉验收"印花周
+                    # 围一圈发白发光轮廓带"。先统一把参考逐通道平移到生成
+                    # 图衣身色调; 鬼场/核心场分别按各自语义取用。
+                    try:
+                        from preserve_refit import match_ref_tone as _tone_fn
+
+                        _ref_matched = _tone_fn(
+                            _rgb_result, cloth_ref_full, keep_full, avoid_mask=np.asarray(core_full)
+                        )
+                    except Exception:
+                        logger.exception("FASHN tone match failed; using raw ref")
+                        _ref_matched = cloth_ref_full
                     # 鬼影擦除(核心场外): FASHN 按自己的几何摆放印花(实测
                     # 偏上), 核心场只盖 TPS 位置, 生成图的整套鬼影笔触
-                    # 暴露在场外(视觉验收: 上方半透明重影)。生成图上同色
-                    # 轴+纹理门检出鬼场, 先用参考底色+folds/hf(默认)贴回
-                    # —— ref 在鬼场处是干净底色, 擦除同时保身体光影; 再
-                    # 做核心恒等贴印。实心款回退分支整件已贴回, 无需此步。
+                    # 暴露在场外(视觉验收: 上方半透明重影)。生成图上同色轴
+                    # 检出鬼场, 用色调匹配参考+恒等参数贴回 —— 恒等 (光/褶
+                    # 全关) 防 gen 鬼影区的明暗场/褶皱带通把鬼影形状搬回。
+                    # 实心款回退分支整件已贴回, 无需此步。
                     try:
                         from preserve_refit import ghost_print_mask as _ghost_fn
 
@@ -412,17 +432,34 @@ def compose_tryon_fashn(
                         if ghost_full is not None and np.asarray(ghost_full).max() > 0:
                             _rgb_result = reapply_garment_detail(
                                 _rgb_result,
-                                cloth_ref_full,
+                                _ref_matched,
                                 ghost_full,
                                 pattern_lock=True,
                                 ref_alpha=alpha_full,
+                                light_strength=0.0,
+                                hf_strength=0.0,
+                                fold_gain=0.0,
+                                content_mask=np.asarray(keep_full),
                             )
                     except Exception:
                         logger.exception("FASHN ghost print erase failed; keeping current pixels")
                         degraded_reasons.append("FASHN ghost print erase failed")
+                    # 核心场贴回参考混合: 白墨笔触保持原样(客观亮色), 场内
+                    # SKU 衣料像素换色调匹配版 —— 整场恒等会把凸包里的亮
+                    # 衣料(198+)拍上暗衣身(96), 印花一圈发光。
+                    try:
+                        from preserve_refit import blend_core_ref_tone as _blend_fn
+
+                        _core_ref = _blend_fn(cloth_ref_full, core_full, _ref_matched)
+                    except Exception:
+                        logger.exception("FASHN core ref blend failed; using raw ref")
+                        _core_ref = cloth_ref_full
+                else:
+                    _ref_matched = None
+                    _core_ref = cloth_ref_full
                 result = reapply_garment_detail(
                     _rgb_result,
-                    cloth_ref_full,
+                    _core_ref,
                     paste_full,
                     pattern_lock=True,
                     ref_alpha=alpha_full,
